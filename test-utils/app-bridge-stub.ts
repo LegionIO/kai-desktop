@@ -67,6 +67,7 @@ function buildDefaultStub(): AppLike {
     conversations: {
       list: async () => [],
       get: async () => null,
+      getForRestore: async () => ({ status: 'missing' as const }),
       put: async (c: unknown) => c,
       delete: async () => ({ ok: true }),
       deleteMany: async () => ({ ok: true, deleted: 0, removedIds: [] }),

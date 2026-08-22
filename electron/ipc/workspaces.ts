@@ -117,13 +117,21 @@ export function registerWorkspaceHandlers(
       ok: boolean;
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
+      activeWorkspaceLastConversationId?: string | null;
     }> => {
       const config = getConfig();
       const workspaces = [...(config.ui?.workspaces ?? [])];
       const activeWorkspaceId = config.ui?.activeWorkspaceId ?? null;
 
       if (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) {
-        return { ok: false, error: 'active-workspace-changed', activeWorkspaceId };
+        const activeWorkspaceLastConversationId =
+          workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.lastActiveConversationId ?? null;
+        return {
+          ok: false,
+          error: 'active-workspace-changed',
+          activeWorkspaceId,
+          activeWorkspaceLastConversationId,
+        };
       }
 
       // Update lastActiveAt on the target workspace. Reject an unknown non-null

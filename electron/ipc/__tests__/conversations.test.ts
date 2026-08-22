@@ -1028,6 +1028,52 @@ describe('conversations IPC: active-id handling', () => {
     await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBeNull();
   });
 
+  it('keeps the active id and reports a transiently unreadable selection separately from absence', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('current-chat'));
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('unreadable-chat'));
+    await harness.invoke('conversations:set-active-id', FAKE_EVENT, 'current-chat');
+    writeFileSync(join(appHome, 'data', 'conversations', 'unreadable-chat.json'), '{not-json', 'utf-8');
+
+    await expect(
+      harness.invoke('conversations:set-active-id', FAKE_EVENT, 'unreadable-chat', 'current-chat'),
+    ).resolves.toEqual({
+      ok: false,
+      error: 'conversation-unavailable',
+      activeConversationId: 'current-chat',
+    });
+    await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('current-chat');
+  });
+
+  it('returns a tri-state snapshot for workspace restoration reads', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('restore-chat'));
+    const recordPath = join(appHome, 'data', 'conversations', 'restore-chat.json');
+
+    await expect(harness.invoke('conversations:get-for-restore', FAKE_EVENT, 'restore-chat')).resolves.toEqual({
+      status: 'found',
+      conversation: expect.objectContaining({ id: 'restore-chat' }),
+    });
+
+    writeFileSync(recordPath, '{not-json', 'utf-8');
+    await expect(harness.invoke('conversations:get-for-restore', FAKE_EVENT, 'restore-chat')).resolves.toEqual({
+      status: 'unavailable',
+    });
+
+    rmSync(recordPath);
+    await expect(harness.invoke('conversations:get-for-restore', FAKE_EVENT, 'restore-chat')).resolves.toEqual({
+      status: 'missing',
+    });
+  });
+
   it('clears the active id when the active conversation is deleted', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

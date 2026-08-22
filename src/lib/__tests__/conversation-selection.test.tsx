@@ -235,6 +235,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         ok: false,
         error: 'active-workspace-changed',
         activeWorkspaceId: 'workspace-authoritative',
+        activeWorkspaceLastConversationId: 'chat-authoritative',
       })
       .mockResolvedValueOnce({ ok: true });
 
@@ -242,13 +243,19 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
       setActiveBrowserWorkspaceWithRebase({
         workspaceId: 'workspace-browser',
         expectedCurrentWorkspaceId: 'workspace-stale',
+        departingConversationId: 'chat-stale',
         setActiveWorkspace,
         isCurrent: () => true,
       }),
     ).resolves.toBe(true);
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-browser', 'workspace-stale');
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-browser', 'workspace-authoritative');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-browser', 'workspace-stale', 'chat-stale');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-browser',
+      'workspace-authoritative',
+      'chat-authoritative',
+    );
   });
 
   it('does not retry a CAS conflict after the Browser request loses ownership', async () => {
@@ -256,12 +263,14 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
       ok: false,
       error: 'active-workspace-changed' as const,
       activeWorkspaceId: 'workspace-authoritative',
+      activeWorkspaceLastConversationId: 'chat-authoritative',
     }));
 
     await expect(
       setActiveBrowserWorkspaceWithRebase({
         workspaceId: 'workspace-browser',
         expectedCurrentWorkspaceId: 'workspace-stale',
+        departingConversationId: 'chat-stale',
         setActiveWorkspace,
         isCurrent: () => false,
       }),

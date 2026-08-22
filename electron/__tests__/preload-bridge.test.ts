@@ -119,7 +119,7 @@ describe('preload bridge contract', () => {
         'onStreamEvent',
       ],
     },
-    { ns: 'conversations', methods: ['list', 'get', 'put', 'delete', 'getActiveId', 'setActiveId'] },
+    { ns: 'conversations', methods: ['list', 'get', 'getForRestore', 'put', 'delete', 'getActiveId', 'setActiveId'] },
     { ns: 'workspaces', methods: ['create', 'rename', 'delete', 'setActive'] },
     { ns: 'memory', methods: ['clear', 'testEmbedding'] },
     { ns: 'mcp', methods: ['testConnection'] },

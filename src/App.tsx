@@ -879,9 +879,10 @@ function AppShell() {
           }
           return;
         }
-        const conv = (await app.conversations.get(restoredId)) as ConversationRecord | null;
+        const restoration = await app.conversations.getForRestore(restoredId);
         if (!isCurrent()) return;
-        if (!conv) {
+        if (restoration.status === 'unavailable') return;
+        if (restoration.status === 'missing') {
           const cleared = await app.conversations.setActiveId(null, restoredId);
           if (cleared.ok && isCurrent()) {
             await app.workspaces.saveLastConversation({
@@ -892,6 +893,7 @@ function AppShell() {
           }
           return;
         }
+        const conv = restoration.conversation as ConversationRecord;
         commitLocalConversationSelection(activeConversationIdRef, restoredId, setActiveConversationId);
         setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(restoredId)));
       })();
@@ -1438,7 +1440,11 @@ function AppShell() {
         getBrowserAttentionGeneration: () => browserAttentionIntentGenerationRef.current,
         browserAttentionGeneration,
         setActiveWorkspace: async (workspaceId, expectedCurrentWorkspaceId, operation) => {
-          const setActiveWorkspaceOnce = async (id: string | null, expectedCurrentId: string | null) => {
+          const setActiveWorkspaceOnce = async (
+            id: string | null,
+            expectedCurrentId: string | null,
+            departingConversationId = activeConversationIdRef.current,
+          ) => {
             const transitionKey = id ?? '';
             const transition = createBrowserWorkspaceTransitionMarker({
               navigationGeneration: selectionGeneration,
@@ -1447,7 +1453,7 @@ function AppShell() {
               operation,
               departingWorkspaceId: expectedCurrentId,
               destinationWorkspaceId: id,
-              departingConversationId: activeConversationIdRef.current,
+              departingConversationId,
             });
             if (transition) browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
             try {
@@ -1500,6 +1506,7 @@ function AppShell() {
           return setActiveBrowserWorkspaceWithRebase({
             workspaceId,
             expectedCurrentWorkspaceId,
+            departingConversationId: activeConversationIdRef.current,
             setActiveWorkspace: setActiveWorkspaceOnce,
             isCurrent: () =>
               navigationIntentGenerationRef.current === selectionGeneration &&

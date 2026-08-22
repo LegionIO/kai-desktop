@@ -230,6 +230,7 @@ export type ActiveWorkspaceCasResult = {
   ok: boolean;
   error?: 'active-workspace-changed';
   activeWorkspaceId?: string | null;
+  activeWorkspaceLastConversationId?: string | null;
 };
 
 export type WorkspaceLastConversationCasResult = {
@@ -253,18 +254,31 @@ const MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS = 4;
 export async function setActiveBrowserWorkspaceWithRebase(options: {
   workspaceId: string;
   expectedCurrentWorkspaceId: string | null;
+  departingConversationId: string | null;
   setActiveWorkspace: (
     workspaceId: string,
     expectedCurrentWorkspaceId: string | null,
+    departingConversationId: string | null,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
 }): Promise<boolean> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
+  let departingConversationId = options.departingConversationId;
   for (let attempt = 0; attempt < MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
-    const result = await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId);
+    const result = await options.setActiveWorkspace(
+      options.workspaceId,
+      expectedCurrentWorkspaceId,
+      departingConversationId,
+    );
     if (result.ok) return true;
-    if (!options.isCurrent() || result.activeWorkspaceId === undefined) return false;
+    if (
+      !options.isCurrent() ||
+      result.activeWorkspaceId === undefined ||
+      result.activeWorkspaceLastConversationId === undefined
+    )
+      return false;
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
+    departingConversationId = result.activeWorkspaceLastConversationId;
   }
   return false;
 }

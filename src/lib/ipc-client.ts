@@ -154,9 +154,12 @@ type AppAPI = {
       expectedCurrentId?: string | null,
     ) => Promise<{
       ok: boolean;
-      error?: 'active-conversation-changed' | 'conversation-not-found';
+      error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
       activeConversationId?: string | null;
     }>;
+    getForRestore: (
+      id: string,
+    ) => Promise<{ status: 'found'; conversation: unknown } | { status: 'missing' } | { status: 'unavailable' }>;
     fork: (
       id: string,
       upToMessageIndex?: number,
@@ -224,6 +227,7 @@ type AppAPI = {
       ok: boolean;
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
+      activeWorkspaceLastConversationId?: string | null;
     }>;
     saveLastConversation: (args: {
       workspaceId: string;

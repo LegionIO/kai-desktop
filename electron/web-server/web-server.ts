@@ -434,6 +434,7 @@ export function getBridgeScript(): string {
       list: function() { return invoke('conversations:list'); },
       search: function(term) { return invoke('conversations:search', term); },
       get: function(id) { return invoke('conversations:get', id); },
+      getForRestore: function(id) { return invoke('conversations:get-for-restore', id); },
       put: function(c) { return invoke('conversations:put', c); },
       delete: function(id) { return invoke('conversations:delete', id); },
       deleteMany: function(ids) { return invoke('conversations:deleteMany', ids); },

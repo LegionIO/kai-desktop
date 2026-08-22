@@ -108,11 +108,13 @@ describe('workspaces:set-active integrity', () => {
     dirs.add('/work/b');
     const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
     const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+    await saveLastConversation(second.id, 'chat-b');
 
     await expect(setActive(first.id, null)).resolves.toEqual({
       ok: false,
       error: 'active-workspace-changed',
       activeWorkspaceId: second.id,
+      activeWorkspaceLastConversationId: 'chat-b',
     });
     expect(config.ui.activeWorkspaceId).toBe(second.id);
   });

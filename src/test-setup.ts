@@ -19,6 +19,7 @@ globalThis.window = globalThis.window || ({} as Window & typeof globalThis);
     onChanged: vi.fn(() => () => {}),
     list: vi.fn().mockResolvedValue([]),
     get: vi.fn(),
+    getForRestore: vi.fn().mockResolvedValue({ status: 'missing' }),
     create: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),

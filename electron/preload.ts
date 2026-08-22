@@ -171,9 +171,13 @@ const appAPI = {
     setActiveId: (id: string | null, expectedCurrentId?: string | null) =>
       ipcRenderer.invoke('conversations:set-active-id', id, expectedCurrentId) as Promise<{
         ok: boolean;
-        error?: 'active-conversation-changed' | 'conversation-not-found';
+        error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
         activeConversationId?: string | null;
       }>,
+    getForRestore: (id: string) =>
+      ipcRenderer.invoke('conversations:get-for-restore', id) as Promise<
+        { status: 'found'; conversation: unknown } | { status: 'missing' } | { status: 'unavailable' }
+      >,
     fork: (id: string, upToMessageIndex?: number) =>
       ipcRenderer.invoke('conversations:fork', id, upToMessageIndex) as Promise<{
         ok: boolean;
@@ -276,6 +280,7 @@ const appAPI = {
         ok: boolean;
         error?: 'active-workspace-changed';
         activeWorkspaceId?: string | null;
+        activeWorkspaceLastConversationId?: string | null;
       }>,
     saveLastConversation: (args: {
       workspaceId: string;

@@ -52,6 +52,7 @@ import type { ConversationRecord, ConversationIndexEntry } from './conversation-
 import {
   readIndex,
   readConversation,
+  readConversationStrict,
   writeConversation,
   sanitizeMessageTree,
   deleteConversation,
@@ -956,6 +957,15 @@ export function registerConversationHandlers(
 
   ipcMain.handle('conversations:get', (_event, id: string) => {
     return readConversation(appHome, id) ?? null;
+  });
+
+  ipcMain.handle('conversations:get-for-restore', (_event, id: string) => {
+    try {
+      const conversation = readConversationStrict(appHome, id);
+      return conversation ? { status: 'found' as const, conversation } : { status: 'missing' as const };
+    } catch {
+      return { status: 'unavailable' as const };
+    }
   });
 
   ipcMain.handle('conversations:put', (event, conversation: ConversationRecord) => {
@@ -2946,8 +2956,14 @@ export function registerConversationHandlers(
     if (expectedCurrentId !== undefined && current !== expectedCurrentId) {
       return { ok: false, error: 'active-conversation-changed', activeConversationId: current };
     }
-    if (id !== null && !readConversation(appHome, id)) {
-      return { ok: false, error: 'conversation-not-found', activeConversationId: current };
+    if (id !== null) {
+      try {
+        if (!readConversationStrict(appHome, id)) {
+          return { ok: false, error: 'conversation-not-found', activeConversationId: current };
+        }
+      } catch {
+        return { ok: false, error: 'conversation-unavailable', activeConversationId: current };
+      }
     }
     setActiveConversationId(appHome, id);
     broadcastActive(appHome);
