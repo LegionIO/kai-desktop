@@ -214,6 +214,8 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadRequestRef = useRef(0);
+  const currentContextRef = useRef({ dataScope, conversationId });
+  currentContextRef.current = { dataScope, conversationId };
   const load = useCallback(async () => {
     const request = ++loadRequestRef.current;
     setLoading(true);
@@ -241,6 +243,10 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
   }, [load]);
   const clear = async (summary: BrowserDataSummary) => {
     if (!browser) return;
+    const requestedContext = { dataScope, conversationId };
+    const contextIsCurrent = () =>
+      currentContextRef.current.dataScope === requestedContext.dataScope &&
+      currentContextRef.current.conversationId === requestedContext.conversationId;
     const recoveryRequired = summary.recoveryRequired === true;
     if (
       !window.confirm(
@@ -260,8 +266,10 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
               scopeKeys: [summary.scopeKey],
             }),
       });
+      if (!contextIsCurrent()) return;
       await load();
     } catch (reason) {
+      if (!contextIsCurrent()) return;
       setError(`Browser data could not be cleared: ${reason instanceof Error ? reason.message : String(reason)}`);
     }
   };

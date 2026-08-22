@@ -392,4 +392,142 @@ describe('BrowserSettings data management', () => {
       screen.getByText('Conversation browser profile · conversation-aaaaaaaaaaaaaaaaaaaaaaaa'),
     ).toBeInTheDocument();
   });
+
+  it('does not let a clear completion restart a load for the previously selected chat', async () => {
+    let resolveClear: (() => void) | undefined;
+    let resolveNextChat: ((summaries: BrowserDataSummary[]) => void) | undefined;
+    const clearData = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveClear = resolve;
+        }),
+    );
+    const nextChatLoad = new Promise<BrowserDataSummary[]>((resolve) => {
+      resolveNextChat = resolve;
+    });
+    const dataSummary = vi
+      .fn()
+      .mockResolvedValueOnce([
+        {
+          scopeKey: 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+          partition: 'persist:kai-browser-conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+          cleanupPending: false,
+          historyCount: 1,
+          bookmarkCount: 0,
+          credentialCount: 0,
+          activeTabCount: 0,
+        },
+      ])
+      .mockImplementationOnce(() => nextChatLoad)
+      .mockResolvedValue([
+        {
+          scopeKey: 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+          partition: 'persist:kai-browser-conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+          cleanupPending: false,
+          historyCount: 9,
+          bookmarkCount: 0,
+          credentialCount: 0,
+          activeTabCount: 0,
+        },
+      ]);
+    installAppBridgeStub({
+      browser: { dataSummary, clearData },
+      partitions: { list: async () => [] },
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const rendered = render(
+      <BrowserSettings
+        config={{ browser: { dataScope: 'conversation' } }}
+        updateConfig={vi.fn()}
+        conversationId="chat-1"
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear' }));
+
+    rendered.rerender(
+      <BrowserSettings
+        config={{ browser: { dataScope: 'conversation' } }}
+        updateConfig={vi.fn()}
+        conversationId="chat-2"
+      />,
+    );
+    await waitFor(() => expect(dataSummary).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolveClear?.();
+    });
+    expect(dataSummary).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveNextChat?.([
+        {
+          scopeKey: 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb',
+          partition: 'persist:kai-browser-conversation-bbbbbbbbbbbbbbbbbbbbbbbb',
+          cleanupPending: false,
+          historyCount: 2,
+          bookmarkCount: 0,
+          credentialCount: 0,
+          activeTabCount: 0,
+        },
+      ]);
+      await nextChatLoad;
+    });
+    expect(
+      screen.getByText('Conversation browser profile · conversation-bbbbbbbbbbbbbbbbbbbbbbbb'),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('Conversation browser profile · conversation-aaaaaaaaaaaaaaaaaaaaaaaa'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not surface a clear failure from the previously selected chat', async () => {
+    let rejectClear: ((reason: Error) => void) | undefined;
+    const clearData = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectClear = reject;
+        }),
+    );
+    const summary = (scopeKey: string): BrowserDataSummary => ({
+      scopeKey,
+      partition: `persist:kai-browser-${scopeKey}`,
+      cleanupPending: false,
+      historyCount: 0,
+      bookmarkCount: 0,
+      credentialCount: 0,
+      activeTabCount: 0,
+    });
+    const dataSummary = vi
+      .fn()
+      .mockResolvedValueOnce([summary('conversation-aaaaaaaaaaaaaaaaaaaaaaaa')])
+      .mockResolvedValueOnce([summary('conversation-bbbbbbbbbbbbbbbbbbbbbbbb')]);
+    installAppBridgeStub({
+      browser: { dataSummary, clearData },
+      partitions: { list: async () => [] },
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const rendered = render(
+      <BrowserSettings
+        config={{ browser: { dataScope: 'conversation' } }}
+        updateConfig={vi.fn()}
+        conversationId="chat-1"
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear' }));
+
+    rendered.rerender(
+      <BrowserSettings
+        config={{ browser: { dataScope: 'conversation' } }}
+        updateConfig={vi.fn()}
+        conversationId="chat-2"
+      />,
+    );
+    expect(
+      await screen.findByText('Conversation browser profile · conversation-bbbbbbbbbbbbbbbbbbbbbbbb'),
+    ).toBeInTheDocument();
+    await act(async () => {
+      rejectClear?.(new Error('old chat clear failed'));
+    });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 });
