@@ -75,9 +75,10 @@ export type BrowserWorkspaceTransitionMarker = {
   departingConversationId: string | null;
 };
 
-/** Rollbacks are ordinary cursor reconciliation, and a same-workspace set can
- * never produce a workspace-ID effect. Neither operation may leave a marker
- * for a later unrelated transition to consume. */
+/** A same-workspace set can never produce a workspace-ID effect. Rollbacks do
+ * need provenance: without it the workspace effect can mistake the selected
+ * source chat for the chat departing the failed destination and corrupt that
+ * destination's saved cursor. */
 export function createBrowserWorkspaceTransitionMarker(options: {
   navigationGeneration: number;
   browserAttentionGeneration: number;
@@ -87,10 +88,17 @@ export function createBrowserWorkspaceTransitionMarker(options: {
   destinationWorkspaceId: string | null;
   departingConversationId: string | null;
 }): BrowserWorkspaceTransitionMarker | undefined {
-  if (options.operation === 'rollback' || options.departingWorkspaceId === options.destinationWorkspaceId) {
-    return undefined;
-  }
-  return options;
+  if (options.departingWorkspaceId === options.destinationWorkspaceId) return undefined;
+  return options.operation === 'rollback'
+    ? {
+        ...options,
+        // Destination metadata is restored transactionally by the failed
+        // Browser navigation. The workspace effect must neither overwrite it
+        // nor restore another chat over the user's surviving selection.
+        departingConversationId: null,
+        suppressArrivingWorkspaceRestoration: true,
+      }
+    : options;
 }
 
 /** A newer Browser request may intentionally retain a workspace reached by an
@@ -161,9 +169,10 @@ export function resolveConversationWorkspaceTransition(options: {
   const suppressArrivingWorkspaceRestoration =
     staleBrowserTransition ||
     (markerDescribesTransition &&
-      options.browserTransition?.operation === 'navigate' &&
-      (options.browserTransition.suppressArrivingWorkspaceRestoration === true ||
-        options.browserTransition.browserAttentionGeneration < options.currentBrowserAttentionGeneration));
+      (options.browserTransition?.operation === 'rollback' ||
+        (options.browserTransition?.operation === 'navigate' &&
+          (options.browserTransition.suppressArrivingWorkspaceRestoration === true ||
+            options.browserTransition.browserAttentionGeneration < options.currentBrowserAttentionGeneration))));
   return {
     staleBrowserTransition,
     suppressArrivingWorkspaceRestoration,
@@ -554,10 +563,42 @@ export async function openBrowserConversationInWorkspace(options: {
     isCurrentAfterSwitch: targetWorkspaceId
       ? () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId)
       : undefined,
-    canRollbackStaleSwitch: () =>
-      options.getConversationSelectionGeneration() === options.conversationSelectionGeneration &&
-      options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
-      options.getBrowserAttentionGeneration() === options.browserAttentionGeneration,
+    canRollbackStaleSwitch: async () => {
+      const workspaceAndBrowserIntentStillCurrent = (): boolean =>
+        options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
+        options.getBrowserAttentionGeneration() === options.browserAttentionGeneration;
+      if (!workspaceAndBrowserIntentStillCurrent()) return false;
+      if (options.getConversationSelectionGeneration() === options.conversationSelectionGeneration) return true;
+
+      // A newer chat choice should keep the Browser-selected workspace only
+      // when that chat actually belongs to the destination. In particular, the
+      // user can click another source-workspace chat before React observes the
+      // Browser's A -> B mutation; that newer selection requires a B -> A
+      // rollback rather than leaving B active and letting its restoration win.
+      // Follow rapid A2 -> B2 selections until one snapshot survives its local
+      // record read. The bounded fallback yields to the newest user intent if
+      // selection keeps changing, instead of risking a rollback underneath it.
+      for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
+        const selectedConversationId = options.getActiveConversationId();
+        if (!selectedConversationId) return true;
+        const selectedConversationGeneration = options.getConversationSelectionGeneration();
+        let selectedConversation: { workspaceId?: string | null } | null = null;
+        try {
+          selectedConversation = await options.getConversation(selectedConversationId);
+        } catch {
+          // Only a positively identified destination chat suppresses rollback.
+        }
+        if (!workspaceAndBrowserIntentStillCurrent()) return false;
+        if (
+          options.getConversationSelectionGeneration() !== selectedConversationGeneration ||
+          options.getActiveConversationId() !== selectedConversationId
+        ) {
+          continue;
+        }
+        return selectedConversation?.workspaceId !== targetWorkspaceId;
+      }
+      return false;
+    },
     discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
     commitConversationSelection: targetWorkspaceId ? selectTargetConversation : undefined,
   });
@@ -584,7 +625,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
-  canRollbackStaleSwitch?: () => boolean;
+  canRollbackStaleSwitch?: () => boolean | Promise<boolean>;
   discardActiveWorkspaceTransition?: (workspaceId: string) => void;
   commitConversationSelection?: () => Promise<boolean>;
 }): Promise<boolean> {
@@ -646,7 +687,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
     observation.cancel();
     if (!committed) {
       try {
-        if (switchedWorkspace && options.canRollbackStaleSwitch?.()) {
+        if (switchedWorkspace && (await options.canRollbackStaleSwitch?.())) {
           await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
         }
       } finally {

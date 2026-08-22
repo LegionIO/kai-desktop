@@ -213,7 +213,7 @@ describe('resolveConversationWorkspaceTransition', () => {
     ).toBe(newer);
   });
 
-  it('does not create markers for same-workspace operations or rollbacks', () => {
+  it('does not create a marker for same-workspace operations and preserves rollback provenance', () => {
     expect(
       createBrowserWorkspaceTransitionMarker({
         navigationGeneration: 1,
@@ -233,9 +233,48 @@ describe('resolveConversationWorkspaceTransition', () => {
         operation: 'rollback',
         departingWorkspaceId: 'workspace-b',
         destinationWorkspaceId: 'workspace-a',
-        departingConversationId: 'chat-b',
+        departingConversationId: 'chat-a',
       }),
-    ).toBeUndefined();
+    ).toEqual({
+      navigationGeneration: 1,
+      browserAttentionGeneration: 1,
+      workspaceSelectionGeneration: 2,
+      operation: 'rollback',
+      departingWorkspaceId: 'workspace-b',
+      destinationWorkspaceId: 'workspace-a',
+      departingConversationId: null,
+      suppressArrivingWorkspaceRestoration: true,
+    });
+  });
+
+  it('does not save or restore conversations while observing a Browser rollback', () => {
+    const rollback = createBrowserWorkspaceTransitionMarker({
+      navigationGeneration: 3,
+      browserAttentionGeneration: 2,
+      workspaceSelectionGeneration: 7,
+      operation: 'rollback',
+      departingWorkspaceId: 'workspace-b',
+      destinationWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
+    });
+
+    expect(
+      resolveConversationWorkspaceTransition({
+        previousWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        currentConversationId: 'chat-a',
+        browserTransition: rollback,
+        currentNavigationGeneration: 3,
+        currentBrowserAttentionGeneration: 2,
+        currentWorkspaceSelectionGeneration: 7,
+      }),
+    ).toEqual({
+      staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: true,
+      departingWorkspaceId: 'workspace-b',
+      departingConversationId: null,
+      nextPreviousWorkspaceId: 'workspace-a',
+    });
   });
 });
 
@@ -837,7 +876,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
 
-  it('keeps the destination workspace after a newer user conversation selection', async () => {
+  it('keeps the destination workspace after a newer destination-workspace conversation selection', async () => {
     let activeWorkspaceId = 'workspace-a';
     let activeConversationId = 'chat-a';
     let selectionGeneration = 1;
@@ -886,6 +925,123 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(switchConversation).not.toHaveBeenCalled();
     expect(setActiveWorkspace).toHaveBeenCalledOnce();
     expect(activeWorkspaceId).toBe('workspace-b');
+  });
+
+  it('rolls back after a newer source-workspace conversation selection', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let activeConversationId = 'chat-a';
+    let selectionGeneration = 1;
+    let conversationSelectionGeneration = 1;
+    let resolveObservation: (observed: boolean) => void = () => {};
+    const workspaceSelectionGeneration = 1;
+    const setActiveWorkspace = vi.fn(async (workspaceId: string | null) => {
+      activeWorkspaceId = workspaceId ?? '';
+      return true;
+    });
+    const switchConversation = vi.fn(async () => true);
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      selectionGeneration,
+      conversationSelectionGeneration,
+      getConversation: async (conversationId) => ({
+        workspaceId: conversationId === 'chat-b' ? 'workspace-b' : 'workspace-a',
+      }),
+      getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
+      getConversationSelectionGeneration: () => conversationSelectionGeneration,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+      saveLastConversation: async () => undefined,
+      getWorkspaceSelectionGeneration: () => workspaceSelectionGeneration,
+      workspaceSelectionGeneration,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      switchConversation,
+    });
+
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
+    activeConversationId = 'chat-a-newer';
+    selectionGeneration++;
+    conversationSelectionGeneration++;
+    resolveObservation(true);
+
+    await expect(opening).resolves.toBe(false);
+    expect(switchConversation).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(activeWorkspaceId).toBe('workspace-a');
+  });
+
+  it('uses the latest stable chat workspace when selection changes during rollback lookup', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let activeConversationId = 'chat-a';
+    let selectionGeneration = 1;
+    let conversationSelectionGeneration = 1;
+    let resolveObservation: (observed: boolean) => void = () => {};
+    let resolveFirstSelectionLookup: (conversation: { workspaceId: string }) => void = () => {};
+    let firstSelectionLookupStarted = false;
+    const setActiveWorkspace = vi.fn(async (workspaceId: string | null) => {
+      activeWorkspaceId = workspaceId ?? '';
+      return true;
+    });
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      selectionGeneration,
+      conversationSelectionGeneration,
+      getConversation: (conversationId) => {
+        if (conversationId === 'chat-b') return Promise.resolve({ workspaceId: 'workspace-b' });
+        if (conversationId === 'chat-b-newer') {
+          return new Promise<{ workspaceId: string }>((resolve) => {
+            firstSelectionLookupStarted = true;
+            resolveFirstSelectionLookup = resolve;
+          });
+        }
+        return Promise.resolve({ workspaceId: 'workspace-a' });
+      },
+      getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
+      getConversationSelectionGeneration: () => conversationSelectionGeneration,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+      saveLastConversation: async () => undefined,
+      getWorkspaceSelectionGeneration: () => 1,
+      workspaceSelectionGeneration: 1,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      switchConversation: vi.fn(async () => true),
+    });
+
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
+    activeConversationId = 'chat-b-newer';
+    selectionGeneration++;
+    conversationSelectionGeneration++;
+    resolveObservation(true);
+    await vi.waitFor(() => expect(firstSelectionLookupStarted).toBe(true));
+    activeConversationId = 'chat-a-latest';
+    selectionGeneration++;
+    conversationSelectionGeneration++;
+    resolveFirstSelectionLookup({ workspaceId: 'workspace-b' });
+
+    await expect(opening).resolves.toBe(false);
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(activeWorkspaceId).toBe('workspace-a');
   });
 
   it('does not select a destination conversation after another window leaves its workspace', async () => {
