@@ -606,6 +606,7 @@ type InternalTab = {
   trustedUserNavigation: boolean;
   trustedUserNavigationTarget: string | null;
   trustedUserNavigationRequestId: number | null;
+  trustedUserNavigationPanelGeneration: number | null;
   trustedUserNavigationLease: number;
   trustedUserNavigationTimer: ReturnType<typeof setTimeout> | null;
   /** Browser-chrome selection/takeover is lifecycle intent, not trusted input
@@ -946,6 +947,7 @@ type BrowserContextMenuDownloadAuthority = {
   tabId: string;
   tabGeneration: number;
   userNavigationLease: number;
+  panelAuthorityGeneration: number;
   contents: WebContents;
   url: string;
   expiresAt: number;
@@ -2200,6 +2202,7 @@ export class BrowserManager {
         tab.trustedUserNavigation = false;
         tab.trustedUserNavigationTarget = null;
         tab.trustedUserNavigationRequestId = null;
+        tab.trustedUserNavigationPanelGeneration = null;
         tab.lastUsedAt = Date.now();
         if (hadFavicon) this.emitTabFavicon(tab);
       }
@@ -3912,6 +3915,7 @@ export class BrowserManager {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
       userNavigationLease: tab.trustedUserNavigationLease,
+      panelAuthorityGeneration: this.panelAuthorityGeneration(tab.shell.conversationId),
       contents,
       url,
       expiresAt: Date.now() + CONTEXT_MENU_DOWNLOAD_AUTHORITY_MS,
@@ -3921,9 +3925,13 @@ export class BrowserManager {
     return authority;
   }
 
-  private consumeContextMenuDownloadAuthority(tab: InternalTab, contents: WebContents, url: string): boolean {
+  private consumeContextMenuDownloadAuthority(
+    tab: InternalTab,
+    contents: WebContents,
+    url: string,
+  ): BrowserContextMenuDownloadAuthority | null {
     const authority = this.contextMenuDownloadAuthorities?.get(contents.id);
-    if (!authority) return false;
+    if (!authority) return null;
     const documentStillMatches =
       authority.tabId === tab.shell.id &&
       authority.tabGeneration === tab.generation &&
@@ -3934,13 +3942,13 @@ export class BrowserManager {
       !contents.isDestroyed();
     if (!documentStillMatches || authority.expiresAt < Date.now()) {
       this.clearContextMenuDownloadAuthority(contents.id, authority);
-      return false;
+      return null;
     }
     // An unrelated timer/service download must not consume the explicit menu
     // command. Leave the authority available for only the exact requested URL.
-    if (authority.url !== url) return false;
+    if (authority.url !== url) return null;
     this.clearContextMenuDownloadAuthority(contents.id, authority);
-    return true;
+    return authority;
   }
 
   private browserPageLeaseToken(lease: BrowserPageLease): string {
@@ -4861,6 +4869,8 @@ export class BrowserManager {
     tab.trustedUserNavigation = true;
     tab.trustedUserNavigationTarget = targetUrl;
     tab.trustedUserNavigationRequestId = null;
+    tab.trustedUserNavigationPanelGeneration = this.panelAuthorityGeneration(tab.shell.conversationId);
+    tab.lastUsedAt = Date.now();
     tab.trustedUserNavigationTimer = setTimeout(() => {
       if (this.tabs.get(tab.shell.id) !== tab || tab.trustedUserNavigationLease !== lease) return;
       tab.trustedUserNavigationTimer = null;
@@ -4881,6 +4891,7 @@ export class BrowserManager {
     tab.trustedUserNavigation = false;
     tab.trustedUserNavigationTarget = null;
     tab.trustedUserNavigationRequestId = null;
+    tab.trustedUserNavigationPanelGeneration = null;
     return true;
   }
 
@@ -6229,6 +6240,7 @@ export class BrowserManager {
             trustedUserNavigation: false,
             trustedUserNavigationTarget: null,
             trustedUserNavigationRequestId: null,
+            trustedUserNavigationPanelGeneration: null,
             trustedUserNavigationLease: 0,
             trustedUserNavigationTimer: null,
             userSelectionGeneration: 0,
@@ -8643,6 +8655,7 @@ export class BrowserManager {
       trustedUserNavigation: false,
       trustedUserNavigationTarget: null,
       trustedUserNavigationRequestId: null,
+      trustedUserNavigationPanelGeneration: null,
       trustedUserNavigationLease: 0,
       trustedUserNavigationTimer: null,
       userSelectionGeneration: 0,
@@ -10150,20 +10163,31 @@ export class BrowserManager {
         const current = Date.now();
         const userGesture =
           tab.popupGesture?.source === 'user' && tab.popupGesture.expiresAt >= current ? tab.popupGesture : null;
+        let matchedTrustedChromeNavigation = false;
         let trustedChromeNavigation = false;
         let trustedContextMenuDownload = false;
         try {
           const downloadUrl = item.getURL();
-          trustedChromeNavigation =
+          matchedTrustedChromeNavigation =
             tab.trustedUserNavigationRequestId !== null &&
             isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, downloadUrl);
-          trustedContextMenuDownload = this.consumeContextMenuDownloadAuthority(tab, contents, downloadUrl);
+          trustedChromeNavigation =
+            matchedTrustedChromeNavigation &&
+            tab.trustedUserNavigationPanelGeneration !== null &&
+            this.hasBrowserNativeDialogAuthority(tab, contents, tab.trustedUserNavigationPanelGeneration);
+          const contextMenuAuthority = this.consumeContextMenuDownloadAuthority(tab, contents, downloadUrl);
+          trustedContextMenuDownload =
+            contextMenuAuthority !== null &&
+            this.hasBrowserNativeDialogAuthority(tab, contents, contextMenuAuthority.panelAuthorityGeneration);
         } catch {
           // A missing/tearing-down DownloadItem URL cannot inherit broad
           // Browser-chrome navigation or context-menu authority.
         }
         const trustedInteractiveGesture = !!userGesture && this.isTargetViewInteractive(tab, contents);
         if (!trustedContextMenuDownload && !trustedChromeNavigation && !trustedInteractiveGesture) {
+          if (matchedTrustedChromeNavigation) {
+            this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
+          }
           // A hidden/background user-owned page can start downloads without an
           // assistant lease (for example from a timer or service callback).
           // Never let that surface an unseen native dialog. Assistant-owned
@@ -10697,6 +10721,7 @@ export class BrowserManager {
                 assertContextPageCurrent();
                 await this.assertTabNotSensitive(tab, contents, 'Saving the image');
                 assertContextPageCurrent();
+                if (!this.hasBrowserNativeDialogAuthority(tab, contents, nativeDialogPanelGeneration)) return;
                 const authority = this.authorizeContextMenuDownload(tab, contents, params.srcURL);
                 try {
                   contents.downloadURL(params.srcURL);
@@ -15563,7 +15588,9 @@ export class BrowserManager {
       try {
         counts = store ? store.counts() : await readStoredBrowserProfileCountsAsync(this.appHome, scopeKey);
       } catch {
-        warnings.push('Browser profile metadata is unreadable; history and bookmark counts may be incomplete.');
+        warnings.push(
+          'Browser profile metadata is unreadable; history, bookmark, and download counts may be incomplete.',
+        );
       }
       const vault = this.vaults.get(scopeKey);
       let credentialCount = 0;
@@ -15579,6 +15606,7 @@ export class BrowserManager {
         ...(recoveryRequired ? { recoveryRequired: true } : {}),
         historyCount: counts.historyCount,
         bookmarkCount: counts.bookmarkCount,
+        downloadCount: counts.downloadCount,
         credentialCount,
         activeTabCount: activeTabCounts.get(scopeKey) ?? 0,
         ...(warnings.length > 0
@@ -15733,6 +15761,7 @@ export class BrowserManager {
         tab.trustedUserNavigation = false;
         tab.trustedUserNavigationTarget = null;
         tab.trustedUserNavigationRequestId = null;
+        tab.trustedUserNavigationPanelGeneration = null;
         tab.lastUsedAt = Date.now();
         if (hadFavicon) this.emitTabFavicon(tab);
       }
@@ -16224,7 +16253,12 @@ export class BrowserManager {
       // The idle timer is a forgotten-resource backstop, not a turn timeout.
       // Keep both assistant-owned tabs and user tabs currently leased to a live
       // run available while that run pauses between Browser calls.
-      const assistantActivityActive = tab.aiActionDepth > 0 || assistantRunActive;
+      const pendingPrompt =
+        [...(this.pendingPermissions?.values() ?? [])].some((prompt) => prompt.tabId === tab.shell.id) ||
+        [...(this.pendingAuth?.values() ?? [])].some((prompt) => prompt.tabId === tab.shell.id) ||
+        [...(this.pendingCredentials?.values() ?? [])].some((prompt) => prompt.tabId === tab.shell.id);
+      const lifecycleActivityActive =
+        tab.aiActionDepth > 0 || assistantRunActive || tab.trustedUserNavigation || pendingPrompt;
       if (
         shouldCloseIdleAssistantTab(
           tab.shell,
@@ -16232,7 +16266,7 @@ export class BrowserManager {
           cutoff,
           this.activeTabs.get(tab.shell.conversationId),
           this.mountedConversationId,
-          assistantActivityActive,
+          lifecycleActivityActive,
         )
       ) {
         this.closeTab(tab);
@@ -16256,7 +16290,7 @@ export class BrowserManager {
           cutoff,
           this.activeTabs.get(tab.shell.conversationId),
           this.mountedConversationId,
-          assistantActivityActive || devToolsOpen,
+          lifecycleActivityActive || devToolsOpen,
         )
       )
         continue;

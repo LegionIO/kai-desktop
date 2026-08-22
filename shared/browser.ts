@@ -794,6 +794,7 @@ export type BrowserDataSummary = {
   warning?: string;
   historyCount: number;
   bookmarkCount: number;
+  downloadCount: number;
   credentialCount: number;
   activeTabCount: number;
 };

@@ -109,6 +109,7 @@ describe('BrowserSettings data management', () => {
             cleanupPending: false,
             historyCount: 1,
             bookmarkCount: 2,
+            downloadCount: 4,
             credentialCount: 3,
             activeTabCount: 1,
           },
@@ -119,6 +120,7 @@ describe('BrowserSettings data management', () => {
     });
 
     render(<BrowserSettings config={{ browser: {} }} updateConfig={vi.fn()} conversationId="chat-1" />);
+    expect(await screen.findByText(/1 history · 2 bookmarks · 4 downloads · 3 passwords · 1 tabs/)).toBeInTheDocument();
     fireEvent.click(await screen.findByRole('button', { name: 'Clear' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
@@ -198,6 +200,7 @@ describe('BrowserSettings data management', () => {
             warning: 'Saved-password metadata is unreadable. Clear this profile to recover.',
             historyCount: 0,
             bookmarkCount: 0,
+            downloadCount: 0,
             credentialCount: 0,
             activeTabCount: 0,
           },
@@ -229,6 +232,7 @@ describe('BrowserSettings data management', () => {
             warning: 'Pending cleanup metadata is unreadable.',
             historyCount: 0,
             bookmarkCount: 0,
+            downloadCount: 0,
             credentialCount: 0,
             activeTabCount: 0,
           },
@@ -259,6 +263,7 @@ describe('BrowserSettings data management', () => {
             cleanupPending: false,
             historyCount: 0,
             bookmarkCount: 0,
+            downloadCount: 0,
             credentialCount: 0,
             activeTabCount: 0,
           },
@@ -268,6 +273,7 @@ describe('BrowserSettings data management', () => {
             cleanupPending: true,
             historyCount: 1,
             bookmarkCount: 2,
+            downloadCount: 4,
             credentialCount: 3,
             activeTabCount: 0,
           },
@@ -294,6 +300,7 @@ describe('BrowserSettings data management', () => {
         cleanupPending: false,
         historyCount: 0,
         bookmarkCount: 0,
+        downloadCount: 0,
         credentialCount: 0,
         activeTabCount: 0,
       },
@@ -340,6 +347,7 @@ describe('BrowserSettings data management', () => {
       cleanupPending: false,
       historyCount: 0,
       bookmarkCount: 0,
+      downloadCount: 0,
       credentialCount: 0,
       activeTabCount: 0,
     };
@@ -381,6 +389,7 @@ describe('BrowserSettings data management', () => {
           cleanupPending: false,
           historyCount: 9,
           bookmarkCount: 8,
+          downloadCount: 6,
           credentialCount: 7,
           activeTabCount: 6,
         },
@@ -414,6 +423,7 @@ describe('BrowserSettings data management', () => {
           cleanupPending: false,
           historyCount: 1,
           bookmarkCount: 0,
+          downloadCount: 0,
           credentialCount: 0,
           activeTabCount: 0,
         },
@@ -426,6 +436,7 @@ describe('BrowserSettings data management', () => {
           cleanupPending: false,
           historyCount: 9,
           bookmarkCount: 0,
+          downloadCount: 0,
           credentialCount: 0,
           activeTabCount: 0,
         },
@@ -465,6 +476,7 @@ describe('BrowserSettings data management', () => {
           cleanupPending: false,
           historyCount: 2,
           bookmarkCount: 0,
+          downloadCount: 0,
           credentialCount: 0,
           activeTabCount: 0,
         },
@@ -493,6 +505,7 @@ describe('BrowserSettings data management', () => {
       cleanupPending: false,
       historyCount: 0,
       bookmarkCount: 0,
+      downloadCount: 0,
       credentialCount: 0,
       activeTabCount: 0,
     });

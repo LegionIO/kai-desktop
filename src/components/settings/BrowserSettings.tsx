@@ -323,8 +323,8 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
               )}
               <p className="truncate font-mono text-[9px] text-muted-foreground">{summary.partition}</p>
               <p className="text-[10px] text-muted-foreground">
-                {summary.historyCount} history · {summary.bookmarkCount} bookmarks · {summary.credentialCount} passwords
-                · {summary.activeTabCount} tabs
+                {summary.historyCount} history · {summary.bookmarkCount} bookmarks · {summary.downloadCount} downloads ·{' '}
+                {summary.credentialCount} passwords · {summary.activeTabCount} tabs
               </p>
             </div>
             <button

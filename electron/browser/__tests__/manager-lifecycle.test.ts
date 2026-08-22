@@ -11481,6 +11481,7 @@ describe('browser manager renderer lifecycle', () => {
       clearingScopes: new Set(),
       contextMenuDownloadAuthorities: new Map(),
       downloads: new Map(),
+      hasBrowserNativeDialogAuthority: () => true,
       isTargetViewInteractive: () => false,
       pagePreloadPath: '/tmp/browser-page.cjs',
       scopeGenerations: new Map([['global', 0]]),
@@ -11553,17 +11554,20 @@ describe('browser manager renderer lifecycle', () => {
       trustedUserNavigation: true,
       trustedUserNavigationTarget: 'https://example.com/report.pdf',
       trustedUserNavigationRequestId: 7,
+      trustedUserNavigationPanelGeneration: 0,
       trustedUserNavigationLease: 1,
       trustedUserNavigationTimer: null,
       shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user' as const },
     };
+    let dialogAuthorized = false;
     const manager = managerWithoutConstructor({
       activeDownloads: new Map(),
       clearingScopes: new Set(),
       downloads: new Map(),
       getWindow: () => null,
       // Omnibox submission keeps focus in Browser chrome rather than the page.
-      // Exact request-bound navigation authority must remain sufficient.
+      // Its captured Browser presentation remains sufficient while current.
+      hasBrowserNativeDialogAuthority: () => dialogAuthorized,
       isTargetViewInteractive: () => false,
       oneTimePermissions: new Set(),
       pagePreloadPath: '/tmp/browser-page.cjs',
@@ -11611,6 +11615,23 @@ describe('browser manager renderer lifecycle', () => {
       setSaveDialogOptions: vi.fn(),
       setSavePath: vi.fn(),
     };
+
+    const hiddenItem = {
+      getURL: () => 'https://example.com/report.pdf',
+      cancel: vi.fn(),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, hiddenItem, { id: 42 });
+    expect(hiddenItem.cancel).toHaveBeenCalledOnce();
+    expect(hiddenItem.setSaveDialogOptions).not.toHaveBeenCalled();
+    expect(tab.trustedUserNavigation).toBe(false);
+
+    tab.trustedUserNavigation = true;
+    tab.trustedUserNavigationTarget = 'https://example.com/report.pdf';
+    tab.trustedUserNavigationRequestId = 7;
+    tab.trustedUserNavigationPanelGeneration = 0;
+    dialogAuthorized = true;
 
     const mismatchedItem = {
       getURL: () => 'https://example.com/unrelated.pdf',
@@ -12926,8 +12947,8 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('yields between Browser Data summary profiles instead of scanning them synchronously', async () => {
-    const counts = vi.fn(() => ({ historyCount: 0, bookmarkCount: 0, downloadCount: 0 }));
+  it('yields between Browser Data summary profiles and includes download counts', async () => {
+    const counts = vi.fn(() => ({ historyCount: 0, bookmarkCount: 0, downloadCount: 3 }));
     const credentialCount = vi.fn(() => 0);
     const stores = { get: vi.fn(() => ({ counts })) };
     const vaults = { get: vi.fn(() => ({ count: credentialCount })) };
@@ -12942,7 +12963,9 @@ describe('browser manager renderer lifecycle', () => {
     expect(stores.get).toHaveBeenCalledOnce();
     expect(vaults.get).toHaveBeenCalledOnce();
 
-    await expect(summary).resolves.toHaveLength(2);
+    await expect(summary).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ scopeKey: 'global', downloadCount: 3 })]),
+    );
     expect(stores.get).toHaveBeenCalledTimes(2);
     expect(vaults.get).toHaveBeenCalledTimes(2);
   });
@@ -16736,6 +16759,49 @@ describe('browser manager renderer lifecycle', () => {
     expect(downloadURL).not.toHaveBeenCalled();
   });
 
+  it('does not start a context-menu image download after Browser presentation is withdrawn during its scan', async () => {
+    const scan = deferred<void>();
+    const downloadURL = vi.fn();
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      downloadURL,
+      getURL: () => 'https://example.com/image',
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+    };
+    const tab = {
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      shell: { id: 'tab-1', conversationId: 'chat-1', title: 'Image', sensitive: false },
+      view: { webContents: contents },
+    };
+    let dialogAuthorized = true;
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+      captureBrowserPageLease: vi.fn(() => ({ tabId: 'tab-1', contents })),
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(() => scan.promise),
+      hasBrowserNativeDialogAuthority: vi.fn(() => dialogAuthorized),
+      runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
+      emitTabs: vi.fn(),
+    });
+
+    const menu = invokePrivate(manager, 'buildContextMenu', tab, contents, {
+      mediaType: 'image',
+      srcURL: 'https://example.com/image.png',
+      x: 12,
+      y: 24,
+    }) as { items: Array<{ label?: string; click?: () => void }> };
+    menu.items.find((item) => item.label === 'Save Image As…')?.click?.();
+    await vi.waitFor(() => expect(Reflect.get(manager, 'assertTabNotSensitive')).toHaveBeenCalledOnce());
+    dialogAuthorized = false;
+    scan.resolve();
+
+    await vi.waitFor(() => expect(Reflect.get(manager, 'hasBrowserNativeDialogAuthority')).toHaveBeenCalled());
+    expect(downloadURL).not.toHaveBeenCalled();
+  });
+
   it('guards context-menu printing with the full sensitivity scan', async () => {
     const scan = deferred<void>();
     const print = vi.fn((_options: unknown, callback: (success: boolean, failureReason: string) => void) =>
@@ -19755,6 +19821,101 @@ describe('browser manager renderer lifecycle', () => {
     invokePrivate(manager, 'discardIdleTabs');
     expect(destroyView).toHaveBeenCalledWith(tab);
   });
+
+  it('refreshes a user navigation lease and retains its renderer while the navigation is pending', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-21T12:00:00.000Z'));
+    try {
+      const tab = {
+        shell: {
+          id: 'navigating-tab',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          audible: false,
+        },
+        assistantOwnerId: null,
+        aiControlOwnerId: null,
+        aiActionDepth: 0,
+        lastUsedAt: 0,
+        trustedUserNavigation: false,
+        trustedUserNavigationTarget: null,
+        trustedUserNavigationRequestId: null,
+        trustedUserNavigationPanelGeneration: null,
+        trustedUserNavigationLease: 0,
+        trustedUserNavigationTimer: null,
+        view: {
+          webContents: {
+            isDestroyed: () => false,
+            isDevToolsOpened: () => false,
+          },
+        },
+      };
+      const destroyView = vi.fn();
+      const manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', 'another-tab']]),
+        destroyView,
+        getConfig: () => ({ browser: { idleDiscardMinutes: 10 } }),
+        mountedConversationId: null,
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      const lease = invokePrivate(manager, 'beginTrustedUserNavigation', tab, 'https://example.com/report') as number;
+      expect(tab.lastUsedAt).toBe(Date.now());
+      tab.lastUsedAt = 0;
+      invokePrivate(manager, 'discardIdleTabs');
+      expect(destroyView).not.toHaveBeenCalled();
+
+      invokePrivate(manager, 'clearTrustedUserNavigation', tab, lease);
+      invokePrivate(manager, 'discardIdleTabs');
+      expect(destroyView).toHaveBeenCalledWith(tab);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['pendingPermissions', 'pendingAuth', 'pendingCredentials'] as const)(
+    'retains an idle tab while %s contains a user prompt',
+    (pendingCollection) => {
+      const tab = {
+        shell: {
+          id: 'prompt-tab',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          audible: false,
+        },
+        assistantOwnerId: null,
+        aiControlOwnerId: null,
+        aiActionDepth: 0,
+        lastUsedAt: 0,
+        trustedUserNavigation: false,
+        view: {
+          webContents: {
+            isDestroyed: () => false,
+            isDevToolsOpened: () => false,
+          },
+        },
+      };
+      const pending = new Map([['prompt-1', { tabId: tab.shell.id }]]);
+      const destroyView = vi.fn();
+      const manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', 'another-tab']]),
+        destroyView,
+        getConfig: () => ({ browser: { idleDiscardMinutes: 10 } }),
+        mountedConversationId: null,
+        [pendingCollection]: pending,
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      invokePrivate(manager, 'discardIdleTabs');
+      expect(destroyView).not.toHaveBeenCalled();
+
+      pending.clear();
+      invokePrivate(manager, 'discardIdleTabs');
+      expect(destroyView).toHaveBeenCalledWith(tab);
+    },
+  );
 
   it('binds assistant document leases to the host realm and assistant run', () => {
     const tab = {
