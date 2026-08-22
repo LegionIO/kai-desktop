@@ -108,8 +108,13 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         workspaceId,
         expectedCurrentWorkspaceId: activeWorkspaceId,
         mutationToken,
-        setActiveWorkspace: (id, expectedCurrentId, token) =>
-          app.workspaces.setActive({ id, expectedCurrentId, mutationToken: token }),
+        setActiveWorkspace: (id, expectedCurrentId, token, expectedCurrentMutationToken) =>
+          app.workspaces.setActive({
+            id,
+            expectedCurrentId,
+            mutationToken: token,
+            ...(expectedCurrentMutationToken !== undefined ? { expectedCurrentMutationToken } : {}),
+          }),
         isCurrent: () => isWorkspaceNavigationIntentCurrent(navigationGeneration),
         canRebase: (conflict) => isLocalWorkspaceMutationToken(conflict.activeWorkspaceMutationToken),
       });

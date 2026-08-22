@@ -18,6 +18,7 @@ import {
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
+  resolveConversationActivationDisposition,
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
@@ -33,6 +34,29 @@ import {
 const activeConversationState = (activeConversationId: string | null, activeConversationRevision = 1) => ({
   activeConversationId,
   activeConversationRevision,
+});
+
+describe('resolveConversationActivationDisposition', () => {
+  const current = {
+    sequence: 4,
+    currentSequence: 4,
+    conversationId: 'chat-b',
+    currentConversationId: 'chat-b',
+    navigationGeneration: 7,
+    currentNavigationGeneration: 7,
+  };
+
+  it('keeps a successful selection while suppressing stale foreground navigation', () => {
+    expect(resolveConversationActivationDisposition(current)).toBe('foreground');
+    expect(resolveConversationActivationDisposition({ ...current, currentNavigationGeneration: 8 })).toBe('background');
+  });
+
+  it('drops an activation superseded by a newer conversation selection', () => {
+    expect(resolveConversationActivationDisposition({ ...current, currentSequence: 5 })).toBe('superseded');
+    expect(resolveConversationActivationDisposition({ ...current, currentConversationId: 'chat-c' })).toBe(
+      'superseded',
+    );
+  });
 });
 
 describe('isConversationWorkspaceRestorationCurrent', () => {
@@ -640,6 +664,46 @@ describe('setActiveUserWorkspaceWithRebase', () => {
       canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
     });
     expect(foreignConflict).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back its exact workspace mutation when a newer intent wins during the CAS', async () => {
+    let current = true;
+    let activeWorkspaceId = 'workspace-a';
+    const setActiveWorkspace = vi.fn(
+      async (
+        workspaceId: string | null,
+        expectedCurrentWorkspaceId: string | null,
+        mutationToken: string,
+        expectedCurrentMutationToken?: string,
+      ) => {
+        expect(activeWorkspaceId).toBe(expectedCurrentWorkspaceId);
+        if (expectedCurrentMutationToken !== undefined) expect(expectedCurrentMutationToken).toBe(mutationToken);
+        activeWorkspaceId = workspaceId ?? '';
+        if (workspaceId === 'workspace-b') current = false;
+        return { ok: true, activeWorkspaceId };
+      },
+    );
+
+    await expect(
+      setActiveUserWorkspaceWithRebase({
+        workspaceId: 'workspace-b',
+        expectedCurrentWorkspaceId: 'workspace-a',
+        mutationToken: 'local-user_request-stale',
+        setActiveWorkspace,
+        isCurrent: () => current,
+        canRebase: () => true,
+      }),
+    ).resolves.toMatchObject({ ok: false, activeWorkspaceId: 'workspace-a' });
+
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-b', 'workspace-a', 'local-user_request-stale');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-a',
+      'workspace-b',
+      'local-user_request-stale',
+      'local-user_request-stale',
+    );
+    expect(activeWorkspaceId).toBe('workspace-a');
   });
 });
 

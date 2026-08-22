@@ -380,6 +380,30 @@ describe('config IPC: registered channels', () => {
     expect(onDisk.launchAtLogin).toBe(true);
   });
 
+  it('rejects an internal write while an external config edit remains unreadable', async () => {
+    let requestReload!: () => void;
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        ({ reloadConfig: requestReload } = registerConfigHandlers(
+          ipc as Parameters<typeof registerConfigHandlers>[0],
+          appHome,
+        ));
+      },
+    });
+    await harness.invoke('config:set', FAKE_EVENT, 'launchAtLogin', true);
+    const configPath = join(appHome, 'settings', 'desktop.json');
+    const partialExternalEdit = '{"browser":';
+    writeFileSync(configPath, partialExternalEdit, 'utf-8');
+
+    requestReload();
+    await expect(harness.invoke('config:set', FAKE_EVENT, 'launchAtLogin', false)).rejects.toThrow(
+      /changed externally.*not readable/i,
+    );
+
+    expect(readFileSync(configPath, 'utf-8')).toBe(partialExternalEdit);
+    expect((await harness.invoke<AppConfig>('config:get', FAKE_EVENT)).launchAtLogin).toBe(true);
+  });
+
   it('rejects a schema-invalid config:set and leaves prior valid state intact', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

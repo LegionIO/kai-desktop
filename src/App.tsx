@@ -94,6 +94,7 @@ import {
   isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
+  resolveConversationActivationDisposition,
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
@@ -1495,26 +1496,24 @@ function AppShell() {
         }
         throw error;
       }
-      if (
-        seq !== activeSyncSeqRef.current ||
-        activeConversationIdRef.current !== id ||
-        navigationIntentGenerationRef.current !== navigationGeneration
-      )
-        return false;
-      setActiveViewState(CHAT_VIEW);
+      const activationDisposition = resolveConversationActivationDisposition({
+        sequence: seq,
+        currentSequence: activeSyncSeqRef.current,
+        conversationId: id,
+        currentConversationId: activeConversationIdRef.current,
+        navigationGeneration,
+        currentNavigationGeneration: navigationIntentGenerationRef.current,
+      });
+      if (activationDisposition === 'superseded') return false;
+      if (activationDisposition === 'foreground') setActiveViewState(CHAT_VIEW);
       setActiveConversationId(id);
       // Load the title for the switched-to conversation. Guard the async title
       // write so a rapid re-switch (A→B→A) doesn't let B's late-resolving title
       // overwrite the now-active A.
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-      if (
-        seq !== activeSyncSeqRef.current ||
-        activeConversationIdRef.current !== id ||
-        navigationIntentGenerationRef.current !== navigationGeneration
-      )
-        return false;
+      if (seq !== activeSyncSeqRef.current || activeConversationIdRef.current !== id) return false;
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
-      return true;
+      return activationDisposition === 'foreground' && navigationIntentGenerationRef.current === navigationGeneration;
     },
     [cancelWorkspaceObservationWaits, cuSessionsByConversation, isMobile],
   );

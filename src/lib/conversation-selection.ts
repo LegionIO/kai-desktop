@@ -249,6 +249,27 @@ export type ActiveConversationState = {
   activeConversationRevision: number;
 };
 
+export type ConversationActivationDisposition = 'foreground' | 'background' | 'superseded';
+
+/** A Browser attention request owns two related decisions: which conversation
+ * is selected and whether Chat should be brought to the foreground. A newer
+ * view-only navigation revokes only the latter; once the backend activation
+ * succeeds, still commit its selection locally so renderer and main cannot
+ * diverge after the matching active-id broadcast was treated as an ack. */
+export function resolveConversationActivationDisposition(options: {
+  sequence: number;
+  currentSequence: number;
+  conversationId: string;
+  currentConversationId: string | null;
+  navigationGeneration: number;
+  currentNavigationGeneration: number;
+}): ConversationActivationDisposition {
+  if (options.sequence !== options.currentSequence || options.currentConversationId !== options.conversationId) {
+    return 'superseded';
+  }
+  return options.navigationGeneration === options.currentNavigationGeneration ? 'foreground' : 'background';
+}
+
 export type WorkspaceRestorationReadResult<T> =
   | { status: 'found'; conversation: T }
   | { status: 'missing' }
@@ -472,9 +493,10 @@ export async function setActiveUserWorkspaceWithRebase(options: {
   expectedCurrentWorkspaceId: string | null;
   mutationToken: string;
   setActiveWorkspace: (
-    workspaceId: string,
+    workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     mutationToken: string,
+    expectedCurrentMutationToken?: string,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
@@ -488,7 +510,25 @@ export async function setActiveUserWorkspaceWithRebase(options: {
       expectedCurrentWorkspaceId,
       options.mutationToken,
     );
-    if (result.ok) return result;
+    if (result.ok) {
+      if (options.isCurrent()) return result;
+      // The stale request committed while a newer navigation intent was taking
+      // ownership. Undo only our exact mutation: both workspace id and token
+      // participate in the CAS, so a newer same-destination click still wins.
+      const rollback = await options.setActiveWorkspace(
+        expectedCurrentWorkspaceId,
+        options.workspaceId,
+        options.mutationToken,
+        options.mutationToken,
+      );
+      if (!rollback.ok) return rollback;
+      return {
+        ok: false,
+        error: 'active-workspace-changed',
+        activeWorkspaceId: expectedCurrentWorkspaceId,
+        activeWorkspaceMutationToken: options.mutationToken,
+      };
+    }
     lastResult = result;
     if (!options.isCurrent() || !options.canRebase(result) || result.activeWorkspaceId === undefined) return result;
     expectedCurrentWorkspaceId = result.activeWorkspaceId;

@@ -1274,7 +1274,7 @@ export function registerConfigHandlers(
   onChanged?: (config: AppConfig) => void,
   mayWriteBrowserConfig: (event: unknown) => boolean = () => false,
   onBrowserChanged?: (config: AppConfig['browser']) => void,
-): { setConfig: (path: string, value: unknown) => void } {
+): { setConfig: (path: string, value: unknown) => void; reloadConfig: () => void } {
   let currentConfig = readEffectiveConfig(appHome);
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
   let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
@@ -1298,6 +1298,10 @@ export function registerConfigHandlers(
     return next;
   };
   let reloadDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  // A failed watcher read means disk may contain an in-progress external edit.
+  // Keep this latch set even after the debounce fires so a later config:set
+  // cannot silently overwrite that edit from the last-known in-memory value.
+  let watchedConfigReadPending = false;
   let broadcastTimer: ReturnType<typeof setTimeout> | null = null;
 
   const flushConfigBroadcast = () => {
@@ -1336,6 +1340,7 @@ export function registerConfigHandlers(
   const applyReload = (): boolean => {
     try {
       currentConfig = readWatchedConfig();
+      watchedConfigReadPending = false;
       publishBrowserConfig(false);
       // External edit to desktop.json (enabled/content/scopes/retention) must
       // take effect without an internal write or restart.
@@ -1344,17 +1349,20 @@ export function registerConfigHandlers(
       return true;
     } catch {
       // Ignore read errors during write
+      watchedConfigReadPending = true;
       return false;
     }
   };
 
   const reloadConfig = () => {
+    watchedConfigReadPending = true;
     // Do not put Browser lifecycle changes behind the general file-watch
     // debounce. Atomic external edits normally emit more than one fs event;
     // snapshot deduplication makes those cheap while preserving a disable that
     // is followed quickly by an enable.
     try {
       const nextConfig = readWatchedConfig();
+      watchedConfigReadPending = false;
       if (JSON.stringify(nextConfig.browser) !== lastBrowserSnapshot) {
         currentConfig = nextConfig;
         publishBrowserConfig(false);
@@ -1375,8 +1383,8 @@ export function registerConfigHandlers(
   // external edit. Before any internal mutation, if a reload is pending, cancel the timer and reload
   // NOW so currentConfig reflects the external change, and the internal mutation layers on top of it.
   const flushPendingReload = (): boolean => {
-    if (reloadDebounceTimer) {
-      clearTimeout(reloadDebounceTimer);
+    if (reloadDebounceTimer || watchedConfigReadPending) {
+      if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
       reloadDebounceTimer = null;
       // If the synchronous flush read FAILS (partial external write mid-flush), do NOT leave the pending
       // reload cancelled (R199): currentConfig is still stale and the caller's internal config:set would
@@ -1453,12 +1461,15 @@ export function registerConfigHandlers(
       // The pending external reload's synchronous read failed (a partial write mid-flush), so currentConfig
       // may be stale and the full-file rewrite below could clobber the external edit — the re-armed retry
       // can't recover an already-overwritten file (R200). Make a best-effort fresh read here so the delta
-      // layers on the latest on-disk state; if it ALSO fails, proceed on the last-known config (unavoidable,
-      // and no worse than before), since silently dropping the user's config:set is a worse outcome.
-      try {
-        currentConfig = readWatchedConfig();
-      } catch {
-        /* still unreadable — proceed with the last-known currentConfig */
+      // layers on the latest on-disk state. If it ALSO fails, reject this write:
+      // overwriting a partially written external file from stale memory could
+      // silently restore an older Browser security policy.
+      if (!applyReload()) {
+        throw new Error('Configuration is being changed externally and is not readable yet. Please retry.');
+      }
+      if (reloadDebounceTimer) {
+        clearTimeout(reloadDebounceTimer);
+        reloadDebounceTimer = null;
       }
     }
     if (path === 'models') {
@@ -1574,5 +1585,5 @@ export function registerConfigHandlers(
     return results;
   });
 
-  return { setConfig: setConfigImpl };
+  return { setConfig: setConfigImpl, reloadConfig };
 }
