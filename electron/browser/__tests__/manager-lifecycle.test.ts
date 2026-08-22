@@ -156,6 +156,8 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       scopeRuntimeReleaseTokens: new Map(),
       scopeRuntimeReleaseTasks: new Map(),
       scopeRuntimeReleaseRestarts: new Set(),
+      scopeRuntimeReleaseRetryAttempts: new Map(),
+      scopeRuntimeReleaseRetryTimers: new Map(),
       stores: new Map(),
       suspendedScopes: new Set<string>(),
       tabOrder: new Map(),
@@ -12433,6 +12435,101 @@ describe('browser manager renderer lifecycle', () => {
     expect(store.setPermissions).not.toHaveBeenCalled();
   });
 
+  it('binds external-app permission to one safe destination and never remembers it profile-wide', () => {
+    type PermissionContents = { id: number; getURL: () => string };
+    type PermissionDetails = { requestingUrl?: string; externalURL?: string };
+    let checkPermission:
+      | ((
+          contents: PermissionContents | null,
+          permission: string,
+          origin: string,
+          details: PermissionDetails,
+        ) => boolean)
+      | undefined;
+    let requestPermission:
+      | ((
+          contents: PermissionContents,
+          permission: string,
+          callback: (allowed: boolean) => void,
+          details: PermissionDetails,
+        ) => void)
+      | undefined;
+    const store = { getPermission: vi.fn(), setPermissions: vi.fn() };
+    const tab = {
+      aiNetworkRestricted: false,
+      generation: 1,
+      scopeKey: 'global',
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+    };
+    const manager = managerWithoutConstructor({
+      emit: vi.fn(),
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      stores: new Map([['global', store]]),
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+    });
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: vi.fn(),
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: (handler: typeof checkPermission) => {
+        checkPermission = handler;
+      },
+      setPermissionRequestHandler: (handler: typeof requestPermission) => {
+        requestPermission = handler;
+      },
+      webRequest: {
+        onBeforeRequest: vi.fn(),
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    const contents = { id: 42, getURL: () => 'https://example.com' };
+    const firstDestination = {
+      requestingUrl: 'https://example.com',
+      externalURL: 'https://outside.example/first?request=1',
+    };
+
+    const first = vi.fn();
+    requestPermission?.(contents, 'openExternal', first, firstDestination);
+    const prompt = manager.getState('chat-1').permissionPrompts?.[0];
+    expect(prompt).toEqual(
+      expect.objectContaining({
+        target: 'External URL: https://outside.example/first?request=1',
+        canPersist: false,
+      }),
+    );
+    expect(() => manager.respondPermissionPrompt(prompt!.id, 'allow')).toThrow(/current request only/);
+    manager.respondPermissionPrompt(prompt!.id, 'allow-once');
+    expect(first).toHaveBeenCalledWith(true);
+    expect(checkPermission?.(contents, 'openExternal', 'https://example.com', firstDestination)).toBe(true);
+
+    const sameDestination = vi.fn();
+    requestPermission?.(contents, 'openExternal', sameDestination, firstDestination);
+    expect(sameDestination).toHaveBeenCalledWith(true);
+
+    const otherDestination = vi.fn();
+    requestPermission?.(contents, 'openExternal', otherDestination, {
+      requestingUrl: 'https://example.com',
+      externalURL: 'https://outside.example/second',
+    });
+    expect(otherDestination).not.toHaveBeenCalled();
+    expect(manager.getState('chat-1').permissionPrompts).toHaveLength(1);
+    const otherPromptId = manager.getState('chat-1').permissionPrompts![0]!.id;
+    invokePrivate(manager, 'finishPendingPermission', otherPromptId, false);
+
+    const unsafeDestination = vi.fn();
+    requestPermission?.(contents, 'openExternal', unsafeDestination, {
+      requestingUrl: 'https://example.com',
+      externalURL: 'file:///private/etc/passwd',
+    });
+    expect(unsafeDestination).toHaveBeenCalledWith(false);
+    expect(checkPermission?.(contents, 'openExternal', 'https://example.com', {})).toBe(false);
+    expect(store.getPermission).not.toHaveBeenCalled();
+    expect(store.setPermissions).not.toHaveBeenCalled();
+  });
+
   it('never reuses an allow-once grant across opaque permission origins', () => {
     type PermissionContents = { id: number; getURL: () => string };
     type PermissionDetails = { requestingUrl?: string; securityOrigin?: string; mediaType?: 'video' };
@@ -20370,6 +20467,44 @@ describe('browser manager renderer lifecycle', () => {
     expect(stopRunningServiceWorkers).toHaveBeenCalledTimes(2);
   });
 
+  it('does not retire a request admitted while idle connection reset is in flight', async () => {
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    const connectionReset = deferred<void>();
+    const closeAllConnections = vi
+      .fn()
+      .mockImplementationOnce(() => connectionReset.promise)
+      .mockResolvedValue(undefined);
+    const releaseScopeRuntime = vi.fn();
+    const manager = managerWithoutConstructor({
+      getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
+      releaseScopeRuntime,
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      stores: new Map([[scopeKey, { flush: vi.fn(async () => undefined) }]]),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections }]]),
+    });
+    const requestActivities = Reflect.get(manager, 'scopeRequestActivities') as Map<string, Map<number, () => void>>;
+    const finishOldRequest = invokePrivate(manager, 'beginScopeActivity', scopeKey, 'network') as () => void;
+    requestActivities.set(scopeKey, new Map([[7, finishOldRequest]]));
+
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+    await vi.waitFor(() => expect(closeAllConnections).toHaveBeenCalledOnce());
+
+    const finishNewRequest = invokePrivate(manager, 'beginScopeActivity', scopeKey, 'network') as () => void;
+    requestActivities.get(scopeKey)!.set(8, finishNewRequest);
+    connectionReset.resolve();
+
+    await vi.waitFor(() => expect(Reflect.get(manager, 'scopeRuntimeReleaseTasks')).toHaveLength(0));
+    expect([...requestActivities.get(scopeKey)!.keys()]).toEqual([8]);
+    expect((Reflect.get(manager, 'scopeActivityCounts') as Map<string, number>).get(scopeKey)).toBe(1);
+    expect(releaseScopeRuntime).not.toHaveBeenCalled();
+
+    invokePrivate(manager, 'finishScopeRequestActivity', scopeKey, 8);
+
+    await vi.waitFor(() => expect(releaseScopeRuntime).toHaveBeenCalledOnce());
+    expect(closeAllConnections).toHaveBeenCalledTimes(2);
+  });
+
   it('waits for cancelled native idle teardown before admitting asynchronous profile work', async () => {
     const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
     const firstWorkerStop = deferred<void>();
@@ -20562,6 +20697,77 @@ describe('browser manager renderer lifecycle', () => {
     await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
     expect(releaseScopeRuntime).not.toHaveBeenCalled();
     expect((Reflect.get(manager, 'stores') as Map<string, unknown>).has(scopeKey)).toBe(true);
+  });
+
+  it('retries transient idle runtime teardown failures with bounded backoff', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const scopeKey = 'conversation-cccccccccccccccccccccccc';
+    const releaseScopeRuntime = vi.fn();
+    const closeAllConnections = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('reset failed once'))
+      .mockRejectedValueOnce(new Error('reset failed twice'))
+      .mockRejectedValueOnce(new Error('reset failed three times'))
+      .mockResolvedValue(undefined);
+    const manager = managerWithoutConstructor({
+      releaseScopeRuntime,
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      stores: new Map([[scopeKey, { flush: vi.fn(async () => undefined) }]]),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections }]]),
+    });
+
+    try {
+      invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(closeAllConnections).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(closeAllConnections).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(closeAllConnections).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(closeAllConnections).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(closeAllConnections).toHaveBeenCalledTimes(4);
+      expect(releaseScopeRuntime).toHaveBeenCalledOnce();
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryAttempts')).toHaveLength(0);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryTimers')).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops idle runtime teardown retries after the bounded retry budget', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const scopeKey = 'conversation-cccccccccccccccccccccccc';
+    const closeAllConnections = vi.fn().mockRejectedValue(new Error('persistent reset failure'));
+    const manager = managerWithoutConstructor({
+      releaseScopeRuntime: vi.fn(),
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections }]]),
+    });
+
+    try {
+      invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+      await vi.advanceTimersByTimeAsync(36_000);
+      expect(closeAllConnections).toHaveBeenCalledTimes(4);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryTimers')).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(closeAllConnections).toHaveBeenCalledTimes(4);
+
+      invokePrivate(manager, 'beginScopeActivity', scopeKey);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryAttempts')).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('retains an idle profile runtime until its active download finishes', async () => {

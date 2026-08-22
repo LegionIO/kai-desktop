@@ -80,6 +80,47 @@ describe('browser permission scopes', () => {
     expect(browserPermissionStorageKeys('notifications')).toEqual(['notifications']);
   });
 
+  it('scopes external-app grants to one safe destination and never persists them', () => {
+    const first = browserPermissionStorageKeys('openExternal', {
+      externalURL: 'https://example.com/one?token=secret',
+    });
+    const equivalent = browserPermissionStorageKeys('openExternal', {
+      externalURL: 'https://example.com:443/one?token=secret',
+    });
+    const second = browserPermissionStorageKeys('openExternal', {
+      externalURL: 'https://example.com/two',
+    });
+
+    expect(first).toEqual(equivalent);
+    expect(first).not.toEqual(second);
+    expect(first[0]).not.toContain('example.com');
+    expect(first[0]).not.toContain('secret');
+    expect(isPersistableBrowserPermission('openExternal')).toBe(false);
+    expect(
+      browserPermissionTargetLabel('openExternal', {
+        externalURL: 'https://example.com/one?token=secret',
+      }),
+    ).toBe('External URL: https://example.com/one?token=secret');
+  });
+
+  it('rejects missing, malformed, and unsafe external-app destinations', () => {
+    expect(browserPermissionStorageKeys('openExternal')).toEqual([]);
+    expect(browserPermissionStorageKeys('openExternal', { externalURL: 'not a URL' })).toEqual([]);
+    expect(browserPermissionStorageKeys('openExternal', { externalURL: 'file:///etc/passwd' })).toEqual([]);
+    expect(browserPermissionStorageKeys('openExternal', { externalURL: 'custom-handler://payload' })).toEqual([]);
+    expect(browserPermissionTargetLabel('openExternal', { externalURL: 'file:///etc/passwd' })).toBeUndefined();
+  });
+
+  it('bounds external-app destination labels', () => {
+    const label = browserPermissionTargetLabel('openExternal', {
+      externalURL: `https://example.com/${'a'.repeat(1_000)}`,
+    });
+
+    expect(label).toHaveLength('External URL: '.length + 512);
+    expect(label).toMatch(/^External URL: https:\/\/example\.com\//);
+    expect(label).toMatch(/…$/);
+  });
+
   it('never treats opaque or malformed origins as persistent permission buckets', () => {
     expect(normalizeBrowserPermissionOrigin('data:text/html,hello')).toBe('opaque page');
     expect(normalizeBrowserPermissionOrigin('not a url')).toBe('unknown page');

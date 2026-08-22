@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isExternallyOpenableUrl } from '../utils/safe-external-url.js';
 
 export type BrowserPermissionDetails = {
   mediaType?: 'video' | 'audio' | 'unknown';
@@ -6,7 +7,17 @@ export type BrowserPermissionDetails = {
   filePath?: string;
   isDirectory?: boolean;
   fileAccessType?: 'writable' | 'readable';
+  externalURL?: string;
 };
+
+function normalizedExternalPermissionUrl(details: BrowserPermissionDetails): string | null {
+  if (!details.externalURL || !isExternallyOpenableUrl(details.externalURL)) return null;
+  try {
+    return new URL(details.externalURL).href;
+  } catch {
+    return null;
+  }
+}
 
 /** Normalize Chromium permission origins without collapsing every opaque page
  * into a persistable "null" bucket shared across unrelated documents. */
@@ -28,21 +39,30 @@ export function isPersistentBrowserPermissionOrigin(origin: string): boolean {
   }
 }
 
-/** File System Access grants are path-specific, but Chromium exposes no safe
- * durable display metadata for an already-hashed grant. Keep them request-only
- * so Kai never offers a remembered permission the user cannot identify later. */
+/** File System Access and OS-handler launches are target-specific, but Kai does
+ * not persist their raw target metadata. Keep them request-only so a remembered
+ * permission can never silently authorize another path or destination. */
 export function isPersistableBrowserPermission(permission: string): boolean {
-  return permission !== 'fileSystem';
+  return permission !== 'fileSystem' && permission !== 'openExternal';
 }
 
 export function browserPermissionTargetLabel(
   permission: string,
   details: BrowserPermissionDetails = {},
 ): string | undefined {
-  if (permission !== 'fileSystem' || !details.filePath) return undefined;
-  const sanitized = details.filePath.replace(/[\u0000-\u001f\u007f]/g, '\ufffd');
-  const bounded = sanitized.length > 512 ? `\u2026${sanitized.slice(-511)}` : sanitized;
-  return `${details.isDirectory ? 'Directory' : 'File'}: ${bounded}`;
+  if (permission === 'openExternal') {
+    const externalURL = normalizedExternalPermissionUrl(details);
+    if (!externalURL) return undefined;
+    const sanitized = externalURL.replace(/[\u0000-\u001f\u007f]/g, '\ufffd');
+    const bounded = sanitized.length > 512 ? `${sanitized.slice(0, 511)}\u2026` : sanitized;
+    return `External URL: ${bounded}`;
+  }
+  if (permission === 'fileSystem' && details.filePath) {
+    const sanitized = details.filePath.replace(/[\u0000-\u001f\u007f]/g, '\ufffd');
+    const bounded = sanitized.length > 512 ? `\u2026${sanitized.slice(-511)}` : sanitized;
+    return `${details.isDirectory ? 'Directory' : 'File'}: ${bounded}`;
+  }
+  return undefined;
 }
 
 /**
@@ -76,6 +96,13 @@ export function browserPermissionStorageKeys(permission: string, details: Browse
     const access = details.fileAccessType;
     const kind = details.isDirectory ? 'directory' : 'file';
     return [`fileSystem:${access}:${kind}:${pathDigest}`];
+  }
+
+  if (permission === 'openExternal') {
+    const externalURL = normalizedExternalPermissionUrl(details);
+    if (!externalURL) return [];
+    const destinationDigest = createHash('sha256').update(externalURL).digest('hex');
+    return [`openExternal:${destinationDigest}`];
   }
 
   return [permission];

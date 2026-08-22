@@ -4096,6 +4096,41 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
   });
 
+  it('shows the exact external-app destination and offers request-scoped access only', async () => {
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [tab],
+          activeTabId: tab.id,
+          permissionPrompts: [
+            {
+              id: 'external-permission',
+              tabId: tab.id,
+              origin: 'https://example.com',
+              permission: 'openExternal',
+              target: 'External URL: https://outside.example/login?continue=%2Faccount',
+              canPersist: false,
+              assistantTriggered: false,
+            },
+          ],
+        }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+
+    render(<BrowserPanel conversationId="chat-1" />);
+
+    expect(
+      await screen.findByText('External URL: https://outside.example/login?continue=%2Faccount'),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Allow' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
+  });
+
   it('announces blocking prompts and auto-focuses only user-triggered response controls', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const setChromeFocus = vi.fn().mockResolvedValue(undefined);

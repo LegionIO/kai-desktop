@@ -344,6 +344,7 @@ const ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS = 1_000;
 const SCREENSHOT_TIMEOUT_MS = 60_000;
 const BACKGROUND_VIEWPORT_TIMEOUT_MS = 5_000;
 const BACKGROUND_VIEWPORT_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000, 4_000] as const;
+const IDLE_RUNTIME_RELEASE_RETRY_DELAYS_MS = [1_000, 5_000, 30_000] as const;
 const PRIVATE_NETWORK_GUARD_TIMEOUT_MS = 15_000;
 const NATIVE_UI_GUARD_TIMEOUT_MS = 15_000;
 const DNS_RESOLUTION_TIMEOUT_MS = 10_000;
@@ -1437,6 +1438,11 @@ export class BrowserManager {
    * release is still unwinding. Remember that terminal cleanup request and run
    * it once the prior owner has left the native boundary. */
   private readonly scopeRuntimeReleaseRestarts = new Set<string>();
+  /** Transient Chromium teardown failures are retried a bounded number of
+   * times. Activity resets the budget; one timer per scope prevents retry
+   * storms while preserving the persistent Session request guards. */
+  private readonly scopeRuntimeReleaseRetryAttempts = new Map<string, number>();
+  private readonly scopeRuntimeReleaseRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly restrictedBackgroundScopes = new Set<string>();
   private readonly assistantControlledOrigins = new Map<string, Set<string>>();
   private readonly automationGestureTokens = new Map<string, PendingAutomationGesture>();
@@ -1626,10 +1632,16 @@ export class BrowserManager {
     // unsuspend) a profile selected by the previous configuration.
     const pendingRuntimeReleases = new Map(this.scopeRuntimeReleaseTasks);
     const pendingReleaseScopeKeys = [
-      ...new Set([...this.scopeRuntimeReleaseTokens.keys(), ...pendingRuntimeReleases.keys()]),
+      ...new Set([
+        ...this.scopeRuntimeReleaseTokens.keys(),
+        ...pendingRuntimeReleases.keys(),
+        ...this.scopeRuntimeReleaseRetryAttempts.keys(),
+        ...this.scopeRuntimeReleaseRetryTimers.keys(),
+      ]),
     ];
     this.scopeRuntimeReleaseTokens.clear();
     this.scopeRuntimeReleaseRestarts.clear();
+    this.cancelAllScopeRuntimeReleaseRetries();
 
     const affectedTabs = [...this.tabs.values()];
     const oldScopeKeys = new Set([
@@ -2511,6 +2523,7 @@ export class BrowserManager {
 
   private beginScopeActivity(scopeKey: string, kind: 'operation' | 'network' = 'operation'): () => void {
     this.assertScopeAvailable(scopeKey);
+    this.cancelScopeRuntimeReleaseRetry(scopeKey);
     // Any new profile operation cancels a pending last-tab release. The
     // releaser rechecks this token after each Chromium shutdown boundary.
     this.scopeRuntimeReleaseTokens.delete(scopeKey);
@@ -2628,6 +2641,50 @@ export class BrowserManager {
     if (!requests) return;
     this.scopeRequestActivities.delete(scopeKey);
     for (const finish of requests.values()) finish();
+  }
+
+  private finishCapturedScopeRequestActivities(scopeKey: string, captured: ReadonlyMap<number, () => void>): void {
+    const requests = this.scopeRequestActivities.get(scopeKey);
+    if (!requests) return;
+    for (const [requestId, finish] of captured) {
+      // Request ids are supplied by Chromium. Guard the exact lease as well as
+      // the id so a later request cannot be retired if Chromium reuses an id
+      // while closeAllConnections() is still settling.
+      if (requests.get(requestId) !== finish) continue;
+      this.validatingProxy?.releaseRequest(scopeKey, requestId);
+      requests.delete(requestId);
+      finish();
+    }
+    if (requests.size === 0) this.scopeRequestActivities.delete(scopeKey);
+  }
+
+  private cancelScopeRuntimeReleaseRetry(scopeKey: string, resetAttempts = true): void {
+    const timer = this.scopeRuntimeReleaseRetryTimers.get(scopeKey);
+    if (timer) clearTimeout(timer);
+    this.scopeRuntimeReleaseRetryTimers.delete(scopeKey);
+    if (resetAttempts) this.scopeRuntimeReleaseRetryAttempts.delete(scopeKey);
+  }
+
+  private cancelAllScopeRuntimeReleaseRetries(): void {
+    for (const scopeKey of this.scopeRuntimeReleaseRetryTimers.keys()) {
+      this.cancelScopeRuntimeReleaseRetry(scopeKey);
+    }
+    this.scopeRuntimeReleaseRetryAttempts.clear();
+  }
+
+  private scheduleScopeRuntimeReleaseRetry(scopeKey: string): void {
+    if (this.scopeRuntimeReleaseRetryTimers.has(scopeKey)) return;
+    const attempt = this.scopeRuntimeReleaseRetryAttempts.get(scopeKey) ?? 0;
+    const delay = IDLE_RUNTIME_RELEASE_RETRY_DELAYS_MS[attempt];
+    if (delay === undefined) return;
+    this.scopeRuntimeReleaseRetryAttempts.set(scopeKey, attempt + 1);
+    const timer = setTimeout(() => {
+      if (this.scopeRuntimeReleaseRetryTimers.get(scopeKey) !== timer) return;
+      this.scopeRuntimeReleaseRetryTimers.delete(scopeKey);
+      this.releaseScopeRuntimeWhenIdle(scopeKey, true);
+    }, delay);
+    timer.unref?.();
+    this.scopeRuntimeReleaseRetryTimers.set(scopeKey, timer);
   }
 
   private runTabOperation<T>(tab: InternalTab, operation: () => Promise<T>): Promise<T> {
@@ -9533,6 +9590,7 @@ export class BrowserManager {
 
   private releaseScopeRuntime(scopeKey: string, preserveSessionGuards = false): void {
     if ([...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)) return;
+    this.cancelScopeRuntimeReleaseRetry(scopeKey);
     if (!preserveSessionGuards) {
       const wiredSession = this.wiredSessionsByScope.get(scopeKey);
       const cleanupSession = this.wiredSessionCleanups.get(scopeKey);
@@ -9573,7 +9631,7 @@ export class BrowserManager {
     if (!preserveSessionGuards) this.suspendedScopes.delete(scopeKey);
   }
 
-  private releaseScopeRuntimeWhenIdle(scopeKey: string): void {
+  private releaseScopeRuntimeWhenIdle(scopeKey: string, scheduledRetry = false): void {
     if ([...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)) return;
     if ([...this.activeDownloads.values()].some((download) => download.scopeKey === scopeKey)) return;
     const config = this.config();
@@ -9586,6 +9644,13 @@ export class BrowserManager {
       !belongsToSelectedScope ||
       this.clearingScopes.has(scopeKey) ||
       this.suspendedScopes.has(scopeKey)
+    ) {
+      return;
+    }
+    if (this.scopeRuntimeReleaseRetryTimers.has(scopeKey)) return;
+    if (
+      !scheduledRetry &&
+      (this.scopeRuntimeReleaseRetryAttempts.get(scopeKey) ?? 0) >= IDLE_RUNTIME_RELEASE_RETRY_DELAYS_MS.length
     ) {
       return;
     }
@@ -9619,6 +9684,7 @@ export class BrowserManager {
         ![...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)
       );
     };
+    let retryAfterFailure = false;
     const work = (async () => {
       try {
         if (!remainsReleasable()) return;
@@ -9636,6 +9702,7 @@ export class BrowserManager {
           // count nonzero forever and prevent the cleanup needed to terminate it.
           await this.stopRunningServiceWorkers(scopedSession, undefined, true);
           if (!remainsReleasable()) return;
+          const resetRequests = new Map(this.scopeRequestActivities.get(scopeKey) ?? []);
           await this.runBrowserSessionMutation(
             scopeKey,
             scopedSession,
@@ -9644,7 +9711,12 @@ export class BrowserManager {
             undefined,
             () => this.releaseScopeRuntimeWhenIdle(scopeKey),
           );
-          this.finishAllScopeRequestActivities(scopeKey);
+          // Only the requests that existed when the reset began were terminated
+          // by that reset. A new request can invalidate the release token while
+          // closeAllConnections() is in flight and must retain its activity
+          // lease until its own terminal event arrives.
+          this.finishCapturedScopeRequestActivities(scopeKey, resetRequests);
+          if (!remainsReleasable()) return;
         }
         await this.waitForScopeIdle(scopeKey);
         if (!remainsReleasable()) return;
@@ -9653,12 +9725,16 @@ export class BrowserManager {
           await store.flush();
           if (!remainsReleasable()) return;
         }
-        if (remainsReleasable()) this.releaseScopeRuntime(scopeKey, true);
+        if (remainsReleasable()) {
+          this.cancelScopeRuntimeReleaseRetry(scopeKey);
+          this.releaseScopeRuntime(scopeKey, true);
+        }
       } catch (error) {
         // Keep the Session wired on failure so any surviving worker remains
-        // under the Browser request policy. A later tab close or shutdown can
-        // retry reclamation.
+        // under the Browser request policy. Retry reclamation with bounded
+        // backoff; fresh activity resets that retry budget.
         console.warn('[Browser] Could not release an idle Browser profile:', error);
+        retryAfterFailure = remainsReleasable();
       } finally {
         if (this.scopeRuntimeReleaseTokens.get(scopeKey) === token) {
           this.scopeRuntimeReleaseTokens.delete(scopeKey);
@@ -9672,6 +9748,7 @@ export class BrowserManager {
       }
       const restart = this.scopeRuntimeReleaseRestarts.delete(scopeKey);
       if (restart) this.releaseScopeRuntimeWhenIdle(scopeKey);
+      else if (retryAfterFailure) this.scheduleScopeRuntimeReleaseRetry(scopeKey);
     });
     this.scopeRuntimeReleaseTasks.set(scopeKey, task);
     void task.catch(() => undefined);
@@ -15987,6 +16064,7 @@ export class BrowserManager {
       // store, vault, and generation state.
       this.scopeRuntimeReleaseTokens.delete(scopeKey);
       this.scopeRuntimeReleaseRestarts.delete(scopeKey);
+      this.cancelScopeRuntimeReleaseRetry(scopeKey);
       const pendingRuntimeRelease = this.scopeRuntimeReleaseTasks.get(scopeKey);
       if (pendingRuntimeRelease) pendingRuntimeReleases.set(scopeKey, pendingRuntimeRelease);
       this.clearingScopes.add(scopeKey);
@@ -16621,6 +16699,7 @@ export class BrowserManager {
     this.shuttingDown = true;
     this.disposed = true;
     clearInterval(this.idleTimer);
+    this.cancelAllScopeRuntimeReleaseRetries();
     for (const vault of this.vaults.values()) vault.dispose();
     for (const pending of this.pendingAssistantContinuations?.values() ?? []) clearTimeout(pending.timer);
     this.pendingAssistantContinuations?.clear();
@@ -16710,6 +16789,8 @@ export class BrowserManager {
     this.scopeRuntimeReleaseTokens.clear();
     this.scopeRuntimeReleaseTasks.clear();
     this.scopeRuntimeReleaseRestarts.clear();
+    this.scopeRuntimeReleaseRetryAttempts.clear();
+    this.scopeRuntimeReleaseRetryTimers.clear();
     this.pendingAssistantTabClosures.clear();
     this.assistantTabCleanups?.clear();
     this.assistantTabCleanupRetries?.clear();
@@ -16725,6 +16806,7 @@ export class BrowserManager {
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
+    this.cancelAllScopeRuntimeReleaseRetries();
     const suspendedByAttempt = new Set<string>();
     const attempt = (async () => {
       // A user may quit while a data clear or settings-driven scope transition
