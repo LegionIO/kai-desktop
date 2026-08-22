@@ -1462,12 +1462,15 @@ function AppShell() {
       expectedCurrentId?: string | null,
       inheritedNavigationGeneration?: number,
       expectedCurrentRevision?: number,
+      inheritedConversationSelectionGeneration?: number,
     ): Promise<boolean> => {
       const navigationGeneration = inheritedNavigationGeneration ?? ++navigationIntentGenerationRef.current;
+      let conversationSelectionGeneration = inheritedConversationSelectionGeneration;
       if (inheritedNavigationGeneration === undefined) {
         cancelWorkspaceObservationWaits();
-        conversationSelectionIntentGenerationRef.current++;
+        conversationSelectionGeneration = ++conversationSelectionIntentGenerationRef.current;
       }
+      conversationSelectionGeneration ??= conversationSelectionIntentGenerationRef.current;
       if (navigationIntentGenerationRef.current !== navigationGeneration) return false;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
@@ -1501,6 +1504,8 @@ function AppShell() {
         currentSequence: activeSyncSeqRef.current,
         conversationId: id,
         currentConversationId: activeConversationIdRef.current,
+        conversationSelectionGeneration,
+        currentConversationSelectionGeneration: conversationSelectionIntentGenerationRef.current,
         navigationGeneration,
         currentNavigationGeneration: navigationIntentGenerationRef.current,
       });
@@ -1511,9 +1516,19 @@ function AppShell() {
       // write so a rapid re-switch (A→B→A) doesn't let B's late-resolving title
       // overwrite the now-active A.
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-      if (seq !== activeSyncSeqRef.current || activeConversationIdRef.current !== id) return false;
+      const finalDisposition = resolveConversationActivationDisposition({
+        sequence: seq,
+        currentSequence: activeSyncSeqRef.current,
+        conversationId: id,
+        currentConversationId: activeConversationIdRef.current,
+        conversationSelectionGeneration,
+        currentConversationSelectionGeneration: conversationSelectionIntentGenerationRef.current,
+        navigationGeneration,
+        currentNavigationGeneration: navigationIntentGenerationRef.current,
+      });
+      if (finalDisposition === 'superseded') return false;
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
-      return activationDisposition === 'foreground' && navigationIntentGenerationRef.current === navigationGeneration;
+      return true;
     },
     [cancelWorkspaceObservationWaits, cuSessionsByConversation, isMobile],
   );
@@ -1554,6 +1569,7 @@ function AppShell() {
             id: string | null,
             expectedCurrentId: string | null,
             departingConversationId = activeConversationIdRef.current,
+            expectedMutationToken?: string,
           ) => {
             const transitionKey = id ?? '';
             const transition = createBrowserWorkspaceTransitionMarker({
@@ -1570,7 +1586,7 @@ function AppShell() {
               const result = await app.workspaces.setActive({
                 id,
                 expectedCurrentId,
-                ...(expectedCurrentMutationToken !== undefined ? { expectedCurrentMutationToken } : {}),
+                ...(expectedMutationToken !== undefined ? { expectedCurrentMutationToken: expectedMutationToken } : {}),
                 mutationToken: workspaceMutationToken,
               });
               if (
@@ -1616,7 +1632,12 @@ function AppShell() {
             }
           };
           if (operation === 'rollback') {
-            return setActiveWorkspaceOnce(workspaceId, expectedCurrentWorkspaceId);
+            return setActiveWorkspaceOnce(
+              workspaceId,
+              expectedCurrentWorkspaceId,
+              activeConversationIdRef.current,
+              expectedCurrentMutationToken,
+            );
           }
           if (workspaceId === null) return false;
           return setActiveBrowserWorkspaceWithRebase({
@@ -1686,12 +1707,14 @@ function AppShell() {
           expectedCurrentConversationId,
           navigationGeneration,
           expectedCurrentConversationRevision,
+          conversationSelectionGeneration,
         ) =>
           handleSwitchConversation(
             conversationId,
             expectedCurrentConversationId,
             navigationGeneration,
             expectedCurrentConversationRevision,
+            conversationSelectionGeneration,
           ),
       });
       return opened && navigationIntentGenerationRef.current === selectionGeneration;

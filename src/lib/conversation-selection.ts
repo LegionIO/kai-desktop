@@ -261,10 +261,16 @@ export function resolveConversationActivationDisposition(options: {
   currentSequence: number;
   conversationId: string;
   currentConversationId: string | null;
+  conversationSelectionGeneration: number;
+  currentConversationSelectionGeneration: number;
   navigationGeneration: number;
   currentNavigationGeneration: number;
 }): ConversationActivationDisposition {
-  if (options.sequence !== options.currentSequence || options.currentConversationId !== options.conversationId) {
+  if (
+    options.sequence !== options.currentSequence ||
+    options.currentConversationId !== options.conversationId ||
+    options.conversationSelectionGeneration !== options.currentConversationSelectionGeneration
+  ) {
     return 'superseded';
   }
   return options.navigationGeneration === options.currentNavigationGeneration ? 'foreground' : 'background';
@@ -502,14 +508,19 @@ export async function setActiveUserWorkspaceWithRebase(options: {
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
 }): Promise<ActiveWorkspaceCasResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
+  let expectedCurrentMutationToken: string | undefined;
   let lastResult: ActiveWorkspaceCasResult = { ok: false };
   for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
     if (!options.isCurrent()) return lastResult;
-    const result = await options.setActiveWorkspace(
-      options.workspaceId,
-      expectedCurrentWorkspaceId,
-      options.mutationToken,
-    );
+    const result =
+      expectedCurrentMutationToken === undefined
+        ? await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId, options.mutationToken)
+        : await options.setActiveWorkspace(
+            options.workspaceId,
+            expectedCurrentWorkspaceId,
+            options.mutationToken,
+            expectedCurrentMutationToken,
+          );
     if (result.ok) {
       if (options.isCurrent()) return result;
       // The stale request committed while a newer navigation intent was taking
@@ -530,8 +541,15 @@ export async function setActiveUserWorkspaceWithRebase(options: {
       };
     }
     lastResult = result;
-    if (!options.isCurrent() || !options.canRebase(result) || result.activeWorkspaceId === undefined) return result;
+    if (
+      !options.isCurrent() ||
+      !options.canRebase(result) ||
+      result.activeWorkspaceId === undefined ||
+      typeof result.activeWorkspaceMutationToken !== 'string'
+    )
+      return result;
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
+    expectedCurrentMutationToken = result.activeWorkspaceMutationToken;
   }
   return lastResult;
 }
@@ -547,28 +565,36 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
     workspaceId: string,
     expectedCurrentWorkspaceId: string | null,
     departingConversationId: string | null,
+    expectedCurrentMutationToken?: string,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
 }): Promise<BrowserWorkspaceSwitchResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
   let departingConversationId = options.departingConversationId;
+  let expectedCurrentMutationToken: string | undefined;
   for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
-    const result = await options.setActiveWorkspace(
-      options.workspaceId,
-      expectedCurrentWorkspaceId,
-      departingConversationId,
-    );
+    const result =
+      expectedCurrentMutationToken === undefined
+        ? await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId, departingConversationId)
+        : await options.setActiveWorkspace(
+            options.workspaceId,
+            expectedCurrentWorkspaceId,
+            departingConversationId,
+            expectedCurrentMutationToken,
+          );
     if (result.ok) return { ok: true, previousWorkspaceId: expectedCurrentWorkspaceId };
     if (
       !options.isCurrent() ||
       !options.canRebase(result) ||
       result.activeWorkspaceId === undefined ||
-      result.activeWorkspaceLastConversationId === undefined
+      result.activeWorkspaceLastConversationId === undefined ||
+      typeof result.activeWorkspaceMutationToken !== 'string'
     )
       return { ok: false };
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
     departingConversationId = result.activeWorkspaceLastConversationId;
+    expectedCurrentMutationToken = result.activeWorkspaceMutationToken;
   }
   return { ok: false };
 }
@@ -605,6 +631,7 @@ export async function openBrowserConversationInWorkspace(options: {
     expectedCurrentConversationId: string | null,
     selectionGeneration: number,
     expectedCurrentConversationRevision: number,
+    conversationSelectionGeneration: number,
   ) => Promise<boolean>;
 }): Promise<boolean> {
   const selectionWhenStarted = options.getActiveConversationId();
@@ -632,6 +659,7 @@ export async function openBrowserConversationInWorkspace(options: {
       backendSelectionWhenStarted.activeConversationId,
       options.selectionGeneration,
       backendSelectionWhenStarted.activeConversationRevision,
+      options.conversationSelectionGeneration,
     );
   };
   if (!targetWorkspaceId) {
@@ -756,6 +784,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   let committed = false;
   let switchedWorkspace = false;
   let shouldDiscardTransition = true;
+  let shouldRestoreDestination = true;
   let previousWorkspaceId = options.activeWorkspaceId ?? null;
   const restoreDestination = async (): Promise<void> => {
     if (!destinationUpdate?.ok || destinationUpdate.previousConversationId === undefined) return;
@@ -832,6 +861,11 @@ export async function prepareConversationWorkspaceSwitch(options: {
                   (authoritativeMutationToken !== undefined &&
                     authoritativeMutationToken !== options.workspaceMutationToken);
               }
+            } else if (disposition === 'retain') {
+              // A newer user selection intentionally owns the destination.
+              // Restoring the Browser request's previous cursor would replace
+              // that retained workspace with stale metadata.
+              shouldRestoreDestination = false;
             }
           } catch (error) {
             shouldDiscardTransition = false;
@@ -847,7 +881,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
           // request's marker remains untouched.
           if (shouldDiscardTransition) options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
         } finally {
-          await restoreDestination();
+          if (shouldRestoreDestination) await restoreDestination();
         }
       }
     }

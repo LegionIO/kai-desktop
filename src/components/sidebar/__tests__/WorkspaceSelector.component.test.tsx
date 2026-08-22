@@ -167,6 +167,7 @@ describe('WorkspaceSelector', () => {
     expect(setActive).toHaveBeenNthCalledWith(2, {
       id: 'workspace-b',
       expectedCurrentId: 'workspace-browser',
+      expectedCurrentMutationToken: 'local-browser_request-1',
       mutationToken: 'local-user_request-rebase',
     });
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
@@ -178,26 +179,44 @@ describe('WorkspaceSelector', () => {
     let backendWorkspaceId = 'workspace-a';
     let backendMutationToken: string | null = null;
     let resolveFirstSelection: (result: { ok: true; activeWorkspaceId: string }) => void = () => {};
-    const setActive = vi.fn(async (args: { id: string; expectedCurrentId: string | null; mutationToken?: string }) => {
-      if (args.id === 'workspace-b') {
+    const setActive = vi.fn(
+      async (args: {
+        id: string;
+        expectedCurrentId: string | null;
+        expectedCurrentMutationToken?: string | null;
+        mutationToken?: string;
+      }) => {
+        if (
+          args.expectedCurrentMutationToken !== undefined &&
+          args.expectedCurrentMutationToken !== backendMutationToken
+        ) {
+          return {
+            ok: false,
+            error: 'active-workspace-changed' as const,
+            activeWorkspaceId: backendWorkspaceId,
+            activeWorkspaceMutationToken: backendMutationToken,
+          };
+        }
+        if (args.id === 'workspace-b') {
+          backendWorkspaceId = args.id;
+          backendMutationToken = args.mutationToken ?? null;
+          return new Promise<{ ok: true; activeWorkspaceId: string }>((resolve) => {
+            resolveFirstSelection = resolve;
+          });
+        }
+        if (args.expectedCurrentId !== backendWorkspaceId) {
+          return {
+            ok: false,
+            error: 'active-workspace-changed' as const,
+            activeWorkspaceId: backendWorkspaceId,
+            activeWorkspaceMutationToken: backendMutationToken,
+          };
+        }
         backendWorkspaceId = args.id;
         backendMutationToken = args.mutationToken ?? null;
-        return new Promise<{ ok: true; activeWorkspaceId: string }>((resolve) => {
-          resolveFirstSelection = resolve;
-        });
-      }
-      if (args.expectedCurrentId !== backendWorkspaceId) {
-        return {
-          ok: false,
-          error: 'active-workspace-changed' as const,
-          activeWorkspaceId: backendWorkspaceId,
-          activeWorkspaceMutationToken: backendMutationToken,
-        };
-      }
-      backendWorkspaceId = args.id;
-      backendMutationToken = args.mutationToken ?? null;
-      return { ok: true, activeWorkspaceId: backendWorkspaceId };
-    });
+        return { ok: true, activeWorkspaceId: backendWorkspaceId };
+      },
+    );
     installAppBridgeStub({ workspaces: { setActive } });
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
@@ -259,6 +278,7 @@ describe('WorkspaceSelector', () => {
     expect(setActive).toHaveBeenNthCalledWith(3, {
       id: 'workspace-c',
       expectedCurrentId: 'workspace-b',
+      expectedCurrentMutationToken: 'local-user_request-1',
       mutationToken: 'local-user_request-2',
     });
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();

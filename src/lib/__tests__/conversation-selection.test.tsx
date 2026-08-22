@@ -42,6 +42,8 @@ describe('resolveConversationActivationDisposition', () => {
     currentSequence: 4,
     conversationId: 'chat-b',
     currentConversationId: 'chat-b',
+    conversationSelectionGeneration: 3,
+    currentConversationSelectionGeneration: 3,
     navigationGeneration: 7,
     currentNavigationGeneration: 7,
   };
@@ -54,6 +56,9 @@ describe('resolveConversationActivationDisposition', () => {
   it('drops an activation superseded by a newer conversation selection', () => {
     expect(resolveConversationActivationDisposition({ ...current, currentSequence: 5 })).toBe('superseded');
     expect(resolveConversationActivationDisposition({ ...current, currentConversationId: 'chat-c' })).toBe(
+      'superseded',
+    );
+    expect(resolveConversationActivationDisposition({ ...current, currentConversationSelectionGeneration: 4 })).toBe(
       'superseded',
     );
   });
@@ -625,6 +630,7 @@ describe('setActiveUserWorkspaceWithRebase', () => {
       'workspace-user',
       'workspace-browser',
       'local-user_request-1',
+      'local-browser_request-1',
     );
   });
 
@@ -716,6 +722,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         error: 'active-workspace-changed',
         activeWorkspaceId: 'workspace-authoritative',
         activeWorkspaceLastConversationId: 'chat-authoritative',
+        activeWorkspaceMutationToken: 'local-browser_request-1',
       })
       .mockResolvedValueOnce({ ok: true });
 
@@ -736,6 +743,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
       'workspace-browser',
       'workspace-authoritative',
       'chat-authoritative',
+      'local-browser_request-1',
     );
   });
 
@@ -837,7 +845,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       mutationToken: 'browser_request-test',
     });
     expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration, 1);
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration, 1, selectionGeneration);
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
 
@@ -868,7 +876,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(true);
 
-    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1, 42);
+    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1, 42, 1);
   });
 
   it('adopts a pending workspace transition when the target is already selected', async () => {
@@ -936,7 +944,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ).resolves.toBe(true);
 
     expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 2, 1);
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 2, 1, 2);
   });
 
   it('does not let a delayed older request adopt a newer transition', async () => {
@@ -972,11 +980,15 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
   it('switches workspaces when Browser attention targets the already-selected conversation', async () => {
     let activeWorkspaceId = 'workspace-b';
-    const saveLastConversation = vi.fn(async () => undefined);
     const setActiveWorkspace = vi.fn(async (workspaceId: string | null) => {
       activeWorkspaceId = workspaceId ?? '';
       return true;
     });
+    const saveLastConversation = vi.fn(async () => ({
+      ok: true,
+      previousConversationId: 'chat-b-previous',
+      lastActiveConversationId: 'chat-b',
+    }));
     const switchConversation = vi.fn(async () => true);
     const cancelObservation = vi.fn();
 
@@ -1025,6 +1037,11 @@ describe('prepareConversationWorkspaceSwitch', () => {
       activeWorkspaceId = workspaceId ?? '';
       return true;
     });
+    const saveLastConversation = vi.fn(async () => ({
+      ok: true,
+      previousConversationId: 'chat-b-previous',
+      lastActiveConversationId: 'chat-b',
+    }));
     const switchConversation = vi.fn(async () => true);
     const retainActiveWorkspaceTransition = vi.fn();
 
@@ -1040,7 +1057,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
-      saveLastConversation: async () => undefined,
+      saveLastConversation,
       getWorkspaceSelectionGeneration: () => workspaceSelectionGeneration,
       workspaceSelectionGeneration,
       getBrowserAttentionGeneration: () => 1,
@@ -1068,6 +1085,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(activeWorkspaceId).toBe('workspace-b');
     expect(retainActiveWorkspaceTransition).toHaveBeenCalledOnce();
     expect(retainActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
+    expect(saveLastConversation).toHaveBeenCalledOnce();
+    expect(saveLastConversation).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b',
+      mutationToken: 'browser_request-test',
+    });
   });
 
   it('rolls back after a newer source-workspace conversation selection', async () => {
@@ -1313,7 +1336,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(false);
 
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1, 1);
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1, 1, 1);
     expect(setActiveWorkspace).toHaveBeenLastCalledWith(
       'workspace-a',
       'workspace-b',
@@ -1435,7 +1458,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveFirstConversation({ workspaceId: 'workspace-a' });
     await expect(first).resolves.toBe(false);
     expect(switchConversation).toHaveBeenCalledOnce();
-    expect(switchConversation).toHaveBeenCalledWith('chat-c', 'chat-a', 2, 1);
+    expect(switchConversation).toHaveBeenCalledWith('chat-c', 'chat-a', 2, 1, 2);
   });
 
   it('rolls an older Browser transition back before the serialized successor mutates workspace state', async () => {
