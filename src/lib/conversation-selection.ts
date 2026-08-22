@@ -674,6 +674,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   let destinationUpdate: WorkspaceLastConversationCasResult | void;
   let committed = false;
   let switchedWorkspace = false;
+  let shouldDiscardTransition = true;
   let previousWorkspaceId = options.activeWorkspaceId ?? null;
   const restoreDestination = async (): Promise<void> => {
     if (!destinationUpdate?.ok || destinationUpdate.previousConversationId === undefined) return;
@@ -726,17 +727,33 @@ export async function prepareConversationWorkspaceSwitch(options: {
     if (!committed) {
       try {
         if (switchedWorkspace) {
-          const disposition = (await options.resolveStaleSwitchDisposition?.()) ?? 'superseded';
-          if (disposition === 'rollback') {
-            await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
+          try {
+            const disposition = (await options.resolveStaleSwitchDisposition?.()) ?? 'superseded';
+            if (disposition === 'rollback') {
+              const rollbackResult = await options.setActiveWorkspace(
+                previousWorkspaceId,
+                targetWorkspaceId,
+                'rollback',
+              );
+              const rolledBack = typeof rollbackResult === 'boolean' ? rollbackResult : rollbackResult.ok;
+              // A failed rollback leaves the destination workspace authoritative.
+              // Keep its navigation marker so the renderer effect can reconcile
+              // its lagging workspace cursor instead of restoring stale state.
+              if (!rolledBack) shouldDiscardTransition = false;
+            }
+          } catch (error) {
+            shouldDiscardTransition = false;
+            throw error;
           }
         }
       } finally {
         try {
-          // Every unsuccessful preparation relinquishes the exact marker it
-          // created or adopted. The renderer callback generation-checks this
-          // request, so a newer Browser request's marker remains untouched.
-          options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
+          // Relinquish the exact marker this request created or adopted unless
+          // a failed rollback left the destination authoritative. In that case
+          // the marker must survive so React can reconcile its lagging cursor.
+          // The callback generation-checks this request, so a newer Browser
+          // request's marker remains untouched.
+          if (shouldDiscardTransition) options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
         } finally {
           await restoreDestination();
         }

@@ -5236,7 +5236,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.trustedUserNavigation).toBe(false);
   });
 
-  it('uses wired exact failures to settle the current same-URL navigation', () => {
+  it('uses wired exact failures when a repeated same-URL navigation starts before its request', () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     let requestPolicy:
       | ((
@@ -5335,15 +5335,22 @@ describe('browser manager renderer lifecycle', () => {
       vi.fn(),
     );
     listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+    // Electron can deliver did-start-navigation for the replacement before its
+    // onBeforeRequest callback. The still-active first request must remain
+    // claimed by the superseded generation rather than being reused here.
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
     requestPolicy?.(
       { id: 11, method: 'GET', webContentsId: 42, resourceType: 'mainFrame', url: navigationUrl },
       vi.fn(),
     );
-    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
     const provisional = Reflect.get(tab, 'provisionalNetworkNavigation') as {
       generation: number;
       redactionKey: unknown;
+      requestId?: number;
+      superseded: Array<{ requestId?: number }>;
     };
+    expect(provisional.requestId).toBe(11);
+    expect(provisional.superseded).toContainEqual(expect.objectContaining({ requestId: 10 }));
     const currentGeneration = provisional.generation;
     const committedRedactionKey = provisional.redactionKey;
 

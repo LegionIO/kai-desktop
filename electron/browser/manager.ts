@@ -10021,11 +10021,22 @@ export class BrowserManager {
     const currentActiveRequestIds = new Set(
       tab.diagnosticActiveNetworkRequestIds ?? tab.activeNetworkRequests?.keys() ?? [],
     );
+    const claimedNavigationRequestIds = new Set<number>();
+    if (previousProvisional?.requestId !== undefined) {
+      claimedNavigationRequestIds.add(previousProvisional.requestId);
+    }
+    for (const attempt of previousProvisional?.superseded ?? []) {
+      if (attempt.requestId !== undefined) claimedNavigationRequestIds.add(attempt.requestId);
+    }
+    for (const attempt of tab.supersededNetworkNavigations ?? []) {
+      if (attempt.requestId !== undefined) claimedNavigationRequestIds.add(attempt.requestId);
+    }
     const expectedNavigationUrl = sanitizeBrowserNetworkUrl(url, currentRedactionKey).url;
     const navigationRequest = [...currentRequests.values()]
       .filter(
         (request) =>
           request.completedAt === undefined &&
+          !claimedNavigationRequestIds.has(request.id) &&
           tab.activeNetworkRequests?.get(request.id) === 'mainFrame' &&
           sanitizeBrowserNetworkUrl(request.url, currentRedactionKey).url === expectedNavigationUrl,
       )
