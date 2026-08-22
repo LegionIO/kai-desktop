@@ -4,6 +4,7 @@ import { stat, realpath } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { basename, isAbsolute } from 'path';
 import type { AppConfig, Workspace } from '../config/schema.js';
+import type { WorkspaceConfigMutation } from './config.js';
 import { nextWorkspaceColor } from '../config/workspaces.js';
 
 /**
@@ -18,7 +19,7 @@ export function registerWorkspaceHandlers(
   _appHome: string,
   getConfig: () => AppConfig,
   setConfig: (path: string, value: unknown) => void,
-): void {
+): { invalidateMutationProvenance: (mutation: WorkspaceConfigMutation) => void } {
   const normalizeMutationToken = (mutationToken: unknown): string | null =>
     typeof mutationToken === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(mutationToken) ? mutationToken : null;
   let activeWorkspaceMutationToken: string | null = null;
@@ -44,6 +45,13 @@ export function registerWorkspaceHandlers(
     const normalized = normalizeMutationToken(mutationToken);
     lastConversationMutations.set(workspaceId, { conversationId, mutationToken: normalized });
     return normalized;
+  };
+  const invalidateMutationProvenance = (mutation: WorkspaceConfigMutation): void => {
+    if (mutation.activeWorkspaceChanged) {
+      mutationTokenWorkspaceId = getConfig().ui?.activeWorkspaceId ?? null;
+      activeWorkspaceMutationToken = null;
+    }
+    if (mutation.lastConversationStateChanged) lastConversationMutations.clear();
   };
 
   // ── Create ──────────────────────────────────────────────────────────────
@@ -272,4 +280,6 @@ export function registerWorkspaceHandlers(
     const dirPath = result.filePaths[0];
     return { path: dirPath, name: basename(dirPath) };
   });
+
+  return { invalidateMutationProvenance };
 }

@@ -1852,6 +1852,7 @@ if (gotSingleInstanceLock) {
 
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
+    let workspaceHandlers: ReturnType<typeof registerWorkspaceHandlers> | null = null;
     const { setConfig } = registerConfigHandlers(
       ipcMain,
       APP_HOME,
@@ -1869,8 +1870,10 @@ if (gotSingleInstanceLock) {
         );
       },
       handleBrowserConfigChanged,
+      (mutation) => workspaceHandlers?.invalidateMutationProvenance(mutation),
     );
     setBrowserRollbackConfig = setConfig;
+    workspaceHandlers = registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     registerConversationHandlers(
       ipcMain,
       APP_HOME,
@@ -2012,8 +2015,6 @@ if (gotSingleInstanceLock) {
         stopAgentForDeletedTask(APP_HOME, taskTerminalManager, assignedAgentId, taskId);
       },
     });
-    registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
-
     // Autopilot / orchestrator — drives task auto-assignment when enabled.
     const initialAutopilotConfig = getConfig().autopilot;
     const taskDispatcher = new TaskDispatcher(

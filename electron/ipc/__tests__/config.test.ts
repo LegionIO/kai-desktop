@@ -108,6 +108,19 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: desktopConfigPayload round-trip', () => {
+  it('fails Browser access closed when a persisted config is invalid before the first read', () => {
+    writeFileSync(join(appHome, 'settings', 'desktop.json'), '{"browser":', 'utf-8');
+
+    const fallback = readEffectiveConfig(appHome);
+
+    expect(fallback.browser.enabled).toBe(false);
+    expect(fallback.browser.readAccess).toBe('deny');
+    expect(fallback.browser.structuredActions).toBe('deny');
+    expect(fallback.browser.scriptInjection).toBe('deny');
+    expect(fallback.browser.passwordAccess).toBe('user-only');
+    expect(fallback.browser.aiAllowPrivateNetwork).toBe(false);
+  });
+
   it('throws on a security-sensitive reload instead of substituting permissive defaults', () => {
     const initial = readEffectiveConfig(appHome);
     initial.browser.enabled = false;
@@ -306,6 +319,51 @@ describe('agent.piSdk schema', () => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: registered channels', () => {
+  it('reports workspace and cursor mutations before a debounced external reload can collapse an ABA sequence', async () => {
+    const onWorkspaceConfigMutation = vi.fn();
+    let requestReload!: () => void;
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        ({ reloadConfig: requestReload } = registerConfigHandlers(
+          ipc as Parameters<typeof registerConfigHandlers>[0],
+          appHome,
+          undefined,
+          undefined,
+          undefined,
+          onWorkspaceConfigMutation,
+        ));
+      },
+    });
+    const initial = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+    const workspace = {
+      id: 'workspace-a',
+      name: 'A',
+      directory: '/work/a',
+      color: '#123456',
+      lastActiveAt: 1,
+      createdAt: 1,
+      lastActiveConversationId: 'chat-a',
+    };
+    const writeExternal = (activeWorkspaceId: string | null, lastActiveConversationId: string | null) => {
+      const next = structuredClone(initial);
+      next.ui.activeWorkspaceId = activeWorkspaceId;
+      next.ui.workspaces = [{ ...workspace, lastActiveConversationId }];
+      writeFileSync(join(appHome, 'settings', 'desktop.json'), JSON.stringify(desktopConfigPayload(next)), 'utf-8');
+      requestReload();
+    };
+
+    writeExternal('workspace-a', 'chat-a');
+    writeExternal('workspace-b', 'chat-b');
+    writeExternal('workspace-a', 'chat-a');
+
+    expect(onWorkspaceConfigMutation).toHaveBeenCalledTimes(3);
+    expect(onWorkspaceConfigMutation.mock.calls).toEqual([
+      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
+      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
+      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
+    ]);
+  });
+
   it('hot-reloads first-time llm.json creation before desktop.json exists', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

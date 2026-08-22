@@ -32,6 +32,7 @@ import type { AppConfig } from '../../config/schema.js';
 
 let config: { ui: { workspaces: unknown[]; activeWorkspaceId: string | null } };
 const sets: Array<[string, unknown]> = [];
+let invalidateMutationProvenance: ReturnType<typeof registerWorkspaceHandlers>['invalidateMutationProvenance'];
 const getConfig = () => config as unknown as AppConfig;
 const setConfig = (path: string, value: unknown) => {
   sets.push([path, value]);
@@ -45,7 +46,7 @@ beforeEach(() => {
   realMap.clear();
   sets.length = 0;
   config = { ui: { workspaces: [], activeWorkspaceId: null } };
-  registerWorkspaceHandlers(fakeIpc as never, '/home', getConfig, setConfig);
+  ({ invalidateMutationProvenance } = registerWorkspaceHandlers(fakeIpc as never, '/home', getConfig, setConfig));
 });
 
 const create = (args: { name: string; directory: string; mutationToken?: string }) =>
@@ -186,6 +187,57 @@ describe('workspaces:set-active integrity', () => {
       activeWorkspaceLastConversationId: null,
       activeWorkspaceMutationToken: 'local-delete-request',
     });
+  });
+
+  it('invalidates active-workspace provenance across an out-of-band ABA change', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+
+    await expect(setActive(first.id, second.id, 'browser-request')).resolves.toMatchObject({
+      ok: true,
+      activeWorkspaceMutationToken: 'browser-request',
+    });
+    config.ui.activeWorkspaceId = second.id;
+    config.ui.activeWorkspaceId = first.id;
+    invalidateMutationProvenance({ activeWorkspaceChanged: true, lastConversationStateChanged: false });
+
+    await expect(setActive(second.id, first.id, 'new-request', 'browser-request')).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: first.id,
+      activeWorkspaceLastConversationId: null,
+      activeWorkspaceMutationToken: null,
+    });
+    expect(config.ui.activeWorkspaceId).toBe(first.id);
+  });
+
+  it('invalidates last-conversation provenance across an out-of-band ABA change', async () => {
+    dirs.add('/work/a');
+    const workspace = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    await expect(
+      saveLastConversation(workspace.id, 'chat-browser', undefined, 'browser-request'),
+    ).resolves.toMatchObject({
+      ok: true,
+      lastActiveConversationMutationToken: 'browser-request',
+    });
+
+    const stored = config.ui.workspaces.find((candidate) => (candidate as { id?: string }).id === workspace.id) as {
+      lastActiveConversationId: string | null;
+    };
+    stored.lastActiveConversationId = 'chat-user';
+    stored.lastActiveConversationId = 'chat-browser';
+    invalidateMutationProvenance({ activeWorkspaceChanged: false, lastConversationStateChanged: true });
+
+    await expect(
+      saveLastConversation(workspace.id, 'chat-old', 'chat-browser', undefined, 'browser-request'),
+    ).resolves.toEqual({
+      ok: false,
+      error: 'last-conversation-changed',
+      lastActiveConversationId: 'chat-browser',
+    });
+    expect(stored.lastActiveConversationId).toBe('chat-browser');
   });
 
   it('rejects a rollback after another mutation changes the workspace away and back', async () => {

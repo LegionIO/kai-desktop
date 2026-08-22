@@ -1112,6 +1112,39 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
   };
 }
 
+export type WorkspaceConfigMutation = {
+  activeWorkspaceChanged: boolean;
+  lastConversationStateChanged: boolean;
+};
+
+function workspaceConfigState(config: AppConfig): {
+  activeWorkspaceId: string | null;
+  lastConversationFingerprint: string;
+} {
+  const workspaces = [...(config.ui?.workspaces ?? [])]
+    .map((workspace) => [workspace.id, workspace.lastActiveConversationId ?? null] as const)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return {
+    activeWorkspaceId: config.ui?.activeWorkspaceId ?? null,
+    lastConversationFingerprint: JSON.stringify(workspaces),
+  };
+}
+
+function failClosedBrowserConfig(config: AppConfig): AppConfig {
+  return {
+    ...config,
+    browser: {
+      ...config.browser,
+      enabled: false,
+      readAccess: 'deny',
+      structuredActions: 'deny',
+      scriptInjection: 'deny',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: false,
+    },
+  };
+}
+
 export function readEffectiveConfig(
   appHome: string,
   options: { failOnInvalid?: boolean; allowMissingDesktopConfig?: boolean } = {},
@@ -1134,10 +1167,14 @@ export function readEffectiveConfig(
         console.error('[Config] Failed to parse desktop.json, using the last valid config:', error);
         return cached;
       }
-      console.error('[Config] Failed to parse desktop.json, using defaults because no valid config was cached:', error);
-      return ensureDefaultProfile(
-        normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
+      console.error('[Config] Failed to parse desktop.json, using fail-closed Browser defaults:', error);
+      const fallback = failClosedBrowserConfig(
+        ensureDefaultProfile(
+          normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
+        ),
       );
+      rememberEffectiveConfig(appHome, fallback);
+      return fallback;
     }
   }
 
@@ -1274,10 +1311,25 @@ export function registerConfigHandlers(
   onChanged?: (config: AppConfig) => void,
   mayWriteBrowserConfig: (event: unknown) => boolean = () => false,
   onBrowserChanged?: (config: AppConfig['browser']) => void,
+  onWorkspaceConfigMutation?: (mutation: WorkspaceConfigMutation) => void,
 ): { setConfig: (path: string, value: unknown) => void; reloadConfig: () => void } {
   let currentConfig = readEffectiveConfig(appHome);
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
   let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
+  let lastObservedWorkspaceState = workspaceConfigState(currentConfig);
+
+  const observeWorkspaceConfig = (nextConfig: AppConfig): void => {
+    const next = workspaceConfigState(nextConfig);
+    const mutation = {
+      activeWorkspaceChanged: next.activeWorkspaceId !== lastObservedWorkspaceState.activeWorkspaceId,
+      lastConversationStateChanged:
+        next.lastConversationFingerprint !== lastObservedWorkspaceState.lastConversationFingerprint,
+    };
+    lastObservedWorkspaceState = next;
+    if (mutation.activeWorkspaceChanged || mutation.lastConversationStateChanged) {
+      onWorkspaceConfigMutation?.(mutation);
+    }
+  };
 
   // Watch for external config changes
   const configPath = getDesktopSettingsPath(appHome);
@@ -1340,6 +1392,7 @@ export function registerConfigHandlers(
   const applyReload = (): boolean => {
     try {
       currentConfig = readWatchedConfig();
+      observeWorkspaceConfig(currentConfig);
       watchedConfigReadPending = false;
       publishBrowserConfig(false);
       // External edit to desktop.json (enabled/content/scopes/retention) must
@@ -1362,6 +1415,11 @@ export function registerConfigHandlers(
     // is followed quickly by an enable.
     try {
       const nextConfig = readWatchedConfig();
+      // Observe workspace state before the general debounce so a rapid
+      // out-of-band A→B→A edit cannot preserve stale Browser CAS tokens.
+      // Internal writes update this snapshot synchronously below, so their
+      // later fs.watch echo is a no-op.
+      observeWorkspaceConfig(nextConfig);
       watchedConfigReadPending = false;
       if (JSON.stringify(nextConfig.browser) !== lastBrowserSnapshot) {
         currentConfig = nextConfig;
@@ -1474,6 +1532,7 @@ export function registerConfigHandlers(
     }
     if (path === 'models') {
       currentConfig = readEffectiveConfig(appHome);
+      observeWorkspaceConfig(currentConfig);
       publishBrowserConfig(false);
       scheduleConfigBroadcast();
       return;
@@ -1511,6 +1570,7 @@ export function registerConfigHandlers(
       }
 
       currentConfig = readEffectiveConfig(appHome);
+      observeWorkspaceConfig(currentConfig);
       publishBrowserConfig(false);
       scheduleConfigBroadcast();
       return;
@@ -1546,6 +1606,7 @@ export function registerConfigHandlers(
     }
     desktopSettingsEstablished = true;
     currentConfig = readEffectiveConfig(appHome);
+    observeWorkspaceConfig(currentConfig);
     publishBrowserConfig(path === 'browser' || path.startsWith('browser.'));
     scheduleConfigBroadcast();
   };
