@@ -69,9 +69,15 @@ interface WorkspaceSelectorProps {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   activeWorkspace: Workspace | null;
+  onWorkspaceNavigationIntent: () => void;
 }
 
-export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({ workspaces, activeWorkspaceId, activeWorkspace }) => {
+export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
+  workspaces,
+  activeWorkspaceId,
+  activeWorkspace,
+  onWorkspaceNavigationIntent,
+}) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -79,6 +85,7 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({ workspaces, acti
 
   const handleSelectWorkspace = async (workspaceId: string) => {
     setDropdownOpen(false);
+    onWorkspaceNavigationIntent();
     await app.workspaces.setActive({ id: workspaceId });
   };
 
@@ -113,8 +120,17 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({ workspaces, acti
         onRequestDelete={handleRequestDelete}
         trigger={<SelectorButton workspace={activeWorkspace} />}
       />
-      <CreateWorkspaceDialog open={createOpen} onOpenChange={setCreateOpen} />
-      <DeleteWorkspaceDialog workspace={deleteTarget} open={deleteOpen} onOpenChange={handleDeleteOpenChange} />
+      <CreateWorkspaceDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+      />
+      <DeleteWorkspaceDialog
+        workspace={deleteTarget}
+        open={deleteOpen}
+        onOpenChange={handleDeleteOpenChange}
+        onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+      />
     </>
   );
 };

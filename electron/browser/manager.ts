@@ -14792,7 +14792,13 @@ export class BrowserManager {
     this.assistantDownloadCleanupRetryTimer = setTimeout(() => {
       this.assistantDownloadCleanupRetryTimer = null;
       if (this.disposed || this.shuttingDown) return;
-      const retryTargets = [...targets];
+      const activeAtRetry = new Set(this.activeDownloads?.values() ?? []);
+      const retryTargets = [...targets].filter((download) => {
+        const stillRevoked = activeAtRetry.has(download) && download.assistantOwnerId !== null && !download.keepOpen;
+        if (!stillRevoked) targets.delete(download);
+        return stillRevoked;
+      });
+      if (retryTargets.length === 0) return;
       void this.cancelActiveAssistantDownloads(retryTargets).then(
         () => {
           for (const download of retryTargets) targets.delete(download);

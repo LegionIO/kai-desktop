@@ -11184,6 +11184,25 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('does not retry cancellation after the user retains the captured download', async () => {
+    vi.useFakeTimers();
+    try {
+      const cancelDownload = vi.fn(async () => undefined);
+      const download = { assistantOwnerId: 'run-old', keepOpen: false, cancel: cancelDownload };
+      const manager = managerWithoutConstructor({ activeDownloads: new Map([[{}, download]]) });
+
+      invokePrivate(manager, 'scheduleAssistantDownloadCleanupRetry', [download]);
+      download.keepOpen = true;
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(cancelDownload).not.toHaveBeenCalled();
+      expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).toBeNull();
+      expect((Reflect.get(manager, 'assistantDownloadCleanupRetryTargets') as Set<unknown>).size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('destroys a retained scripted renderer when its assistant run ends', async () => {
     const end = vi.fn(async () => undefined);
     const destroyView = vi.fn((tab: { view: unknown }) => {

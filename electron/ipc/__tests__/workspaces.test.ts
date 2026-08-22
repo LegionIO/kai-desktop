@@ -49,7 +49,8 @@ beforeEach(() => {
 });
 
 const create = (args: { name: string; directory: string }) => handlers.get('workspaces:create')!(null, args);
-const setActive = (id: string | null) => handlers.get('workspaces:set-active')!(null, { id });
+const setActive = (id: string | null, expectedCurrentId?: string | null) =>
+  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId });
 
 describe('workspaces:create validation', () => {
   it('rejects an empty name', async () => {
@@ -86,9 +87,23 @@ describe('workspaces:set-active integrity', () => {
   it('accepts null (clear active) and a real id', async () => {
     dirs.add('/work/a');
     const w = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
-    await expect(setActive(null)).resolves.toBeUndefined();
+    await expect(setActive(null)).resolves.toEqual({ ok: true, activeWorkspaceId: null });
     expect(config.ui.activeWorkspaceId).toBeNull();
-    await setActive(w.id);
+    await expect(setActive(w.id)).resolves.toEqual({ ok: true, activeWorkspaceId: w.id });
     expect(config.ui.activeWorkspaceId).toBe(w.id);
+  });
+
+  it('does not replace a newer active workspace when the expected workspace is stale', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+
+    await expect(setActive(first.id, null)).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: second.id,
+    });
+    expect(config.ui.activeWorkspaceId).toBe(second.id);
   });
 });

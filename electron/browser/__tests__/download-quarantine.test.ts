@@ -189,6 +189,28 @@ describe('assistant download quarantine', () => {
     expect(readFileSync(exported, 'utf8')).toBe('remote payload');
   });
 
+  it('retains the recovery journal when post-rename destination verification fails', async () => {
+    const appHome = createAppHome();
+    const source = prepareAssistantDownloadQuarantine(appHome, 'global', downloadId(1));
+    writeFileSync(source, 'remote payload');
+    const exported = join(appHome, 'chosen-by-user.dmg');
+    const exportId = '88888888-8888-4888-8888-888888888888';
+
+    await expect(
+      exportAssistantDownloadFile(appHome, source, exported, {
+        platform: 'darwin',
+        exportId,
+        writeMacOsQuarantineAttribute: async () => undefined,
+        verifyPublishedDestination: async () => {
+          throw new Error('destination identity check failed');
+        },
+      }),
+    ).rejects.toThrow(/identity check failed/i);
+
+    expect(readFileSync(exported, 'utf8')).toBe('remote payload');
+    expect(readdirSync(assistantDownloadExportJournalDirectory(appHome))).toEqual([`Kai-${exportId}.json`]);
+  });
+
   it('fails macOS export closed without replacing an existing file when quarantine metadata cannot be set', async () => {
     const appHome = createAppHome();
     const source = prepareAssistantDownloadQuarantine(appHome, 'global', downloadId(1));

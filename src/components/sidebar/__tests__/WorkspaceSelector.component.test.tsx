@@ -4,7 +4,14 @@ import { WorkspaceSelector } from '../WorkspaceSelector';
 
 describe('WorkspaceSelector', () => {
   it('lets the empty-workspace title-bar control shrink and truncate cleanly', () => {
-    render(<WorkspaceSelector workspaces={[]} activeWorkspaceId={null} activeWorkspace={null} />);
+    render(
+      <WorkspaceSelector
+        workspaces={[]}
+        activeWorkspaceId={null}
+        activeWorkspace={null}
+        onWorkspaceNavigationIntent={() => undefined}
+      />,
+    );
 
     const trigger = screen.getByRole('button', { name: /open a workspace/i });
     expect(trigger).toHaveClass('min-w-0', 'max-w-full');

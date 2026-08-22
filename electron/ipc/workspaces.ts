@@ -108,22 +108,38 @@ export function registerWorkspaceHandlers(
 
   // ── Set Active ──────────────────────────────────────────────────────────
 
-  ipcMain.handle('workspaces:set-active', async (_event, args: { id: string | null }): Promise<void> => {
-    const config = getConfig();
-    const workspaces = [...(config.ui?.workspaces ?? [])];
+  ipcMain.handle(
+    'workspaces:set-active',
+    async (
+      _event,
+      args: { id: string | null; expectedCurrentId?: string | null },
+    ): Promise<{
+      ok: boolean;
+      error?: 'active-workspace-changed';
+      activeWorkspaceId?: string | null;
+    }> => {
+      const config = getConfig();
+      const workspaces = [...(config.ui?.workspaces ?? [])];
+      const activeWorkspaceId = config.ui?.activeWorkspaceId ?? null;
 
-    // Update lastActiveAt on the target workspace. Reject an unknown non-null
-    // id so we never persist a dangling activeWorkspaceId (a stale/bogus id
-    // from the renderer would otherwise leave the UI pointing at nothing).
-    if (args.id) {
-      const idx = workspaces.findIndex((w) => w.id === args.id);
-      if (idx === -1) throw new Error(`Workspace not found: ${args.id}`);
-      workspaces[idx] = { ...workspaces[idx], lastActiveAt: Date.now() };
-      setConfig('ui.workspaces', workspaces);
-    }
+      if (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) {
+        return { ok: false, error: 'active-workspace-changed', activeWorkspaceId };
+      }
 
-    setConfig('ui.activeWorkspaceId', args.id);
-  });
+      // Update lastActiveAt on the target workspace. Reject an unknown non-null
+      // id so we never persist a dangling activeWorkspaceId (a stale/bogus id
+      // from the renderer would otherwise leave the UI pointing at nothing).
+      if (args.id) {
+        const idx = workspaces.findIndex((w) => w.id === args.id);
+        if (idx === -1) throw new Error(`Workspace not found: ${args.id}`);
+        workspaces[idx] = { ...workspaces[idx], lastActiveAt: Date.now() };
+        setConfig('ui.workspaces', workspaces);
+      }
+
+      setConfig('ui.activeWorkspaceId', args.id);
+      return { ok: true, activeWorkspaceId: args.id };
+    },
+  );
 
   // ── Save Last Active Conversation for a Workspace ──────────────────────
 

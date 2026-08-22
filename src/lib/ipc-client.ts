@@ -220,7 +220,11 @@ type AppAPI = {
     create: (args: { name: string; directory: string }) => Promise<unknown>;
     rename: (args: { id: string; name: string }) => Promise<void>;
     delete: (args: { id: string }) => Promise<void>;
-    setActive: (args: { id: string | null }) => Promise<void>;
+    setActive: (args: { id: string | null; expectedCurrentId?: string | null }) => Promise<{
+      ok: boolean;
+      error?: 'active-workspace-changed';
+      activeWorkspaceId?: string | null;
+    }>;
     saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) => Promise<void>;
     browseDirectory: () => Promise<{ path: string; name: string } | null>;
   };

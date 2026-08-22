@@ -122,21 +122,31 @@ export type WorkspaceObservationWait = {
 
 export async function openBrowserConversationInWorkspace(options: {
   conversationId: string;
+  selectionGeneration: number;
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
   getActiveConversationId: () => string | null;
   getSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
   getKnownWorkspaceIds: () => Iterable<string>;
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
-  setActiveWorkspace: (workspaceId: string) => Promise<void>;
+  getWorkspaceSelectionGeneration: () => number;
+  workspaceSelectionGeneration: number;
+  setActiveWorkspace: (workspaceId: string | null, expectedCurrentWorkspaceId?: string | null) => Promise<boolean>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
-  switchConversation: (conversationId: string) => Promise<boolean>;
+  switchConversation: (
+    conversationId: string,
+    expectedCurrentConversationId: string | null,
+    selectionGeneration: number,
+  ) => Promise<boolean>;
 }): Promise<boolean> {
   const selectionWhenStarted = options.getActiveConversationId();
-  const selectionGeneration = options.getSelectionGeneration();
   const selectionIsCurrent = (): boolean =>
-    options.getSelectionGeneration() === selectionGeneration &&
+    options.getSelectionGeneration() === options.selectionGeneration &&
     options.getActiveConversationId() === selectionWhenStarted;
+  const selectionIsCompatibleAfterWorkspaceSwitch = (): boolean =>
+    options.getSelectionGeneration() === options.selectionGeneration &&
+    (options.getActiveConversationId() === selectionWhenStarted ||
+      options.getActiveConversationId() === options.conversationId);
   const conversation = await options.getConversation(options.conversationId);
   if (!conversation) return false;
 
@@ -161,11 +171,13 @@ export async function openBrowserConversationInWorkspace(options: {
     setActiveWorkspace: options.setActiveWorkspace,
     createWorkspaceObservationWait: options.createWorkspaceObservationWait,
     isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
+    isCurrentAfterSwitch: selectionIsCompatibleAfterWorkspaceSwitch,
+    canRollbackStaleSwitch: () => options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration,
   });
   if (!workspaceReady) return false;
   if (options.getActiveConversationId() === options.conversationId) return true;
   if (!selectionIsCurrent()) return false;
-  return options.switchConversation(options.conversationId);
+  return options.switchConversation(options.conversationId, selectionWhenStarted, options.selectionGeneration);
 }
 
 /** Prepare cross-workspace navigation initiated by Browser attention. Saving
@@ -179,9 +191,11 @@ export async function prepareConversationWorkspaceSwitch(options: {
   activeWorkspaceId?: string | null;
   knownWorkspaceIds: Iterable<string>;
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
-  setActiveWorkspace: (workspaceId: string) => Promise<void>;
+  setActiveWorkspace: (workspaceId: string | null, expectedCurrentWorkspaceId?: string | null) => Promise<boolean>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
+  isCurrentAfterSwitch?: () => boolean;
+  canRollbackStaleSwitch?: () => boolean;
 }): Promise<boolean> {
   const targetWorkspaceId = options.conversationWorkspaceId;
   if (!targetWorkspaceId) return true;
@@ -194,9 +208,24 @@ export async function prepareConversationWorkspaceSwitch(options: {
         conversationId: options.conversationId,
       });
       if (options.isCurrent && !options.isCurrent()) return false;
-      await options.setActiveWorkspace(targetWorkspaceId);
+      const switched = await options.setActiveWorkspace(targetWorkspaceId, options.activeWorkspaceId ?? null);
+      if (!switched) return false;
+      if (options.isCurrentAfterSwitch && !options.isCurrentAfterSwitch()) {
+        if (options.canRollbackStaleSwitch?.()) {
+          await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId);
+        }
+        return false;
+      }
     }
-    return await observation.promise;
+    const observed = await observation.promise;
+    if (!observed) return false;
+    if (targetWorkspaceId !== options.activeWorkspaceId && options.isCurrentAfterSwitch?.() === false) {
+      if (options.canRollbackStaleSwitch?.()) {
+        await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId);
+      }
+      return false;
+    }
+    return true;
   } finally {
     observation.cancel();
   }

@@ -8,12 +8,14 @@ interface DeleteWorkspaceDialogProps {
   workspace: Workspace | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onWorkspaceNavigationIntent: () => void;
 }
 
 export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
   workspace,
   open,
   onOpenChange,
+  onWorkspaceNavigationIntent,
 }) => {
   const [confirmText, setConfirmText] = useState('');
   const [isDeleting, setIsDeleting] = useState(false);
@@ -23,6 +25,7 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
   const handleDelete = async () => {
     if (!isMatch || !workspace) return;
     setIsDeleting(true);
+    onWorkspaceNavigationIntent();
     try {
       await app.workspaces.delete({ id: workspace.id });
       onOpenChange(false);
@@ -60,12 +63,11 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
           <Dialog.Description asChild>
             <div className="mt-3 space-y-2 text-sm text-muted-foreground">
               <p>
-                This will permanently remove <strong className="text-foreground">{workspace?.name}</strong> from
-                your workspaces. Conversations and tasks scoped to this workspace will become unscoped.
+                This will permanently remove <strong className="text-foreground">{workspace?.name}</strong> from your
+                workspaces. Conversations and tasks scoped to this workspace will become unscoped.
               </p>
               <p className="text-xs text-muted-foreground/70">
-                Your files on disk will not be affected — only the workspace
-                metadata is deleted.
+                Your files on disk will not be affected — only the workspace metadata is deleted.
               </p>
             </div>
           </Dialog.Description>
