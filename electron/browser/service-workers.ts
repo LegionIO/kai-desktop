@@ -3,6 +3,13 @@ import { hardenRemoteWebPreferences } from './session.js';
 
 export const BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS = 5_000;
 
+class BrowserServiceWorkerCommandTimeoutError extends Error {
+  constructor(command: string, timeoutMs: number) {
+    super(`${command} exceeded its ${timeoutMs / 1_000} second deadline.`);
+    this.name = 'BrowserServiceWorkerCommandTimeoutError';
+  }
+}
+
 async function runServiceWorkerCommandWithDeadline<T>(
   command: string,
   task: () => Promise<T>,
@@ -12,7 +19,7 @@ async function runServiceWorkerCommandWithDeadline<T>(
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
       () => {
-        reject(new Error(`${command} exceeded its ${timeoutMs / 1_000} second deadline.`));
+        reject(new BrowserServiceWorkerCommandTimeoutError(command, timeoutMs));
       },
       Math.max(0, timeoutMs),
     );
@@ -34,6 +41,7 @@ export async function stopRunningBrowserServiceWorkers(
   requireSuccess = false,
   commandTimeoutMs = BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS,
   acquireDebuggerLease?: (target: WebContents) => { release: () => void },
+  aggregateTimeoutMs = commandTimeoutMs,
 ): Promise<void> {
   let versionIds: string[];
   try {
@@ -49,6 +57,12 @@ export async function stopRunningBrowserServiceWorkers(
   let target = contents;
   let wasAttached = false;
   let debuggerLease: { release: () => void } | undefined;
+  const deadlineAt = Date.now() + Math.max(0, aggregateTimeoutMs);
+  const remainingCommandTime = (command: string): number => {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new BrowserServiceWorkerCommandTimeoutError(command, aggregateTimeoutMs);
+    return Math.min(commandTimeoutMs, remaining);
+  };
   try {
     if (!target || target.isDestroyed()) {
       const webPreferences: Record<string, unknown> = { session: scopedSession };
@@ -65,7 +79,7 @@ export async function stopRunningBrowserServiceWorkers(
     await runServiceWorkerCommandWithDeadline(
       'ServiceWorker.enable',
       () => target!.debugger.sendCommand('ServiceWorker.enable'),
-      commandTimeoutMs,
+      remainingCommandTime('ServiceWorker.enable'),
     );
     // Keep CDP pressure bounded. A profile can accumulate many registrations;
     // eagerly allocating one command and deadline timer per worker can stall the
@@ -76,10 +90,15 @@ export async function stopRunningBrowserServiceWorkers(
         await runServiceWorkerCommandWithDeadline(
           `ServiceWorker.stopWorker (${versionId})`,
           () => target!.debugger.sendCommand('ServiceWorker.stopWorker', { versionId }),
-          commandTimeoutMs,
+          remainingCommandTime(`ServiceWorker.stopWorker (${versionId})`),
         );
       } catch (error) {
         firstFailure ??= { error };
+        // A timed-out CDP call is not cancellable. Stop issuing more commands
+        // on this target; detaching/closing it below bounds retained native work
+        // to that single command, while the aggregate deadline bounds the full
+        // cleanup regardless of the number of worker registrations.
+        if (error instanceof BrowserServiceWorkerCommandTimeoutError) break;
       }
     }
     if (requireSuccess && firstFailure) throw firstFailure.error;

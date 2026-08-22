@@ -1428,6 +1428,15 @@ export class BrowserManager {
    * queue reports the real operation settled. */
   private readonly pendingSessionMutationScopes = new Map<string, number>();
   private readonly scopeRuntimeReleaseTokens = new Map<string, object>();
+  /** Idle release can cross native Chromium boundaries that cannot be
+   * synchronously cancelled. Keep the whole task visible until it unwinds so a
+   * replacement tab/profile operation never races stale worker or connection
+   * teardown. */
+  private readonly scopeRuntimeReleaseTasks = new Map<string, Promise<void>>();
+  /** A synchronous/profile-network operation can finish while a cancelled idle
+   * release is still unwinding. Remember that terminal cleanup request and run
+   * it once the prior owner has left the native boundary. */
+  private readonly scopeRuntimeReleaseRestarts = new Set<string>();
   private readonly restrictedBackgroundScopes = new Set<string>();
   private readonly assistantControlledOrigins = new Map<string, Set<string>>();
   private readonly automationGestureTokens = new Map<string, PendingAutomationGesture>();
@@ -1615,8 +1624,12 @@ export class BrowserManager {
     // close, and metadata flush. Revoke every token before publishing a scope
     // suspension so that stale work can never release (and historically
     // unsuspend) a profile selected by the previous configuration.
-    const pendingReleaseScopeKeys = [...this.scopeRuntimeReleaseTokens.keys()];
+    const pendingRuntimeReleases = new Map(this.scopeRuntimeReleaseTasks);
+    const pendingReleaseScopeKeys = [
+      ...new Set([...this.scopeRuntimeReleaseTokens.keys(), ...pendingRuntimeReleases.keys()]),
+    ];
     this.scopeRuntimeReleaseTokens.clear();
+    this.scopeRuntimeReleaseRestarts.clear();
 
     const affectedTabs = [...this.tabs.values()];
     const oldScopeKeys = new Set([
@@ -1637,7 +1650,13 @@ export class BrowserManager {
       // The tabs below are destroyed immediately after this loop. Give worker
       // shutdown its own temporary CDP target so an async debugger command can
       // never race a renderer teardown.
-      serviceWorkerStops.push(this.stopRunningServiceWorkers(scopedSession, undefined, true));
+      serviceWorkerStops.push(
+        (async () => {
+          const pendingRuntimeRelease = pendingRuntimeReleases.get(scopeKey);
+          if (pendingRuntimeRelease) await pendingRuntimeRelease;
+          await this.stopRunningServiceWorkers(scopedSession, undefined, true);
+        })(),
+      );
     }
 
     const downloadDrain = this.cancelActiveDownloadsForScopes(oldScopeKeys);
@@ -2528,6 +2547,21 @@ export class BrowserManager {
 
   private async withScopeActivity<T>(scopeKey: string, operation: () => Promise<T>): Promise<T> {
     this.assertHostRendererOperationCurrent();
+    this.assertScopeAvailable(scopeKey);
+    // Native worker shutdown and connection resets cannot be cancelled once
+    // started. Invalidate the release token immediately, then wait for its task
+    // to unwind before admitting work that may create a renderer or use the
+    // same Session. Loop because a synchronous/network completion can request a
+    // successor release while this caller is waiting.
+    while (true) {
+      const pendingRelease = this.scopeRuntimeReleaseTasks.get(scopeKey);
+      if (!pendingRelease) break;
+      this.scopeRuntimeReleaseTokens.delete(scopeKey);
+      this.scopeRuntimeReleaseRestarts.delete(scopeKey);
+      await pendingRelease;
+      this.assertHostRendererOperationCurrent();
+      this.assertScopeAvailable(scopeKey);
+    }
     const finish = this.beginScopeActivity(scopeKey);
     try {
       const result = await operation();
@@ -2581,6 +2615,11 @@ export class BrowserManager {
     requests!.delete(requestId);
     if (requests!.size === 0) this.scopeRequestActivities.delete(scopeKey);
     finish();
+    // Requests are also the wake-up mechanism for persistent workers after a
+    // tabless profile was released. Their terminal event must re-arm cleanup;
+    // otherwise a request that invalidated an in-flight release (or recreated a
+    // metadata store) retains that runtime indefinitely.
+    this.releaseScopeRuntimeWhenIdle(scopeKey);
   }
 
   private finishAllScopeRequestActivities(scopeKey: string): void {
@@ -9530,11 +9569,34 @@ export class BrowserManager {
     this.scopeGenerations.delete(scopeKey);
     this.scopeRequestActivities.delete(scopeKey);
     this.scopeRuntimeReleaseTokens.delete(scopeKey);
+    this.scopeRuntimeReleaseRestarts.delete(scopeKey);
     if (!preserveSessionGuards) this.suspendedScopes.delete(scopeKey);
   }
 
   private releaseScopeRuntimeWhenIdle(scopeKey: string): void {
     if ([...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)) return;
+    if ([...this.activeDownloads.values()].some((download) => download.scopeKey === scopeKey)) return;
+    const config = this.config();
+    const belongsToSelectedScope =
+      config.dataScope === 'global' ? scopeKey === 'global' : scopeKey.startsWith('conversation-');
+    if (
+      this.disposed ||
+      this.shuttingDown ||
+      !config.enabled ||
+      !belongsToSelectedScope ||
+      this.clearingScopes.has(scopeKey) ||
+      this.suspendedScopes.has(scopeKey)
+    ) {
+      return;
+    }
+    const activeRelease = this.scopeRuntimeReleaseTasks.get(scopeKey);
+    if (activeRelease) {
+      // A valid token means this request is already covered by the active
+      // releaser. A missing token means newer work cancelled it and has now
+      // finished, so schedule exactly one successor after native teardown exits.
+      if (!this.scopeRuntimeReleaseTokens.has(scopeKey)) this.scopeRuntimeReleaseRestarts.add(scopeKey);
+      return;
+    }
     // One release owns the profile until it completes or a newly admitted
     // operation invalidates its token. Coalescing avoids spawning duplicate
     // service-worker CDP targets and connection resets for paired UI reads.
@@ -9557,7 +9619,7 @@ export class BrowserManager {
         ![...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)
       );
     };
-    void (async () => {
+    const work = (async () => {
       try {
         if (!remainsReleasable()) return;
         // Metadata/native operations can overlap a caller that just released
@@ -9603,6 +9665,16 @@ export class BrowserManager {
         }
       }
     })();
+    let task!: Promise<void>;
+    task = work.finally(() => {
+      if (this.scopeRuntimeReleaseTasks.get(scopeKey) === task) {
+        this.scopeRuntimeReleaseTasks.delete(scopeKey);
+      }
+      const restart = this.scopeRuntimeReleaseRestarts.delete(scopeKey);
+      if (restart) this.releaseScopeRuntimeWhenIdle(scopeKey);
+    });
+    this.scopeRuntimeReleaseTasks.set(scopeKey, task);
+    void task.catch(() => undefined);
   }
 
   private trackBrowserNetworkRequest(
@@ -15898,6 +15970,7 @@ export class BrowserManager {
     const downloadQuiescedScopeKeys = new Set<string>();
     const chromiumStorageClearedScopeKeys = new Set<string>();
     const clearedScopeKeys = new Set<string>();
+    const pendingRuntimeReleases = new Map<string, Promise<void>>();
     let shellStateFinalized = false;
     const getBrowserSession = (scopeKey: string): Session => {
       const existing = browserSessions.get(scopeKey);
@@ -15913,6 +15986,9 @@ export class BrowserManager {
       // Revoke that lease before the clear starts mutating the same Session,
       // store, vault, and generation state.
       this.scopeRuntimeReleaseTokens.delete(scopeKey);
+      this.scopeRuntimeReleaseRestarts.delete(scopeKey);
+      const pendingRuntimeRelease = this.scopeRuntimeReleaseTasks.get(scopeKey);
+      if (pendingRuntimeRelease) pendingRuntimeReleases.set(scopeKey, pendingRuntimeRelease);
       this.clearingScopes.add(scopeKey);
       this.bumpScopeGeneration(scopeKey);
     }
@@ -16004,6 +16080,10 @@ export class BrowserManager {
               run: async () => {
                 const failures: unknown[] = [];
                 try {
+                  // An idle release may already be inside an uncancellable
+                  // worker-stop or Session reset. Join it before starting the
+                  // destructive clear's own native teardown.
+                  await pendingRuntimeReleases.get(scopeKey);
                   // Start worker shutdown only when this scope reaches the
                   // sequential clear loop. Eager promises for every selected
                   // profile can otherwise create an unbounded number of CDP
@@ -16628,6 +16708,8 @@ export class BrowserManager {
     this.scopeOperationIdleWaiters.clear();
     this.pendingSessionMutationScopes?.clear();
     this.scopeRuntimeReleaseTokens.clear();
+    this.scopeRuntimeReleaseTasks.clear();
+    this.scopeRuntimeReleaseRestarts.clear();
     this.pendingAssistantTabClosures.clear();
     this.assistantTabCleanups?.clear();
     this.assistantTabCleanupRetries?.clear();
@@ -16647,8 +16729,16 @@ export class BrowserManager {
     const attempt = (async () => {
       // A user may quit while a data clear or settings-driven scope transition
       // is already running. Stop admitting new work, then join the shared
-      // mutation tail before destroying sessions or performing the final flush.
-      await Promise.allSettled([this.startupDownloadReconciliation, this.profileMutationTail]);
+      // mutation tail and any idle native teardown before destroying sessions
+      // or performing the final flush.
+      const pendingRuntimeReleases = [...this.scopeRuntimeReleaseTasks.values()];
+      this.scopeRuntimeReleaseTokens.clear();
+      this.scopeRuntimeReleaseRestarts.clear();
+      await Promise.allSettled([
+        this.startupDownloadReconciliation,
+        this.profileMutationTail,
+        ...pendingRuntimeReleases,
+      ]);
       if (this.disposed) return;
       const tabs = [...this.tabs.values()];
       const queues = tabs.map((tab) => tab.queue.whenIdle());

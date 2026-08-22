@@ -154,6 +154,8 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       scopeOperationIdleWaiters: new Map(),
       scopeRequestActivities: new Map(),
       scopeRuntimeReleaseTokens: new Map(),
+      scopeRuntimeReleaseTasks: new Map(),
+      scopeRuntimeReleaseRestarts: new Set(),
       stores: new Map(),
       suspendedScopes: new Set<string>(),
       tabOrder: new Map(),
@@ -20333,6 +20335,83 @@ describe('browser manager renderer lifecycle', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
+  it('re-arms tabless profile release when the final background request settles', async () => {
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    const firstWorkerStop = deferred<void>();
+    const stopRunningServiceWorkers = vi
+      .fn()
+      .mockImplementationOnce(() => firstWorkerStop.promise)
+      .mockResolvedValue(undefined);
+    const releaseScopeRuntime = vi.fn();
+    const manager = managerWithoutConstructor({
+      getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
+      releaseScopeRuntime,
+      stopRunningServiceWorkers,
+      stores: new Map([[scopeKey, { flush: vi.fn(async () => undefined) }]]),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections: vi.fn(async () => undefined) }]]),
+    });
+
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledOnce());
+
+    const finishRequest = invokePrivate(manager, 'beginScopeActivity', scopeKey, 'network') as () => void;
+    (Reflect.get(manager, 'scopeRequestActivities') as Map<string, Map<number, () => void>>).set(
+      scopeKey,
+      new Map([[7, finishRequest]]),
+    );
+    firstWorkerStop.resolve();
+    await vi.waitFor(() => expect(Reflect.get(manager, 'scopeRuntimeReleaseTasks')).toHaveLength(0));
+    expect(releaseScopeRuntime).not.toHaveBeenCalled();
+
+    invokePrivate(manager, 'finishScopeRequestActivity', scopeKey, 7);
+
+    await vi.waitFor(() => expect(releaseScopeRuntime).toHaveBeenCalledOnce());
+    expect(stopRunningServiceWorkers).toHaveBeenCalledTimes(2);
+  });
+
+  it('waits for cancelled native idle teardown before admitting asynchronous profile work', async () => {
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    const firstWorkerStop = deferred<void>();
+    const secondWorkerStop = deferred<void>();
+    const stopRunningServiceWorkers = vi
+      .fn()
+      .mockImplementationOnce(() => firstWorkerStop.promise)
+      .mockImplementationOnce(() => secondWorkerStop.promise);
+    const closeAllConnections = vi.fn(async () => undefined);
+    const releaseScopeRuntime = vi.fn();
+    const manager = managerWithoutConstructor({
+      getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
+      releaseScopeRuntime,
+      stopRunningServiceWorkers,
+      stores: new Map([[scopeKey, { flush: vi.fn(async () => undefined) }]]),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections }]]),
+    });
+
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledOnce());
+
+    const operationStarted = vi.fn();
+    const operation = invokePrivate(manager, 'withScopeActivity', scopeKey, async () => {
+      operationStarted();
+    }) as Promise<void>;
+    await Promise.resolve();
+    expect(operationStarted).not.toHaveBeenCalled();
+    expect(closeAllConnections).not.toHaveBeenCalled();
+
+    firstWorkerStop.resolve();
+    await operation;
+
+    expect(operationStarted).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledTimes(2));
+    expect(closeAllConnections).not.toHaveBeenCalled();
+
+    secondWorkerStop.resolve();
+    await vi.waitFor(() => expect(releaseScopeRuntime).toHaveBeenCalledOnce());
+    expect(closeAllConnections).toHaveBeenCalledOnce();
+  });
+
   it('retains persistent-session request guards when releasing the last idle tab', () => {
     const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
     const cleanupSession = vi.fn();
@@ -20557,6 +20636,49 @@ describe('browser manager renderer lifecycle', () => {
     expect(preemption.scopeKeys).toContain(scopeKey);
     expect((Reflect.get(manager, 'suspendedScopes') as Set<string>).has(scopeKey)).toBe(true);
     await preemption.connectionDrain;
+  });
+
+  it('joins active idle native teardown before config preemption starts replacement cleanup', async () => {
+    const scopeKey = 'global';
+    const idleWorkerStop = deferred<void>();
+    const stopRunningServiceWorkers = vi
+      .fn()
+      .mockImplementationOnce(() => idleWorkerStop.promise)
+      .mockResolvedValue(undefined);
+    const closeAllConnections = vi.fn(async () => undefined);
+    const scopedSession = { closeAllConnections };
+    electronMocks.fromPartition.mockReturnValue(scopedSession);
+    let enabled = true;
+    const manager = managerWithoutConstructor({
+      browserEnabled: true,
+      dataScope: 'global',
+      getConfig: () => ({ browser: { dataScope: 'global', enabled } }),
+      stopRunningServiceWorkers,
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, scopedSession]]),
+    });
+
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledOnce());
+
+    enabled = false;
+    const preemption = invokePrivate(manager, 'preemptBrowserConfigTransition', {
+      dataScope: 'global',
+      enabled: false,
+      structuredActions: 'allow',
+      scriptInjection: 'allow',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: false,
+    }) as { connectionDrain: Promise<void> };
+
+    expect(stopRunningServiceWorkers).toHaveBeenCalledOnce();
+    expect(closeAllConnections).not.toHaveBeenCalled();
+
+    idleWorkerStop.resolve();
+    await preemption.connectionDrain;
+
+    expect(stopRunningServiceWorkers).toHaveBeenCalledTimes(2);
+    expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
   it('releases every runtime resource owned by a deleted conversation profile', () => {
@@ -21912,6 +22034,69 @@ describe('browser manager renderer lifecycle', () => {
       expect(debuggerApi.sendCommand).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS);
       await rejected;
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+      expect(webContents.close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds service-worker cleanup across every version and stops after the first timed-out command', async () => {
+    vi.useFakeTimers();
+    let attached = false;
+    const debuggerApi = {
+      isAttached: vi.fn(() => attached),
+      attach: vi.fn(() => {
+        attached = true;
+      }),
+      detach: vi.fn(() => {
+        attached = false;
+      }),
+      sendCommand: vi.fn((method: string, params?: { versionId?: string }) => {
+        if (method === 'ServiceWorker.enable') return Promise.resolve();
+        if (params?.versionId === 'worker-version-1') {
+          return new Promise<void>((resolve) => setTimeout(resolve, 3_000));
+        }
+        return new Promise(() => undefined);
+      }),
+    };
+    const webContents = {
+      close: vi.fn(),
+      debugger: debuggerApi,
+      isDestroyed: () => false,
+    };
+    electronMocks.webContentsView.mockReturnValue({ webContents });
+    const scopedSession = {
+      serviceWorkers: {
+        getAllRunning: () => ({
+          'worker-version-1': {},
+          'worker-version-2': {},
+          'worker-version-3': {},
+        }),
+      },
+    };
+    const manager = managerWithoutConstructor({});
+
+    try {
+      const stopping = invokePrivate(
+        manager,
+        'stopRunningServiceWorkers',
+        scopedSession,
+        undefined,
+        true,
+      ) as Promise<void>;
+      const rejected = expect(stopping).rejects.toThrow(/ServiceWorker\.stopWorker.*deadline/);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS - 3_000);
+      await rejected;
+
+      expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('ServiceWorker.stopWorker', {
+        versionId: 'worker-version-3',
+      });
       expect(debuggerApi.detach).toHaveBeenCalledOnce();
       expect(webContents.close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
     } finally {
