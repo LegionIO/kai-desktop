@@ -729,6 +729,7 @@ export class BrowserValidatingProxy {
     // the original hostname while this proxy pins the actual connection IP.
     const directlyPrivateTarget =
       normalized === 'localhost' ||
+      normalized.endsWith('.localhost') ||
       normalized.endsWith('.local') ||
       (literalFamily !== 0 && isPrivateResolvedAddress(normalized));
     if (restricted && directlyPrivateTarget) {

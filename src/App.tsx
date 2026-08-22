@@ -696,6 +696,10 @@ function AppShell() {
   // Monotonic token guarding async active-conversation reads (onChanged fetch +
   // switch title load) so out-of-order resolutions can't apply stale state.
   const activeSyncSeqRef = useRef(0);
+  // Browser-attention navigation may wait on record and workspace I/O. Track
+  // newer local selection intents separately from restoration bookkeeping so a
+  // delayed attention click cannot pull the user back to an older chat.
+  const conversationSelectionIntentGenerationRef = useRef(0);
   const configuredWorkspaceIdRef = useRef<string | null>(null);
   const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
@@ -1072,6 +1076,7 @@ function AppShell() {
 
   const handleDeleteConversation = useCallback(
     async (id: string, fallbackCandidateIds?: string[]): Promise<ConversationDeleteResult> => {
+      if (activeConversationIdRef.current === id) conversationSelectionIntentGenerationRef.current++;
       const selectionWhenDeleteStarted = activeConversationIdRef.current;
       let backendFallbackId: string | null = null;
       const allConversations = (await app.conversations.list()) as ConversationRecord[];
@@ -1156,6 +1161,9 @@ function AppShell() {
       const requestedIds = [...new Set(ids)];
       if (requestedIds.length === 0) return { ok: true, deleted: 0, removedIds: [] };
       const requested = new Set(requestedIds);
+      if (activeConversationIdRef.current && requested.has(activeConversationIdRef.current)) {
+        conversationSelectionIntentGenerationRef.current++;
+      }
       let excludedFromFallback = requested;
       const selectionWhenDeleteStarted = activeConversationIdRef.current;
       const deletingSelectedConversation =
@@ -1282,6 +1290,7 @@ function AppShell() {
 
   const handleSwitchConversation = useCallback(
     async (id: string, expectedCurrentId?: string | null): Promise<boolean> => {
+      conversationSelectionIntentGenerationRef.current++;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
       const seq = ++activeSyncSeqRef.current;
@@ -1325,6 +1334,8 @@ function AppShell() {
         conversationId: id,
         getConversation: (conversationId) =>
           app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
+        getActiveConversationId: () => activeConversationIdRef.current,
+        getSelectionGeneration: () => conversationSelectionIntentGenerationRef.current,
         getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
         getKnownWorkspaceIds: () => knownWorkspaceIdsRef.current,
         saveLastConversation: (args) => app.workspaces.saveLastConversation(args),
@@ -1337,6 +1348,7 @@ function AppShell() {
 
   const handleNewConversation = useCallback(
     async (expectedCurrentId?: string | null) => {
+      conversationSelectionIntentGenerationRef.current++;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
       suppressStoreSync.current = true;

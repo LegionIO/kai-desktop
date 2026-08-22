@@ -164,6 +164,31 @@ describe('assistant download quarantine', () => {
     expect(readFileSync(exported, 'utf8')).toBe('remote payload');
   });
 
+  it('retains the recovery journal when destination-directory sync fails after rename', async () => {
+    const appHome = createAppHome();
+    const source = prepareAssistantDownloadQuarantine(appHome, 'global', downloadId(1));
+    writeFileSync(source, 'remote payload');
+    const exported = join(appHome, 'chosen-by-user.dmg');
+    const exportId = '77777777-7777-4777-8777-777777777777';
+
+    await expect(
+      exportAssistantDownloadFile(appHome, source, exported, {
+        platform: 'darwin',
+        exportId,
+        writeMacOsQuarantineAttribute: async () => undefined,
+        syncDestinationDirectory: async () => {
+          throw new Error('destination directory sync failed');
+        },
+      }),
+    ).rejects.toThrow(/directory sync failed/i);
+
+    expect(readFileSync(exported, 'utf8')).toBe('remote payload');
+    expect(readdirSync(assistantDownloadExportJournalDirectory(appHome))).toEqual([`Kai-${exportId}.json`]);
+    await expect(reconcileAssistantDownloadExportJournal(appHome)).resolves.toEqual([]);
+    expect(readdirSync(assistantDownloadExportJournalDirectory(appHome))).toEqual([]);
+    expect(readFileSync(exported, 'utf8')).toBe('remote payload');
+  });
+
   it('fails macOS export closed without replacing an existing file when quarantine metadata cannot be set', async () => {
     const appHome = createAppHome();
     const source = prepareAssistantDownloadQuarantine(appHome, 'global', downloadId(1));

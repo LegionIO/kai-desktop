@@ -37,6 +37,7 @@ type AssistantDownloadExportOptions = {
   exportId?: string;
   writeMacOsQuarantineAttribute?: (path: string, value: string, handle: FileHandle) => Promise<void>;
   removeExportJournal?: (path: string) => Promise<void>;
+  syncDestinationDirectory?: (path: string) => Promise<void>;
 };
 
 export type PrunedAssistantDownload = {
@@ -516,10 +517,13 @@ export async function exportAssistantDownloadFile(
     await assertOpenFileOwnsPath(stagedHandle, staged, 'staging file');
     await fsPromises.rename(staged, destination);
     await assertOpenFileOwnsPath(stagedHandle, destination, 'destination');
+    // rename() is the publication commit point. From here on the journal must
+    // survive any durability failure so startup recovery can repeat the missing
+    // destination-directory barrier without touching the published file.
+    published = true;
     // rename is atomic but is not crash-durable until the containing directory
     // has been synced.
-    await syncDirectory(dirname(destination));
-    published = true;
+    await (options.syncDestinationDirectory ?? syncDirectory)(dirname(destination));
   } catch (error) {
     if (!published) {
       await fsPromises.rm(staged, { force: true }).catch(() => undefined);

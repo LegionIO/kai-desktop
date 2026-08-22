@@ -344,7 +344,7 @@ export function isPrivateNetworkUrl(rawUrl: string): boolean {
     .toLowerCase()
     .replace(/^\[|\]$/g, '')
     .replace(/\.$/, '');
-  if (host === 'localhost' || host.endsWith('.local')) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
   if (isIP(host) === 4) return isPrivateIpv4(host);
   if (isIP(host) === 6) return isPrivateIpv6(host);
   return false;

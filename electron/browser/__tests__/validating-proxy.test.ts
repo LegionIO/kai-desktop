@@ -368,6 +368,22 @@ describe('Browser validating proxy', () => {
     proxy.releaseRequest('global', 43);
   });
 
+  it('blocks localhost subdomains even when DNS resolves them to a reachable endpoint', async () => {
+    const resolveHost = vi.fn(async (hostname: string) => {
+      expect(hostname).toBe('api.localhost');
+      return [{ address: '127.0.0.1', family: 4 as const }];
+    });
+    const proxy = new BrowserValidatingProxy(undefined, { resolveHost });
+    proxies.push(proxy);
+    const resolveEndpoints = Reflect.get(proxy, 'resolveEndpoints') as (
+      hostname: string,
+      restrictPrivateNetwork: boolean,
+    ) => Promise<unknown>;
+
+    await expect(resolveEndpoints.call(proxy, 'api.localhost', true)).rejects.toThrow(/private-network destination/i);
+    expect(resolveHost).toHaveBeenCalledOnce();
+  });
+
   it('keeps every same-host connection restricted until all assistant requests release', async () => {
     const target = createServer((_request, response) => response.end('trusted-user-page'));
     servers.push(target);

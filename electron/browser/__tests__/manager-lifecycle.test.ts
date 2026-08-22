@@ -10726,14 +10726,31 @@ describe('browser manager renderer lifecycle', () => {
         .mockResolvedValue(undefined);
       Reflect.set(manager, 'cleanupAssistantStateOwnedByRun', cleanup);
 
-      await expect(manager.cancelAssistantContinuations('chat-1')).rejects.toThrow(/will be retried/i);
-      expect(manager.hasPendingAssistantContinuation('chat-1', 'run-1')).toBe(true);
+      let cancellationSettled = false;
+      const cancellation = manager.cancelAssistantContinuations('chat-1').then(() => {
+        cancellationSettled = true;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(cancellationSettled).toBe(false);
+      expect(manager.hasPendingAssistantContinuation('chat-1', 'run-1')).toBe(false);
       expect(Reflect.get(manager, 'assistantContinuationLeases').has('chat-1\u0000run-1')).toBe(true);
+      expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(1);
+
+      let continuationSettled = false;
+      const continuation = manager.beginAssistantContinuation('chat-1', 'run-2', 'run-1').then(() => {
+        continuationSettled = true;
+      });
+      await Promise.resolve();
+      expect(continuationSettled).toBe(false);
 
       await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.all([cancellation, continuation]);
       expect(cleanup).toHaveBeenCalledTimes(2);
       expect(manager.hasPendingAssistantContinuation('chat-1', 'run-1')).toBe(false);
       expect(Reflect.get(manager, 'assistantContinuationLeases').has('chat-1\u0000run-1')).toBe(false);
+      expect(() => manager.assertAssistantRun('chat-1', { id: 'run-2' })).not.toThrow();
       expect(warn).not.toHaveBeenCalled();
       manager.dispose();
     } finally {
@@ -11111,12 +11128,19 @@ describe('browser manager renderer lifecycle', () => {
         emitTabs: vi.fn(),
       });
 
-      await expect(manager.cleanupAssistantTabs('chat-1', 'run-1')).rejects.toThrow(/terminal state/i);
-      expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(1);
+      let cleanupSettled = false;
+      const cleanup = manager.cleanupAssistantTabs('chat-1', 'run-1').then(() => {
+        cleanupSettled = true;
+      });
       const retained = manager.waitForAssistantTabCleanup('chat-1');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(cleanupSettled).toBe(false);
+      expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(1);
 
       await vi.advanceTimersByTimeAsync(1_000);
-      await retained;
+      await Promise.all([cleanup, retained]);
 
       expect(cleanupAssistantStateOwnedByRun).toHaveBeenCalledTimes(2);
       expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(0);
@@ -11132,19 +11156,26 @@ describe('browser manager renderer lifecycle', () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
-      const cancelActiveAssistantDownloads = vi
-        .fn()
+      const cancelOldDownload = vi
+        .fn<() => Promise<void>>()
         .mockRejectedValueOnce(new Error('download still progressing'))
         .mockResolvedValue(undefined);
-      const manager = managerWithoutConstructor({ cancelActiveAssistantDownloads });
+      const cancelNewDownload = vi.fn(async () => undefined);
+      const oldDownload = { assistantOwnerId: 'run-old', keepOpen: false, cancel: cancelOldDownload };
+      const newDownload = { assistantOwnerId: 'run-new', keepOpen: false, cancel: cancelNewDownload };
+      const oldItem = {};
+      const activeDownloads = new Map<object, unknown>([[oldItem, oldDownload]]);
+      const manager = managerWithoutConstructor({ activeDownloads });
 
-      invokePrivate(manager, 'scheduleAssistantDownloadCleanupRetry');
+      invokePrivate(manager, 'scheduleAssistantDownloadCleanupRetry', [oldDownload]);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(cancelActiveAssistantDownloads).toHaveBeenCalledOnce();
+      expect(cancelOldDownload).toHaveBeenCalledOnce();
       expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).not.toBeNull();
 
+      activeDownloads.set({}, newDownload);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(cancelActiveAssistantDownloads).toHaveBeenCalledTimes(2);
+      expect(cancelOldDownload).toHaveBeenCalledTimes(2);
+      expect(cancelNewDownload).not.toHaveBeenCalled();
       expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).toBeNull();
       expect(warn).toHaveBeenCalledOnce();
     } finally {

@@ -1385,6 +1385,9 @@ export class BrowserManager {
    * run must never become adoptable by a future logical-turn continuation. */
   private assistantTabCleanupRetries?: Map<string, PendingAssistantTabCleanupRetry>;
   private assistantDownloadCleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Exact downloads captured at a global Browser-authority revocation. A retry
+   * must never re-enumerate downloads that a later authorized run started. */
+  private assistantDownloadCleanupRetryTargets?: Set<ActiveBrowserDownload>;
   /** Run ids whose temporary tabs are retained across the gap between a
    * completed stream and its authorized continuation. */
   private readonly assistantContinuationLeases = new Set<string>();
@@ -1951,9 +1954,10 @@ export class BrowserManager {
     // DownloadItems outlive their initiating WebContents. Revoke temporary
     // assistant downloads directly instead of relying on their tabs still
     // being present in the live tab map below.
-    void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
+    const revokedDownloads = this.activeAssistantDownloads();
+    void this.cancelActiveAssistantDownloads(revokedDownloads).catch((error: unknown) => {
       console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
-      this.scheduleAssistantDownloadCleanupRetry();
+      this.scheduleAssistantDownloadCleanupRetry(revokedDownloads);
     });
     void this.cancelAssistantContinuations().catch((error: unknown) => {
       console.warn('[Browser] Assistant continuation revocation will be retried:', error);
@@ -2666,6 +2670,10 @@ export class BrowserManager {
    * predecessor. A stale/missing predecessor simply starts a normal run. */
   async beginAssistantContinuation(conversationId: string, runId: string, predecessorRunId: string): Promise<void> {
     if (this.disposed) throw new Error('The in-app browser is unavailable.');
+    // A predecessor whose terminal cleanup is retrying is no longer adoptable.
+    // Wait for that stable cleanup barrier, then begin a fresh run below.
+    await this.waitForAssistantTabCleanup(conversationId);
+    if (this.disposed) throw new Error('The in-app browser is unavailable.');
     const key = assistantContinuationKey(conversationId, predecessorRunId);
     const pending = this.pendingAssistantContinuations.get(key);
 
@@ -2680,7 +2688,6 @@ export class BrowserManager {
     this.pendingAssistantContinuations.delete(key);
     clearTimeout(pending.timer);
     const predecessorTargetId = this.assistantTargetTabs?.get(key);
-    let predecessorCleanupRetained = false;
     try {
       const generation = this.assistantRuns.begin(conversationId, runId);
       await Promise.all([pending.drain, this.finishAssistantContinuations(unrelated, true)]);
@@ -2759,18 +2766,18 @@ export class BrowserManager {
         this.finishAssistantContinuations(unrelated, true),
       ]);
       const cleanupResults = await Promise.allSettled([
-        this.cleanupAssistantStateOwnedByRun(conversationId, predecessorRunId),
-        this.cleanupAssistantStateOwnedByRun(conversationId, runId),
+        this.cleanupAssistantTabs(conversationId, predecessorRunId),
+        this.cleanupAssistantTabs(conversationId, runId),
       ]);
-      if (cleanupResults[0]?.status === 'rejected') {
-        this.scheduleAssistantContinuationCleanupRetry(pending);
-        predecessorCleanupRetained = true;
-      }
       this.emitTabs(conversationId);
+      const cleanupFailure = cleanupResults.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (cleanupFailure) throw cleanupFailure.reason;
       throw error;
     } finally {
       this.forgetAssistantTarget(conversationId, predecessorRunId);
-      if (!predecessorCleanupRetained) this.assistantContinuationLeases.delete(key);
+      this.assistantContinuationLeases.delete(key);
     }
   }
 
@@ -2799,11 +2806,10 @@ export class BrowserManager {
     const conversations = new Set<string>();
     const results = await Promise.allSettled(
       pendingContinuations.map(async (pending) => {
-        await pending.drain;
         if (closeTabs && !this.disposed) {
-          await this.cleanupAssistantStateOwnedByRun(pending.conversationId, pending.runId);
+          await this.cleanupAssistantTabs(pending.conversationId, pending.runId);
           conversations.add(pending.conversationId);
-        }
+        } else await pending.drain;
         this.assistantContinuationLeases.delete(assistantContinuationKey(pending.conversationId, pending.runId));
       }),
     );
@@ -2813,30 +2819,10 @@ export class BrowserManager {
       const result = results[index]!;
       if (result.status === 'fulfilled') continue;
       failures.push(result.reason);
-      this.scheduleAssistantContinuationCleanupRetry(pendingContinuations[index]!);
     }
     if (failures.length > 0) {
-      throw new AggregateError(failures, 'One or more Browser continuation cleanups failed and will be retried.');
+      throw new AggregateError(failures, 'One or more Browser continuation cleanups failed.');
     }
-  }
-
-  private scheduleAssistantContinuationCleanupRetry(pending: PendingAssistantContinuation): void {
-    const key = assistantContinuationKey(pending.conversationId, pending.runId);
-    if (this.disposed || this.shuttingDown) {
-      this.assistantContinuationLeases.delete(key);
-      return;
-    }
-    const current = this.pendingAssistantContinuations.get(key);
-    if (current && current !== pending) return;
-    clearTimeout(pending.timer);
-    pending.timer = setTimeout(() => {
-      void this.expireAssistantContinuation(key, pending).catch((error: unknown) => {
-        console.warn('[Browser] Assistant continuation cleanup will be retried:', error);
-      });
-    }, ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS);
-    pending.timer.unref?.();
-    this.pendingAssistantContinuations.set(key, pending);
-    this.assistantContinuationLeases.add(key);
   }
 
   private async expireAssistantContinuation(key: string, pending: PendingAssistantContinuation): Promise<void> {
@@ -14782,22 +14768,40 @@ export class BrowserManager {
     return Promise.all(cancellations).then(() => undefined);
   }
 
-  private cancelActiveAssistantDownloads(): Promise<void> {
-    const cancellations = [...(this.activeDownloads?.values() ?? [])]
-      .filter((download) => download.assistantOwnerId !== null && !download.keepOpen)
-      .map((download) => download.cancel());
+  private activeAssistantDownloads(): ActiveBrowserDownload[] {
+    return [...(this.activeDownloads?.values() ?? [])].filter(
+      (download) => download.assistantOwnerId !== null && !download.keepOpen,
+    );
+  }
+
+  private cancelActiveAssistantDownloads(downloads = this.activeAssistantDownloads()): Promise<void> {
+    const cancellations = downloads.map((download) => download.cancel());
     return Promise.all(cancellations).then(() => undefined);
   }
 
-  private scheduleAssistantDownloadCleanupRetry(): void {
-    if (this.disposed || this.shuttingDown || this.assistantDownloadCleanupRetryTimer) return;
+  private scheduleAssistantDownloadCleanupRetry(downloads: Iterable<ActiveBrowserDownload> = []): void {
+    const active = new Set(this.activeDownloads?.values() ?? []);
+    const targets = (this.assistantDownloadCleanupRetryTargets ??= new Set());
+    for (const download of downloads) {
+      if (active.has(download) && download.assistantOwnerId !== null && !download.keepOpen) targets.add(download);
+    }
+    for (const download of targets) {
+      if (!active.has(download) || download.assistantOwnerId === null || download.keepOpen) targets.delete(download);
+    }
+    if (this.disposed || this.shuttingDown || this.assistantDownloadCleanupRetryTimer || targets.size === 0) return;
     this.assistantDownloadCleanupRetryTimer = setTimeout(() => {
       this.assistantDownloadCleanupRetryTimer = null;
       if (this.disposed || this.shuttingDown) return;
-      void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
-        console.warn('[Browser] Assistant download cancellation will be retried:', error);
-        this.scheduleAssistantDownloadCleanupRetry();
-      });
+      const retryTargets = [...targets];
+      void this.cancelActiveAssistantDownloads(retryTargets).then(
+        () => {
+          for (const download of retryTargets) targets.delete(download);
+        },
+        (error: unknown) => {
+          console.warn('[Browser] Assistant download cancellation will be retried:', error);
+          this.scheduleAssistantDownloadCleanupRetry();
+        },
+      );
     }, ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS);
     this.assistantDownloadCleanupRetryTimer.unref?.();
   }
@@ -15943,14 +15947,28 @@ export class BrowserManager {
     const key = assistantContinuationKey(conversationId, runId);
     const retainedRetry = this.assistantTabCleanupRetries?.get(key);
     if (retainedRetry) return retainedRetry.completion;
-    // cleanupAssistantTabsNow executes synchronously through assistantRuns.end,
-    // revoking new work before this method returns. Track the resulting drain
-    // without deferring that revocation behind a promise microtask.
-    const cleanup = this.cleanupAssistantTabsNow(conversationId, runId).then(() => {
-      this.finishAssistantTabCleanupRetry(key);
+    let resolve!: () => void;
+    const completion = new Promise<void>((settled) => {
+      resolve = settled;
     });
-    void cleanup.catch(() => this.scheduleAssistantTabCleanupRetry(conversationId, runId));
-    return this.trackAssistantTabCleanup(conversationId, cleanup);
+    const pending: PendingAssistantTabCleanupRetry = {
+      conversationId,
+      runId,
+      completion,
+      resolve,
+      timer: null,
+    };
+    (this.assistantTabCleanupRetries ??= new Map()).set(key, pending);
+    this.trackAssistantTabCleanup(conversationId, completion);
+    // cleanupAssistantTabsNow executes synchronously through assistantRuns.end,
+    // revoking new work before this method returns. Expose one stable promise
+    // before starting the attempt so existing waiters remain pending across a
+    // transient failure and every retry.
+    void this.cleanupAssistantTabsNow(conversationId, runId).then(
+      () => this.finishAssistantTabCleanupRetry(key, pending),
+      () => this.armAssistantTabCleanupRetry(key, pending),
+    );
+    return completion;
   }
 
   private trackAssistantTabCleanup(conversationId: string, cleanup: Promise<void>): Promise<void> {
@@ -15967,27 +15985,6 @@ export class BrowserManager {
       })
       .catch(() => undefined);
     return cleanup;
-  }
-
-  private scheduleAssistantTabCleanupRetry(conversationId: string, runId: string): void {
-    if (this.disposed || this.shuttingDown) return;
-    const key = assistantContinuationKey(conversationId, runId);
-    if (this.pendingAssistantContinuations?.has(key)) return;
-    if (this.assistantTabCleanupRetries?.has(key)) return;
-    let resolve!: () => void;
-    const completion = new Promise<void>((settled) => {
-      resolve = settled;
-    });
-    const pending: PendingAssistantTabCleanupRetry = {
-      conversationId,
-      runId,
-      completion,
-      resolve,
-      timer: null,
-    };
-    (this.assistantTabCleanupRetries ??= new Map()).set(key, pending);
-    this.trackAssistantTabCleanup(conversationId, completion);
-    this.armAssistantTabCleanupRetry(key, pending);
   }
 
   private armAssistantTabCleanupRetry(key: string, pending: PendingAssistantTabCleanupRetry): void {
@@ -16024,6 +16021,7 @@ export class BrowserManager {
     if (!pending || (expected && pending !== expected)) return;
     if (pending.timer) clearTimeout(pending.timer);
     this.assistantTabCleanupRetries?.delete(key);
+    this.assistantContinuationLeases?.delete(key);
     pending.resolve();
   }
 
@@ -16040,7 +16038,10 @@ export class BrowserManager {
     if (pending) {
       this.pendingAssistantContinuations.delete(key);
       clearTimeout(pending.timer);
-      await this.finishAssistantContinuations([pending], true);
+      await pending.drain;
+      await this.cleanupAssistantStateOwnedByRun(conversationId, runId);
+      this.assistantContinuationLeases.delete(key);
+      this.emitTabs(conversationId);
       return;
     }
     await this.assistantRuns.end(conversationId, runId);
@@ -16128,9 +16129,10 @@ export class BrowserManager {
     // DownloadItems outlive their initiating WebContents. Invoke every
     // non-retained assistant cancellation synchronously while its run ownership
     // is still intact, before clearing leases and destroying page renderers.
-    void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
+    const revokedDownloads = this.activeAssistantDownloads();
+    void this.cancelActiveAssistantDownloads(revokedDownloads).catch((error: unknown) => {
       console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
-      this.scheduleAssistantDownloadCleanupRetry();
+      this.scheduleAssistantDownloadCleanupRetry(revokedDownloads);
     });
     this.assistantRuns.clear();
     this.assistantTargetTabs?.clear();
@@ -16229,6 +16231,7 @@ export class BrowserManager {
       clearTimeout(this.assistantDownloadCleanupRetryTimer);
       this.assistantDownloadCleanupRetryTimer = null;
     }
+    this.assistantDownloadCleanupRetryTargets?.clear();
     ipcMain.off('browser-page:sensitive', this.handleSensitiveEvent);
     ipcMain.off('browser-page:login-submitted', this.handleLoginSubmitted);
     ipcMain.off('browser-page:activity', this.handlePageActivity);

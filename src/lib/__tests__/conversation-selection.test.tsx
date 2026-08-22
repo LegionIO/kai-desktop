@@ -67,6 +67,8 @@ describe('filterConversationDeleteFallbackCandidates', () => {
 describe('prepareConversationWorkspaceSwitch', () => {
   it('uses workspace state observed after the conversation lookup resolves', async () => {
     let activeWorkspaceId = 'workspace-a';
+    const activeConversationId = 'chat-a';
+    const selectionGeneration = 1;
     let resolveConversation: (conversation: { workspaceId: string }) => void = () => {};
     const getConversation = vi.fn(
       () =>
@@ -82,6 +84,8 @@ describe('prepareConversationWorkspaceSwitch', () => {
     const opening = openBrowserConversationInWorkspace({
       conversationId: 'chat-b',
       getConversation,
+      getActiveConversationId: () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
       saveLastConversation,
@@ -101,6 +105,79 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(setActiveWorkspace).not.toHaveBeenCalled();
     expect(switchConversation).toHaveBeenCalledWith('chat-b');
     expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('does not let delayed Browser attention override a newer user selection', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let activeConversationId = 'chat-a';
+    let selectionGeneration = 1;
+    let resolveObservation: (observed: boolean) => void = () => {};
+    const setActiveWorkspace = vi.fn(async (workspaceId: string) => {
+      activeWorkspaceId = workspaceId;
+    });
+    const switchConversation = vi.fn(async () => true);
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      getConversation: async () => ({ workspaceId: 'workspace-b' }),
+      getActiveConversationId: () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+      saveLastConversation: async () => undefined,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      switchConversation,
+    });
+
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b'));
+    activeConversationId = 'chat-user-choice';
+    selectionGeneration++;
+    resolveObservation(true);
+
+    await expect(opening).resolves.toBe(false);
+    expect(switchConversation).not.toHaveBeenCalled();
+  });
+
+  it('accepts the target selected by the requested workspace restoration', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let activeConversationId = 'chat-a';
+    const selectionGeneration = 1;
+    let resolveObservation: (observed: boolean) => void = () => {};
+    const setActiveWorkspace = vi.fn(async (workspaceId: string) => {
+      activeWorkspaceId = workspaceId;
+    });
+    const switchConversation = vi.fn(async () => true);
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      getConversation: async () => ({ workspaceId: 'workspace-b' }),
+      getActiveConversationId: () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+      saveLastConversation: async () => undefined,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      switchConversation,
+    });
+
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b'));
+    activeConversationId = 'chat-b';
+    resolveObservation(true);
+
+    await expect(opening).resolves.toBe(true);
+    expect(switchConversation).not.toHaveBeenCalled();
   });
 
   it('waits for a configured workspace whose transition effect is still pending', async () => {

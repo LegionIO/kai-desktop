@@ -123,6 +123,8 @@ export type WorkspaceObservationWait = {
 export async function openBrowserConversationInWorkspace(options: {
   conversationId: string;
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
+  getActiveConversationId: () => string | null;
+  getSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
   getKnownWorkspaceIds: () => Iterable<string>;
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
@@ -130,8 +132,21 @@ export async function openBrowserConversationInWorkspace(options: {
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   switchConversation: (conversationId: string) => Promise<boolean>;
 }): Promise<boolean> {
+  const selectionWhenStarted = options.getActiveConversationId();
+  const selectionGeneration = options.getSelectionGeneration();
+  const selectionIsCurrent = (): boolean =>
+    options.getSelectionGeneration() === selectionGeneration &&
+    options.getActiveConversationId() === selectionWhenStarted;
   const conversation = await options.getConversation(options.conversationId);
   if (!conversation) return false;
+
+  // A Browser-attention click is navigation intent, but it must not become a
+  // newer intent merely because its record/workspace lookup was slow. If the
+  // target was selected by the workspace restoration we initiated, the request
+  // already succeeded and must not issue a second selection CAS.
+  if (options.getActiveConversationId() === options.conversationId) return true;
+  if (!selectionIsCurrent()) return false;
+  const activeWorkspaceAtPreparation = options.getActiveWorkspaceId();
 
   // Read workspace state only after the async record lookup. Browser attention
   // can arrive while the user is changing workspaces, and render-captured state
@@ -140,13 +155,16 @@ export async function openBrowserConversationInWorkspace(options: {
   const workspaceReady = await prepareConversationWorkspaceSwitch({
     conversationId: options.conversationId,
     conversationWorkspaceId: conversation.workspaceId,
-    activeWorkspaceId: options.getActiveWorkspaceId(),
+    activeWorkspaceId: activeWorkspaceAtPreparation,
     knownWorkspaceIds: options.getKnownWorkspaceIds(),
     saveLastConversation: options.saveLastConversation,
     setActiveWorkspace: options.setActiveWorkspace,
     createWorkspaceObservationWait: options.createWorkspaceObservationWait,
+    isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
   });
   if (!workspaceReady) return false;
+  if (options.getActiveConversationId() === options.conversationId) return true;
+  if (!selectionIsCurrent()) return false;
   return options.switchConversation(options.conversationId);
 }
 
@@ -163,6 +181,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
   setActiveWorkspace: (workspaceId: string) => Promise<void>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
+  isCurrent?: () => boolean;
 }): Promise<boolean> {
   const targetWorkspaceId = options.conversationWorkspaceId;
   if (!targetWorkspaceId) return true;
@@ -174,6 +193,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
         workspaceId: targetWorkspaceId,
         conversationId: options.conversationId,
       });
+      if (options.isCurrent && !options.isCurrent()) return false;
       await options.setActiveWorkspace(targetWorkspaceId);
     }
     return await observation.promise;

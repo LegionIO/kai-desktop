@@ -156,6 +156,8 @@ describe('browser session helpers', () => {
   it('identifies private network destinations', () => {
     expect(isPrivateNetworkUrl('http://127.0.0.1')).toBe(true);
     expect(isPrivateNetworkUrl('http://localhost.:3000')).toBe(true);
+    expect(isPrivateNetworkUrl('https://api.localhost')).toBe(true);
+    expect(isPrivateNetworkUrl('https://api.localhost.')).toBe(true);
     expect(isPrivateNetworkUrl('http://service.local.')).toBe(true);
     expect(isPrivateNetworkUrl('https://192.168.4.2')).toBe(true);
     expect(isPrivateNetworkUrl('https://172.20.1.1')).toBe(true);
