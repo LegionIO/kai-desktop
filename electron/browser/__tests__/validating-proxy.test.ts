@@ -276,8 +276,12 @@ describe('Browser validating proxy', () => {
         releaseStalled();
         await vi.advanceTimersByTimeAsync(0);
         await expect(proxy.configureSession(session)).resolves.toBeUndefined();
-        expect(setProxy).toHaveBeenCalledTimes(2);
-        expect(closeAllConnections).toHaveBeenCalledTimes(stalledOperation === 'setProxy' ? 1 : 2);
+        // Both callers already admitted their serialized transactions before
+        // their public deadlines expired. They must finish in order after the
+        // native stall clears; the final call then establishes a cached,
+        // observed-successful configuration.
+        expect(setProxy).toHaveBeenCalledTimes(3);
+        expect(closeAllConnections).toHaveBeenCalledTimes(3);
       } finally {
         vi.useRealTimers();
       }
@@ -354,7 +358,7 @@ describe('Browser validating proxy', () => {
       const session = { setProxy, closeAllConnections } as never;
 
       const first = proxy.configureSession(session);
-      const firstTimedOut = expect(first).rejects.toThrow(/reset timed out/i);
+      const firstTimedOut = expect(first).rejects.toThrow(/configuration timed out/i);
       await vi.advanceTimersByTimeAsync(25);
       await firstTimedOut;
 
