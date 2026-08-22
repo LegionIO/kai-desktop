@@ -1,6 +1,25 @@
 import { realpathSync, openSync, fstatSync, readSync, closeSync, constants } from 'fs';
 import { sep } from 'path';
 
+export function resolveBoundedSuffixRange(
+  size: number,
+  requestedBytes: number,
+  maxBytes: number,
+): { start: number; end: number } | null {
+  if (
+    !Number.isSafeInteger(size) ||
+    size <= 0 ||
+    !Number.isSafeInteger(requestedBytes) ||
+    requestedBytes <= 0 ||
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes <= 0
+  ) {
+    return null;
+  }
+  const length = Math.min(size, requestedBytes, maxBytes);
+  return { start: size - length, end: size - 1 };
+}
+
 /**
  * Read a file that MUST resolve inside `rootDir`, resistant to symlink-based
  * escapes and TOCTOU swaps. Returns the file bytes, or null if the path escapes

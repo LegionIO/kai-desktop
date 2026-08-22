@@ -183,7 +183,7 @@ import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
-import { safeReadFileWithin, safeReadRangeWithin } from './utils/safe-file-read.js';
+import { resolveBoundedSuffixRange, safeReadFileWithin, safeReadRangeWithin } from './utils/safe-file-read.js';
 import { overrideCommittedQuitUnloadVeto } from './quit-lifecycle.js';
 import {
   BROWSER_FORCE_EXIT_GRACE_MS,
@@ -2926,12 +2926,17 @@ if (gotSingleInstanceLock) {
           // suffix range — resolve against size from a 1-byte probe (cheap) to get total length
           const probe = safeReadRangeWithin(mediaDir, filePath, 0, 0);
           if (!probe) return new Response('Not Found', { status: 404 });
-          const suffix = Math.min(parseInt(endStr, 10), probe.size);
-          start = Math.max(0, probe.size - suffix);
-          // Cap the served span to MEDIA_CHUNK (R172): an open-ended suffix like bytes=-536870912
-          // would otherwise buffer the whole (up to 512MiB) file. The client re-requests further
-          // bytes with follow-up ranges.
-          end = Math.min(probe.size - 1, start + MEDIA_CHUNK - 1);
+          const suffixRange = resolveBoundedSuffixRange(probe.size, parseInt(endStr, 10), MEDIA_CHUNK);
+          if (!suffixRange) {
+            return new Response('Range Not Satisfiable', {
+              status: 416,
+              headers: { 'Content-Range': `bytes */${probe.size}` },
+            });
+          }
+          // Cap oversized suffixes at the tail: callers asking for `bytes=-N`
+          // need the final bytes (often media metadata), not the first chunk of
+          // the larger suffix interval.
+          ({ start, end } = suffixRange);
         } else {
           start = startStr === '' ? 0 : parseInt(startStr, 10);
           end = endStr === '' ? start + MEDIA_CHUNK - 1 : parseInt(endStr, 10);

@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { safeReadFileWithin } from '../safe-file-read.js';
+import { resolveBoundedSuffixRange, safeReadFileWithin } from '../safe-file-read.js';
 
 let root: string;
 let outside: string;
@@ -70,5 +70,25 @@ describe('safeReadFileWithin', () => {
     // (TOCTOU), not a pre-existing link to a legitimate in-root target.
     expect(safeReadFileWithin(root, link)?.toString()).toBe('inside');
     expect(safeReadFileWithin(root, target)?.toString()).toBe('inside');
+  });
+});
+
+describe('resolveBoundedSuffixRange', () => {
+  it('keeps a capped suffix range anchored at the end of the file', () => {
+    expect(resolveBoundedSuffixRange(20, 12, 4)).toEqual({ start: 16, end: 19 });
+  });
+
+  it('returns the requested tail when it is smaller than the cap', () => {
+    expect(resolveBoundedSuffixRange(20, 3, 4)).toEqual({ start: 17, end: 19 });
+  });
+
+  it('clamps suffixes larger than the file', () => {
+    expect(resolveBoundedSuffixRange(3, 20, 4)).toEqual({ start: 0, end: 2 });
+  });
+
+  it('rejects empty or invalid ranges', () => {
+    expect(resolveBoundedSuffixRange(20, 0, 4)).toBeNull();
+    expect(resolveBoundedSuffixRange(0, 3, 4)).toBeNull();
+    expect(resolveBoundedSuffixRange(20, 3, Number.NaN)).toBeNull();
   });
 });
