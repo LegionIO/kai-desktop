@@ -5184,6 +5184,20 @@ export class BrowserManager {
     );
   }
 
+  /** Opening a native picker temporarily blurs Browser chrome. The picker owns
+   * the focus authority checked before it opens, so completion validates the
+   * durable panel generation instead of requiring focus to have already been
+   * restored by the OS. Host-renderer authority is checked separately by the
+   * surrounding IPC operation. */
+  private hasBrowserChromeNativeDialogCompletionAuthority(
+    conversationId: string,
+    panelAuthorityGeneration: number,
+  ): boolean {
+    return (
+      !this.disposed && !this.shuttingDown && panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId)
+    );
+  }
+
   /** Acquire manager ownership of the target debugger until the returned
    * one-shot release is called. All manager CDP users share this lease set so a
    * panel mount may restore viewport metrics concurrently without detaching an
@@ -7904,8 +7918,8 @@ export class BrowserManager {
   }
 
   async mount(conversationId: string, bounds: BrowserBounds | null): Promise<void> {
-    const mountGeneration = (this.mountGeneration = (this.mountGeneration ?? 0) + 1);
     if (!this.config().enabled) {
+      this.mountGeneration = (this.mountGeneration ?? 0) + 1;
       const mountedConversationId = this.mountedConversationId;
       if (mountedConversationId) {
         this.invalidatePanelAuthority(mountedConversationId);
@@ -7931,6 +7945,7 @@ export class BrowserManager {
         return;
       }
       if (this.mountedConversationId !== conversationId) return;
+      this.mountGeneration = (this.mountGeneration ?? 0) + 1;
       this.invalidatePanelAuthority(conversationId);
       this.mountedConversationId = null;
       this.mountedBounds = null;
@@ -7949,6 +7964,7 @@ export class BrowserManager {
     if (this.removedConversations.has(conversationId) || this.isConversationDefinitivelyAbsent(conversationId)) {
       this.fenceRemovedConversation(conversationId);
       if (this.mountedConversationId === conversationId) {
+        this.mountGeneration = (this.mountGeneration ?? 0) + 1;
         this.mountedConversationId = null;
         this.mountedBounds = null;
         this.detachAttachedView();
@@ -7960,6 +7976,7 @@ export class BrowserManager {
     // Validate before publishing either field. A transient invalid resize must
     // not leave raw rejected bounds available to attachActiveView().
     const validatedBounds = validateBrowserBounds(bounds, win.getContentBounds());
+    const mountGeneration = (this.mountGeneration = (this.mountGeneration ?? 0) + 1);
     const previousMountedConversationId = this.mountedConversationId;
     if (previousMountedConversationId && previousMountedConversationId !== conversationId) {
       this.invalidatePanelAuthority(previousMountedConversationId);
@@ -8055,15 +8072,27 @@ export class BrowserManager {
       tab.assistantBackgroundInitialLoadPending ||
       tab.assistantBackgroundViewportContents?.has(tab.view.webContents) ||
       this.hasPendingBackgroundAutomationArm(tab, tab.view.webContents) ||
-      this.hasDispatchedSyntheticInput(tab, tab.view.webContents)
+      this.hasDispatchedSyntheticInput(tab, tab.view.webContents) ||
+      this.assistantDialogProtectionRestores?.has(tab.view.webContents.id)
     ) {
       // Authority, background viewport, and input-provenance transitions are
-      // intentionally hidden from real input. Mounting remains recorded and
-      // their cleanup paths retry attachment after the quarantine is removed.
+      // intentionally hidden from real input. File-chooser interception is
+      // native target state too: direct attachment paths must not expose the
+      // page until Chromium acknowledges restoration. Mounting remains
+      // recorded and cleanup retries attachment after quarantine is removed.
+      const dialogRestore = this.assistantDialogProtectionRestores?.get(tab.view.webContents.id);
       this.detachAttachedView();
       tab.view.setVisible(false);
       if (!this.hasStableNativeSurfaceLease(tab.view)) {
         tab.view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      }
+      if (dialogRestore) {
+        const restoringContentsId = tab.view.webContents.id;
+        const retryAfterRestore = () => {
+          if (this.assistantDialogProtectionRestores?.get(restoringContentsId) === dialogRestore) return;
+          this.attachActiveView(conversationId);
+        };
+        void dialogRestore.then(retryAfterRestore, retryAfterRestore);
       }
       return;
     }
@@ -14975,7 +15004,7 @@ export class BrowserManager {
       const selected =
         win && !win.isDestroyed() ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
       this.assertHostRendererOperationCurrent();
-      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+      if (!this.hasBrowserChromeNativeDialogCompletionAuthority(conversationId, nativeDialogPanelGeneration)) {
         return { imported: 0, canceled: true };
       }
       if (selected.canceled || !selected.filePaths[0]) return { imported: 0, canceled: true };
@@ -15006,7 +15035,7 @@ export class BrowserManager {
       const selected =
         win && !win.isDestroyed() ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
       this.assertHostRendererOperationCurrent();
-      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+      if (!this.hasBrowserChromeNativeDialogCompletionAuthority(conversationId, nativeDialogPanelGeneration)) {
         return { exported: 0, canceled: true };
       }
       if (selected.canceled || !selected.filePath) return { exported: 0, canceled: true };

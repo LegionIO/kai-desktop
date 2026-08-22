@@ -275,12 +275,13 @@ const appAPI = {
     create: (args: { name: string; directory: string }) => ipcRenderer.invoke('workspaces:create', args),
     rename: (args: { id: string; name: string }) => ipcRenderer.invoke('workspaces:rename', args),
     delete: (args: { id: string }) => ipcRenderer.invoke('workspaces:delete', args),
-    setActive: (args: { id: string | null; expectedCurrentId?: string | null }) =>
+    setActive: (args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string }) =>
       ipcRenderer.invoke('workspaces:set-active', args) as Promise<{
         ok: boolean;
         error?: 'active-workspace-changed';
         activeWorkspaceId?: string | null;
         activeWorkspaceLastConversationId?: string | null;
+        activeWorkspaceMutationToken?: string | null;
       }>,
     saveLastConversation: (args: {
       workspaceId: string;

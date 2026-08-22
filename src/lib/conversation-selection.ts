@@ -222,6 +222,11 @@ export type ActiveConversationCasResult = {
   activeConversationId?: string | null;
 };
 
+export type WorkspaceRestorationReadResult<T> =
+  | { status: 'found'; conversation: T }
+  | { status: 'missing' }
+  | { status: 'unavailable' };
+
 const WORKSPACE_RESTORATION_RETRY_DELAYS_MS = [25, 75, 150] as const;
 
 /** A strict conversation read can fail transiently before the selection CAS is
@@ -247,6 +252,9 @@ export async function setActiveConversationForWorkspaceRestoration(options: {
     if (!options.isCurrent()) return null;
     const result = await options.setActiveId(options.conversationId, options.expectedCurrentConversationId);
     if (!options.isCurrent()) return null;
+    if (result.error === 'active-conversation-changed' && result.activeConversationId === options.conversationId) {
+      return { ok: true, activeConversationId: result.activeConversationId };
+    }
     if (result.error !== 'conversation-unavailable') return result;
     const delayMs = WORKSPACE_RESTORATION_RETRY_DELAYS_MS[attempt];
     if (delayMs === undefined) return result;
@@ -254,17 +262,44 @@ export async function setActiveConversationForWorkspaceRestoration(options: {
   }
 }
 
+/** The post-CAS strict read can encounter the same transient filesystem window
+ * as the activation read. Keep it tied to the original renderer intent and use
+ * the same bounded retry budget before deciding that rollback is necessary. */
+export async function getConversationForWorkspaceRestoration<T>(options: {
+  conversationId: string;
+  isCurrent: () => boolean;
+  getForRestore: (conversationId: string) => Promise<WorkspaceRestorationReadResult<T>>;
+  waitForRetry?: (delayMs: number) => Promise<void>;
+}): Promise<WorkspaceRestorationReadResult<T> | null> {
+  const waitForRetry =
+    options.waitForRetry ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      }));
+  for (let attempt = 0; ; attempt += 1) {
+    if (!options.isCurrent()) return null;
+    const result = await options.getForRestore(options.conversationId);
+    if (!options.isCurrent()) return null;
+    if (result.status !== 'unavailable') return result;
+    const delayMs = WORKSPACE_RESTORATION_RETRY_DELAYS_MS[attempt];
+    if (delayMs === undefined) return result;
+    await waitForRetry(delayMs);
+  }
+}
+
 /** A failed workspace mutation may request restoration only while it remains
- * the newest navigation intent and the renderer is still in its source scope. */
+ * the newest conversation/workspace selection intent and the renderer is still
+ * in its source scope. View-only navigation must not suppress the repair. */
 export function shouldRetryWorkspaceConversationRestoration(options: {
   workspaceId: string | null;
   currentWorkspaceId: string | null;
-  navigationGeneration: number;
-  currentNavigationGeneration: number;
+  selectionIntentGeneration: number;
+  currentSelectionIntentGeneration: number;
 }): boolean {
   return (
     options.workspaceId === options.currentWorkspaceId &&
-    options.navigationGeneration === options.currentNavigationGeneration
+    options.selectionIntentGeneration === options.currentSelectionIntentGeneration
   );
 }
 
@@ -314,6 +349,8 @@ export type ActiveWorkspaceCasResult = {
   error?: 'active-workspace-changed';
   activeWorkspaceId?: string | null;
   activeWorkspaceLastConversationId?: string | null;
+  /** Opaque provenance for the mutation that selected activeWorkspaceId. */
+  activeWorkspaceMutationToken?: string | null;
 };
 
 export type BrowserWorkspaceSwitchResult = {
@@ -350,6 +387,7 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
     departingConversationId: string | null,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
+  canRebase: (result: ActiveWorkspaceCasResult) => boolean;
 }): Promise<BrowserWorkspaceSwitchResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
   let departingConversationId = options.departingConversationId;
@@ -362,6 +400,7 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
     if (result.ok) return { ok: true, previousWorkspaceId: expectedCurrentWorkspaceId };
     if (
       !options.isCurrent() ||
+      !options.canRebase(result) ||
       result.activeWorkspaceId === undefined ||
       result.activeWorkspaceLastConversationId === undefined
     )
@@ -393,6 +432,7 @@ export async function openBrowserConversationInWorkspace(options: {
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
+  discardActiveWorkspaceTransition?: (workspaceId: string) => void;
   switchConversation: (
     conversationId: string,
     expectedCurrentConversationId: string | null,
@@ -443,6 +483,7 @@ export async function openBrowserConversationInWorkspace(options: {
     canRollbackStaleSwitch: () =>
       options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
       options.getBrowserAttentionGeneration() === options.browserAttentionGeneration,
+    discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
   });
   if (!workspaceReady) return false;
   if (options.getActiveConversationId() === options.conversationId) return true;
@@ -470,6 +511,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   isCurrent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
   canRollbackStaleSwitch?: () => boolean;
+  discardActiveWorkspaceTransition?: (workspaceId: string) => void;
 }): Promise<boolean> {
   const targetWorkspaceId = options.conversationWorkspaceId;
   if (!targetWorkspaceId) return true;
@@ -517,7 +559,10 @@ export async function prepareConversationWorkspaceSwitch(options: {
       return false;
     }
     const observed = await observation.promise;
-    if (!observed) return false;
+    if (!observed) {
+      options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
+      return false;
+    }
     if (options.isCurrentAfterSwitch?.() === false) {
       if (switchedWorkspace && options.canRollbackStaleSwitch?.()) {
         await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');

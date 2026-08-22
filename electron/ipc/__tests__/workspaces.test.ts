@@ -49,8 +49,8 @@ beforeEach(() => {
 });
 
 const create = (args: { name: string; directory: string }) => handlers.get('workspaces:create')!(null, args);
-const setActive = (id: string | null, expectedCurrentId?: string | null) =>
-  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId });
+const setActive = (id: string | null, expectedCurrentId?: string | null, mutationToken?: string) =>
+  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId, mutationToken });
 const saveLastConversation = (
   workspaceId: string,
   conversationId: string | null,
@@ -117,6 +117,34 @@ describe('workspaces:set-active integrity', () => {
       activeWorkspaceLastConversationId: 'chat-b',
     });
     expect(config.ui.activeWorkspaceId).toBe(second.id);
+  });
+
+  it('reports mutation provenance only while that exact workspace remains active', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+
+    await expect(setActive(first.id, second.id, 'browser_request-1')).resolves.toEqual({
+      ok: true,
+      activeWorkspaceId: first.id,
+      activeWorkspaceMutationToken: 'browser_request-1',
+    });
+    await expect(setActive(second.id, second.id)).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: first.id,
+      activeWorkspaceLastConversationId: null,
+      activeWorkspaceMutationToken: 'browser_request-1',
+    });
+
+    await expect(setActive(second.id, first.id)).resolves.toEqual({ ok: true, activeWorkspaceId: second.id });
+    await expect(setActive(first.id, first.id)).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: second.id,
+      activeWorkspaceLastConversationId: null,
+    });
   });
 });
 

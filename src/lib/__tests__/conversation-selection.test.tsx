@@ -12,6 +12,7 @@ import {
   commitLocalConversationSelection,
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
+  getConversationForWorkspaceRestoration,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
@@ -269,6 +270,25 @@ describe('rollbackUnavailableWorkspaceRestoration', () => {
 });
 
 describe('setActiveConversationForWorkspaceRestoration', () => {
+  it('coalesces a stale CAS result when another client already selected the restoration target', async () => {
+    const setActiveId = vi.fn(async () => ({
+      ok: false,
+      error: 'active-conversation-changed' as const,
+      activeConversationId: 'chat-b',
+    }));
+
+    await expect(
+      setActiveConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        expectedCurrentConversationId: 'chat-a',
+        isCurrent: () => true,
+        setActiveId,
+      }),
+    ).resolves.toEqual({ ok: true, activeConversationId: 'chat-b' });
+
+    expect(setActiveId).toHaveBeenCalledOnce();
+  });
+
   it('retries transient unavailable reads within a bounded budget', async () => {
     const setActiveId = vi
       .fn()
@@ -329,17 +349,61 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
   });
 });
 
+describe('getConversationForWorkspaceRestoration', () => {
+  it('retries transient post-CAS reads within the bounded restoration budget', async () => {
+    const conversation = { id: 'chat-b' };
+    const getForRestore = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 'unavailable' })
+      .mockResolvedValueOnce({ status: 'unavailable' })
+      .mockResolvedValueOnce({ status: 'found', conversation });
+    const waitForRetry = vi.fn(async () => undefined);
+
+    await expect(
+      getConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        isCurrent: () => true,
+        getForRestore,
+        waitForRetry,
+      }),
+    ).resolves.toEqual({ status: 'found', conversation });
+
+    expect(getForRestore).toHaveBeenCalledTimes(3);
+    expect(waitForRetry.mock.calls).toEqual([[25], [75]]);
+  });
+
+  it('abandons a retry after a newer selection intent takes ownership', async () => {
+    let current = true;
+    const getForRestore = vi.fn(async () => ({ status: 'unavailable' as const }));
+
+    await expect(
+      getConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        isCurrent: () => current,
+        getForRestore,
+        waitForRetry: async () => {
+          current = false;
+        },
+      }),
+    ).resolves.toBeNull();
+
+    expect(getForRestore).toHaveBeenCalledOnce();
+  });
+});
+
 describe('shouldRetryWorkspaceConversationRestoration', () => {
-  it('requires both the original workspace and navigation generation', () => {
+  it('requires the original workspace and selection intent but ignores view-only navigation', () => {
     const current = {
       workspaceId: 'workspace-a',
       currentWorkspaceId: 'workspace-a',
-      navigationGeneration: 4,
-      currentNavigationGeneration: 4,
+      selectionIntentGeneration: 4,
+      currentSelectionIntentGeneration: 4,
     };
 
     expect(shouldRetryWorkspaceConversationRestoration(current)).toBe(true);
-    expect(shouldRetryWorkspaceConversationRestoration({ ...current, currentNavigationGeneration: 5 })).toBe(false);
+    expect(shouldRetryWorkspaceConversationRestoration({ ...current, currentSelectionIntentGeneration: 5 })).toBe(
+      false,
+    );
     expect(shouldRetryWorkspaceConversationRestoration({ ...current, currentWorkspaceId: 'workspace-b' })).toBe(false);
   });
 });
@@ -390,6 +454,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         departingConversationId: 'chat-stale',
         setActiveWorkspace,
         isCurrent: () => true,
+        canRebase: () => true,
       }),
     ).resolves.toEqual({ ok: true, previousWorkspaceId: 'workspace-authoritative' });
 
@@ -417,6 +482,30 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         departingConversationId: 'chat-stale',
         setActiveWorkspace,
         isCurrent: () => false,
+        canRebase: () => true,
+      }),
+    ).resolves.toEqual({ ok: false });
+
+    expect(setActiveWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it('does not rebase across a workspace mutation owned by another renderer', async () => {
+    const setActiveWorkspace = vi.fn(async () => ({
+      ok: false,
+      error: 'active-workspace-changed' as const,
+      activeWorkspaceId: 'workspace-authoritative',
+      activeWorkspaceLastConversationId: 'chat-authoritative',
+      activeWorkspaceMutationToken: 'other-renderer',
+    }));
+
+    await expect(
+      setActiveBrowserWorkspaceWithRebase({
+        workspaceId: 'workspace-browser',
+        expectedCurrentWorkspaceId: 'workspace-stale',
+        departingConversationId: 'chat-stale',
+        setActiveWorkspace,
+        isCurrent: () => true,
+        canRebase: (result) => result.activeWorkspaceMutationToken === 'this-renderer',
       }),
     ).resolves.toEqual({ ok: false });
 
@@ -921,6 +1010,25 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveObservation(true);
     await expect(preparation).resolves.toBe(true);
     expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('discards the exact Browser transition when workspace observation fails', async () => {
+    const discardActiveWorkspaceTransition = vi.fn();
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+        saveLastConversation: async () => undefined,
+        setActiveWorkspace: async () => true,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(false), cancel: vi.fn() }),
+        discardActiveWorkspaceTransition,
+      }),
+    ).resolves.toBe(false);
+
+    expect(discardActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
   });
 
   it('rolls a stale authoritative rebase back to the workspace actually replaced', async () => {

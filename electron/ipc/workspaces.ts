@@ -19,6 +19,14 @@ export function registerWorkspaceHandlers(
   getConfig: () => AppConfig,
   setConfig: (path: string, value: unknown) => void,
 ): void {
+  let activeWorkspaceMutationToken: string | null = null;
+  let mutationTokenWorkspaceId = getConfig().ui?.activeWorkspaceId ?? null;
+  const recordActiveWorkspaceMutation = (workspaceId: string | null, mutationToken?: string): void => {
+    mutationTokenWorkspaceId = workspaceId;
+    activeWorkspaceMutationToken =
+      typeof mutationToken === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(mutationToken) ? mutationToken : null;
+  };
+
   // ── Create ──────────────────────────────────────────────────────────────
 
   ipcMain.handle('workspaces:create', async (_event, args: { name: string; directory: string }): Promise<Workspace> => {
@@ -72,6 +80,7 @@ export function registerWorkspaceHandlers(
 
     setConfig('ui.workspaces', [...workspaces, workspace]);
     setConfig('ui.activeWorkspaceId', workspace.id);
+    recordActiveWorkspaceMutation(workspace.id);
 
     return workspace;
   });
@@ -100,8 +109,10 @@ export function registerWorkspaceHandlers(
       if (workspaces.length > 0) {
         const sorted = [...workspaces].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
         setConfig('ui.activeWorkspaceId', sorted[0].id);
+        recordActiveWorkspaceMutation(sorted[0].id);
       } else {
         setConfig('ui.activeWorkspaceId', null);
+        recordActiveWorkspaceMutation(null);
       }
     }
   });
@@ -112,16 +123,21 @@ export function registerWorkspaceHandlers(
     'workspaces:set-active',
     async (
       _event,
-      args: { id: string | null; expectedCurrentId?: string | null },
+      args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string },
     ): Promise<{
       ok: boolean;
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
       activeWorkspaceLastConversationId?: string | null;
+      activeWorkspaceMutationToken?: string | null;
     }> => {
       const config = getConfig();
       const workspaces = [...(config.ui?.workspaces ?? [])];
       const activeWorkspaceId = config.ui?.activeWorkspaceId ?? null;
+      if (mutationTokenWorkspaceId !== activeWorkspaceId) {
+        mutationTokenWorkspaceId = activeWorkspaceId;
+        activeWorkspaceMutationToken = null;
+      }
 
       if (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) {
         const activeWorkspaceLastConversationId =
@@ -131,6 +147,7 @@ export function registerWorkspaceHandlers(
           error: 'active-workspace-changed',
           activeWorkspaceId,
           activeWorkspaceLastConversationId,
+          ...(activeWorkspaceMutationToken ? { activeWorkspaceMutationToken } : {}),
         };
       }
 
@@ -145,7 +162,12 @@ export function registerWorkspaceHandlers(
       }
 
       setConfig('ui.activeWorkspaceId', args.id);
-      return { ok: true, activeWorkspaceId: args.id };
+      recordActiveWorkspaceMutation(args.id, args.mutationToken);
+      return {
+        ok: true,
+        activeWorkspaceId: args.id,
+        ...(activeWorkspaceMutationToken ? { activeWorkspaceMutationToken } : {}),
+      };
     },
   );
 

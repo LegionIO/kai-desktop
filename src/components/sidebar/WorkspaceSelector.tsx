@@ -94,7 +94,9 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     const navigationGeneration = onWorkspaceNavigationIntent();
     try {
       const result = await app.workspaces.setActive({ id: workspaceId, expectedCurrentId: activeWorkspaceId });
-      if (!result.ok) onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
+      if (!result.ok && (result.activeWorkspaceId === undefined || result.activeWorkspaceId === activeWorkspaceId)) {
+        onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
+      }
     } catch {
       onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
     }

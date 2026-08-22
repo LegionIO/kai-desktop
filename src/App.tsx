@@ -89,6 +89,7 @@ import {
   commitLocalConversationSelection,
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
+  getConversationForWorkspaceRestoration,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   resolveConversationWorkspaceTransition,
@@ -725,6 +726,7 @@ function AppShell() {
   const workspaceSelectionIntentGenerationRef = useRef(0);
   const browserAttentionIntentGenerationRef = useRef(0);
   const browserWorkspaceTransitionsRef = useRef<Map<string, BrowserWorkspaceTransitionMarker>>(new Map());
+  const lastBrowserWorkspaceMutationTokenRef = useRef<string | null>(null);
   const [workspaceRestorationRetryGeneration, setWorkspaceRestorationRetryGeneration] = useState(0);
   const handledWorkspaceRestorationRetryGenerationRef = useRef(0);
   const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>((next) => {
@@ -735,10 +737,10 @@ function AppShell() {
     workspaceSelectionIntentGenerationRef.current++;
     navigationIntentGenerationRef.current++;
     conversationSelectionIntentGenerationRef.current++;
-    return navigationIntentGenerationRef.current;
+    return conversationSelectionIntentGenerationRef.current;
   }, []);
   const retryWorkspaceConversationRestoration = useCallback(
-    (workspaceId: string | null, navigationGeneration: number) => {
+    (workspaceId: string | null, selectionIntentGeneration: number) => {
       // A concurrent successful workspace mutation will run the normal
       // workspace-change effect. Retry only when the failed request left us in
       // the workspace whose in-flight restoration it invalidated, and only while
@@ -747,8 +749,8 @@ function AppShell() {
         shouldRetryWorkspaceConversationRestoration({
           workspaceId,
           currentWorkspaceId: configuredWorkspaceIdRef.current,
-          navigationGeneration,
-          currentNavigationGeneration: navigationIntentGenerationRef.current,
+          selectionIntentGeneration,
+          currentSelectionIntentGeneration: conversationSelectionIntentGenerationRef.current,
         })
       ) {
         setWorkspaceRestorationRetryGeneration((generation) => generation + 1);
@@ -921,8 +923,12 @@ function AppShell() {
           }
           return;
         }
-        const restoration = await app.conversations.getForRestore(restoredId);
-        if (!isCurrent()) return;
+        const restoration = await getConversationForWorkspaceRestoration({
+          conversationId: restoredId,
+          isCurrent,
+          getForRestore: (conversationId) => app.conversations.getForRestore(conversationId),
+        });
+        if (!restoration) return;
         if (restoration.status === 'unavailable') {
           await rollbackUnavailableWorkspaceRestoration({
             restoredConversationId: restoredId,
@@ -1475,6 +1481,7 @@ function AppShell() {
       conversationSelectionIntentGenerationRef.current++;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
       const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
+      const workspaceMutationToken = generateId();
       const opened = await openBrowserConversationInWorkspace({
         conversationId: id,
         selectionGeneration,
@@ -1508,7 +1515,12 @@ function AppShell() {
             });
             if (transition) browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
             try {
-              const result = await app.workspaces.setActive({ id, expectedCurrentId });
+              const result = await app.workspaces.setActive({
+                id,
+                expectedCurrentId,
+                mutationToken: workspaceMutationToken,
+              });
+              if (result.ok) lastBrowserWorkspaceMutationTokenRef.current = workspaceMutationToken;
               if (
                 !result.ok &&
                 transition &&
@@ -1563,6 +1575,9 @@ function AppShell() {
               navigationIntentGenerationRef.current === selectionGeneration &&
               workspaceSelectionIntentGenerationRef.current === workspaceSelectionGeneration &&
               browserAttentionIntentGenerationRef.current === browserAttentionGeneration,
+            canRebase: (result) =>
+              lastBrowserWorkspaceMutationTokenRef.current !== null &&
+              result.activeWorkspaceMutationToken === lastBrowserWorkspaceMutationTokenRef.current,
           });
         },
         createWorkspaceObservationWait,
@@ -1579,6 +1594,16 @@ function AppShell() {
           });
           if (adopted && adopted !== transition) {
             browserWorkspaceTransitionsRef.current.set(transitionKey, adopted);
+          }
+        },
+        discardActiveWorkspaceTransition: (workspaceId) => {
+          const transitionKey = workspaceId ?? '';
+          const transition = browserWorkspaceTransitionsRef.current.get(transitionKey);
+          if (
+            transition?.navigationGeneration === selectionGeneration &&
+            transition.browserAttentionGeneration === browserAttentionGeneration
+          ) {
+            browserWorkspaceTransitionsRef.current.delete(transitionKey);
           }
         },
         switchConversation: (conversationId, expectedCurrentConversationId, navigationGeneration) =>

@@ -2292,6 +2292,84 @@ describe('browser manager renderer lifecycle', () => {
     expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
   });
 
+  it('completes bookmark import after the native picker temporarily blurs Browser chrome', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'kai-bookmark-picker-'));
+    const filePath = join(directory, 'bookmarks.html');
+    writeFileSync(filePath, '<DL><p><DT><A HREF="https://example.com">Example</A></DL>');
+    const selected = deferred<{ canceled: boolean; filePaths: string[] }>();
+    electronMocks.showOpenDialog.mockReturnValue(selected.promise);
+    const replaceBookmarks = vi.fn(() => 1);
+    const manager = managerWithoutConstructor({
+      chromeFocusConversationId: 'chat-1',
+      storeForScope: () => ({ replaceBookmarks }),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    try {
+      const importing = manager.importBookmarks('chat-1');
+      await vi.waitFor(() => expect(electronMocks.showOpenDialog).toHaveBeenCalledOnce());
+      Reflect.set(manager, 'chromeFocusConversationId', null);
+      selected.resolve({ canceled: false, filePaths: [filePath] });
+
+      await expect(importing).resolves.toEqual({ imported: 1 });
+      expect(replaceBookmarks).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('completes bookmark export after the native picker temporarily blurs Browser chrome', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'kai-bookmark-picker-'));
+    const filePath = join(directory, 'bookmarks.html');
+    const selected = deferred<{ canceled: boolean; filePath: string }>();
+    electronMocks.showSaveDialog.mockReturnValue(selected.promise);
+    const bookmark = {
+      id: 'bookmark-1',
+      scopeKey: 'global',
+      title: 'Example',
+      url: 'https://example.com',
+      folder: '',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const manager = managerWithoutConstructor({
+      chromeFocusConversationId: 'chat-1',
+      storeForScope: () => ({ listBookmarks: () => [bookmark] }),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    try {
+      const exporting = manager.exportBookmarks('chat-1');
+      await vi.waitFor(() => expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce());
+      Reflect.set(manager, 'chromeFocusConversationId', null);
+      selected.resolve({ canceled: false, filePath });
+
+      await expect(exporting).resolves.toEqual({ exported: 1, filePath });
+      expect(readFileSync(filePath, 'utf8')).toContain('https://example.com');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels bookmark import when panel authority expires while its picker is open', async () => {
+    const selected = deferred<{ canceled: boolean; filePaths: string[] }>();
+    electronMocks.showOpenDialog.mockReturnValue(selected.promise);
+    const replaceBookmarks = vi.fn(() => 1);
+    const manager = managerWithoutConstructor({
+      chromeFocusConversationId: 'chat-1',
+      storeForScope: () => ({ replaceBookmarks }),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    const importing = manager.importBookmarks('chat-1');
+    await vi.waitFor(() => expect(electronMocks.showOpenDialog).toHaveBeenCalledOnce());
+    invokePrivate(manager, 'invalidatePanelAuthority', 'chat-1');
+    selected.resolve({ canceled: false, filePaths: ['/tmp/never-read.html'] });
+
+    await expect(importing).resolves.toEqual({ imported: 0, canceled: true });
+    expect(replaceBookmarks).not.toHaveBeenCalled();
+  });
+
   it('broadcasts global bookmark mutations to every known conversation', () => {
     const bookmark = {
       id: 'bookmark-1',
@@ -18927,6 +19005,47 @@ describe('browser manager renderer lifecycle', () => {
     await mounting;
   });
 
+  it('keeps direct native attachment quarantined until file-chooser restoration settles', async () => {
+    const restoration = deferred<void>();
+    const restores = new Map<number, Promise<void>>();
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const view = {
+      setBounds,
+      setVisible,
+      webContents: { id: 42, isDestroyed: () => false, focus: vi.fn() },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view,
+    };
+    const trackedRestore = restoration.promise.finally(() => restores.delete(42));
+    restores.set(42, trackedRestore);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assistantDialogProtectionRestores: restores,
+      attachedView: null,
+      getWindow: () => visibleHostWindow(),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
+
+    restoration.resolve();
+    await trackedRestore;
+    await vi.waitFor(() => expect(setVisible).toHaveBeenLastCalledWith(true));
+
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+  });
+
   it('drains a menu preview before mount restores or captures a renderer', async () => {
     const previewDrain = deferred<void>();
     const oldView = {
@@ -19023,6 +19142,47 @@ describe('browser manager renderer lifecycle', () => {
 
     expect(ensureView).not.toHaveBeenCalled();
     expect(prepareTabForUserPresentation).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'mountedConversationId')).toBe('chat-2');
+  });
+
+  it('ignores a stale foreign unmount without invalidating the current mount continuation', async () => {
+    const viewReady = deferred<void>();
+    const tab = {
+      shell: { id: 'tab-2', conversationId: 'chat-2', reloadRequired: false },
+      scriptTainted: false,
+      view: {
+        setBounds: vi.fn(),
+        setVisible: vi.fn(),
+        webContents: { isDestroyed: () => false },
+      },
+    };
+    const attachActiveView = vi.fn();
+    const notifyPanelStateChanged = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-2', tab.shell.id]]),
+      attachActiveView,
+      emitPendingPrompts: vi.fn(),
+      ensureView: vi.fn(() => viewReady.promise),
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged,
+      prepareTabForUserPresentation: vi.fn(() => null),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const mounting = manager.mount('chat-2', { x: 20, y: 30, width: 320, height: 220 });
+    await Promise.resolve();
+    await manager.mount('chat-stale', null);
+    viewReady.resolve();
+    await mounting;
+
+    expect(attachActiveView).toHaveBeenCalledTimes(2);
+    expect(notifyPanelStateChanged).toHaveBeenCalledWith('chat-2');
     expect(Reflect.get(manager, 'mountedConversationId')).toBe('chat-2');
   });
 
