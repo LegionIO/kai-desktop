@@ -1494,18 +1494,20 @@ function AppShell() {
     async (id: string): Promise<boolean> => {
       cancelWorkspaceObservationWaits();
       const selectionGeneration = ++navigationIntentGenerationRef.current;
-      conversationSelectionIntentGenerationRef.current++;
+      const conversationSelectionGeneration = ++conversationSelectionIntentGenerationRef.current;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
       const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
       const workspaceMutationToken = `${browserWorkspaceMutationTokenPrefixRef.current}_${generateId()}`;
       const opened = await openBrowserConversationInWorkspace({
         conversationId: id,
         selectionGeneration,
+        conversationSelectionGeneration,
         getConversation: (conversationId) =>
           app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
         getActiveConversationId: () => activeConversationIdRef.current,
         getBackendActiveConversationId: () => app.conversations.getActiveId(),
         getSelectionGeneration: () => navigationIntentGenerationRef.current,
+        getConversationSelectionGeneration: () => conversationSelectionIntentGenerationRef.current,
         getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
         getKnownWorkspaceIds: () => knownWorkspaceIdsRef.current,
         saveLastConversation: (args) => app.workspaces.saveLastConversation(args),

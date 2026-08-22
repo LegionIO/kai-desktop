@@ -477,10 +477,12 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
 export async function openBrowserConversationInWorkspace(options: {
   conversationId: string;
   selectionGeneration: number;
+  conversationSelectionGeneration: number;
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
   getActiveConversationId: () => string | null;
   getBackendActiveConversationId: () => Promise<string | null>;
   getSelectionGeneration: () => number;
+  getConversationSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
   getKnownWorkspaceIds: () => Iterable<string>;
   saveLastConversation: SaveWorkspaceLastConversation;
@@ -553,6 +555,7 @@ export async function openBrowserConversationInWorkspace(options: {
       ? () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId)
       : undefined,
     canRollbackStaleSwitch: () =>
+      options.getConversationSelectionGeneration() === options.conversationSelectionGeneration &&
       options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
       options.getBrowserAttentionGeneration() === options.browserAttentionGeneration,
     discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
@@ -630,10 +633,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
       return false;
     }
     const observed = await observation.promise;
-    if (!observed) {
-      options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
-      return false;
-    }
+    if (!observed) return false;
     if (options.isCurrentAfterSwitch?.() === false) {
       return false;
     }
@@ -650,7 +650,14 @@ export async function prepareConversationWorkspaceSwitch(options: {
           await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
         }
       } finally {
-        await restoreDestination();
+        try {
+          // Every unsuccessful preparation relinquishes the exact marker it
+          // created or adopted. The renderer callback generation-checks this
+          // request, so a newer Browser request's marker remains untouched.
+          options.discardActiveWorkspaceTransition?.(targetWorkspaceId);
+        } finally {
+          await restoreDestination();
+        }
       }
     }
   }
