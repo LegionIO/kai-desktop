@@ -5236,6 +5236,80 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.trustedUserNavigation).toBe(false);
   });
 
+  it('retires an empty-URL abort tombstone and surfaces a later genuine same-URL failure', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    let currentUrl = 'https://committed.example';
+    const repeatedUrl = 'https://repeated.example/path';
+    const successorUrl = 'https://successor.example';
+    const tab = {
+      shell: {
+        id: 'tab-navigation-tombstone',
+        conversationId: 'chat-1',
+        url: currentUrl,
+        title: 'Committed',
+        loading: true,
+        error: undefined as string | undefined,
+        sensitive: false,
+        reloadRequired: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      scriptTainted: false,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 0,
+      networkRequests: new Map(),
+      activeNetworkRequests: new Map(),
+      networkRequestSequence: 0,
+    };
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      cancelFaviconFetch: vi.fn(),
+      emitTabs,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const contents = {
+      getTitle: () => 'Current',
+      getURL: () => currentUrl,
+      isCurrentlyAudible: () => false,
+      isDestroyed: () => false,
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false, clear: vi.fn() },
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    Object.assign(tab, { view: { webContents: contents } });
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+
+    listeners.get('did-start-navigation')?.({}, repeatedUrl, false, true);
+    listeners.get('did-start-navigation')?.({}, successorUrl, false, true);
+    currentUrl = successorUrl;
+    listeners.get('did-navigate')?.({}, successorUrl);
+
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(Reflect.get(tab, 'supersededNetworkNavigations')).toHaveLength(1);
+
+    // A late Chromium abort can omit validatedURL. It still retires the oldest
+    // committed tombstone and must not touch the already committed successor.
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', '', true);
+    expect(Reflect.get(tab, 'supersededNetworkNavigations')).toBeUndefined();
+    expect(tab.shell.url).toBe(successorUrl);
+    expect(tab.shell.error).toBeUndefined();
+
+    // Leave an older tombstone for the exact same URL. A non-aborted failure
+    // matching the current generation is authoritative and must be surfaced,
+    // even if the older abort never arrives.
+    listeners.get('did-start-navigation')?.({}, repeatedUrl, false, true);
+    listeners.get('did-start-navigation')?.({}, repeatedUrl, false, true);
+    listeners.get('did-fail-load')?.({}, -105, 'ERR_NAME_NOT_RESOLVED', repeatedUrl, true);
+
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(tab.shell.loading).toBe(false);
+    expect(tab.shell.url).toBe(repeatedUrl);
+    expect(tab.shell.error).toBe('ERR_NAME_NOT_RESOLVED (-105)');
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
+  });
+
   it('contains profile-marker filesystem failures inside Electron navigation callbacks', () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const cancelFaviconFetch = vi.fn();
@@ -21791,6 +21865,38 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.shell.discarded).toBe(true);
 
     await expect(manager.find('chat-1', 'tab-1', 'needle', true, false, 1)).rejects.toThrow(/ERR_NAME_NOT_RESOLVED/);
+  });
+
+  it('publishes native config readiness only after a queued Browser re-enable commits', async () => {
+    const queuedMutation = deferred<void>();
+    const emit = vi.fn();
+    const manager = managerWithoutConstructor({
+      browserEnabled: false,
+      dataScope: 'global',
+      emit,
+      mountedConversationId: null,
+      profileMutationTail: queuedMutation.promise,
+      tabs: new Map(),
+    });
+
+    const transition = manager.handleConfigChanged({
+      dataScope: 'global',
+      enabled: true,
+      readAccess: 'allow',
+      structuredActions: 'allow',
+      scriptInjection: 'allow',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: false,
+    } as never);
+
+    expect(manager.isEnabled()).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+
+    queuedMutation.resolve();
+    await expect(transition).resolves.toEqual({ committed: true });
+
+    expect(manager.isEnabled()).toBe(true);
+    expect(emit).toHaveBeenCalledWith({ type: 'config-applied', enabled: true, dataScope: 'global' });
   });
 
   it('quiesces the old session and downloads before completing a data-scope transition', async () => {

@@ -795,6 +795,69 @@ describe('BrowserPanel', () => {
     expect(available.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('retries a retained native tab when a queued Browser re-enable commits', async () => {
+    let enabled = true;
+    let nativeEnabled = true;
+    let configChanged: (() => void) | undefined;
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (bounds && !nativeEnabled) throw new Error('The in-app browser is disabled in Settings.');
+    });
+    const boundedMountCount = () => mount.mock.calls.filter(([, bounds]) => bounds !== null).length;
+    installAppBridgeStub({
+      config: {
+        get: async () => ({ browser: { enabled, dataScope: 'global' } }),
+        onChanged: (callback: () => void) => {
+          configChanged = callback;
+          return vi.fn();
+        },
+      },
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(
+      <ConfigProvider>
+        <BrowserPanel conversationId="chat-1" />
+      </ConfigProvider>,
+    );
+
+    await screen.findByText('Example');
+    await waitFor(() => expect(boundedMountCount()).toBe(1));
+
+    enabled = false;
+    nativeEnabled = false;
+    await act(async () => {
+      configChanged?.();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('Browser disabled')).toBeInTheDocument();
+
+    // Persistence reaches React before the manager's serialized profile queue
+    // commits. The first bounds report is therefore rejected by native code.
+    enabled = true;
+    await act(async () => {
+      configChanged?.();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('The in-app browser is disabled in Settings.')).toBeInTheDocument();
+    expect(boundedMountCount()).toBe(2);
+
+    nativeEnabled = true;
+    act(() => emit?.({ type: 'config-applied', enabled: true, dataScope: 'global' }));
+
+    await waitFor(() => expect(boundedMountCount()).toBe(3));
+    expect(screen.queryByText('The in-app browser is disabled in Settings.')).not.toBeInTheDocument();
+  });
+
   it('renders full browser chrome and routes navigation/tab controls', async () => {
     const createTab = vi.fn().mockResolvedValue(tab);
     const commandTab = vi.fn().mockResolvedValue(undefined);

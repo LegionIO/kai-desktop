@@ -659,6 +659,15 @@ export type BrowserShortcutAction =
 
 export type BrowserEvent =
   | {
+      /** Emitted after the native manager commits a Browser-enabling
+       * transition. Renderer chrome can be visible while profile work is still
+       * queued, so this is the readiness edge used to retry state hydration
+       * and native mounting. */
+      type: 'config-applied';
+      enabled: boolean;
+      dataScope: BrowserDataScope;
+    }
+  | {
       type: 'profile-scope-changed';
       dataScope: BrowserDataScope;
     }

@@ -2327,6 +2327,13 @@ export class BrowserManager {
       }
     }
     if (scopeChangeRequested) this.emit({ type: 'profile-scope-changed', dataScope: config.dataScope });
+    if (!wasEnabled) {
+      // Persisted config reaches React before serialized Chromium/profile work
+      // necessarily commits. Publish a distinct native-readiness edge so a
+      // panel whose early mount was rejected while disabled can hydrate and
+      // remount retained tabs without waiting for incidental layout activity.
+      this.emit({ type: 'config-applied', enabled: true, dataScope: config.dataScope });
+    }
     return { committed: true };
   }
 
@@ -9321,7 +9328,7 @@ export class BrowserManager {
       // Two rapid navigations may target the same URL; in that case the stale
       // ERR_ABORTED must not revoke the newer request's private-network/auth
       // authority.
-      if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL)) return;
+      if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL, errorCode)) return;
       if (isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, validatedURL)) {
         this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
       }
@@ -10063,29 +10070,51 @@ export class BrowserManager {
     ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS);
   }
 
-  private consumeSupersededBrowserNetworkNavigationFailure(tab: InternalTab, url: string): boolean {
+  private consumeSupersededBrowserNetworkNavigationFailure(tab: InternalTab, url: string, errorCode: number): boolean {
     const comparableUrl = comparablePopupReferrerUrl(url);
     const provisional = tab.provisionalNetworkNavigation;
-    const consumeMatching = (attempts: Array<{ generation: number; urls: Set<string> }>): boolean => {
-      const matchingIndex = comparableUrl ? attempts.findIndex((attempt) => attempt.urls.has(comparableUrl)) : -1;
-      if (matchingIndex < 0) return false;
-      attempts.splice(matchingIndex, 1);
+    const currentMatches = !!comparableUrl && provisional?.urls.has(comparableUrl) === true;
+    // A non-aborted failure matching the live provisional generation belongs
+    // to that generation. An older same-URL tombstone may never receive its
+    // own terminal event and must not hide this genuine failure.
+    if (errorCode !== -3 && currentMatches) return false;
+
+    type SupersededAttempt = { generation: number; urls: Set<string> };
+    type SupersededBucket = {
+      attempts: SupersededAttempt[];
+      retained: boolean;
+    };
+    const buckets: SupersededBucket[] = [];
+    if (provisional?.superseded.length) buckets.push({ attempts: provisional.superseded, retained: false });
+    if (tab.supersededNetworkNavigations?.length) {
+      buckets.push({ attempts: tab.supersededNetworkNavigations, retained: true });
+    }
+    const consumeOldest = (matches: (attempt: SupersededAttempt) => boolean): boolean => {
+      let selected: { bucket: SupersededBucket; index: number; generation: number } | null = null;
+      for (const bucket of buckets) {
+        for (let index = 0; index < bucket.attempts.length; index++) {
+          const attempt = bucket.attempts[index];
+          if (!matches(attempt) || (selected && selected.generation <= attempt.generation)) continue;
+          selected = { bucket, index, generation: attempt.generation };
+        }
+      }
+      if (!selected) return false;
+      selected.bucket.attempts.splice(selected.index, 1);
+      if (selected.bucket.retained && selected.bucket.attempts.length === 0) {
+        tab.supersededNetworkNavigations = undefined;
+      }
       return true;
     };
-    // Prefer the oldest still-pending generation when two rapid attempts use
-    // the same URL. Chromium reports the superseded attempt's abort first.
-    if (provisional && consumeMatching(provisional.superseded)) return true;
-    if (tab.supersededNetworkNavigations && consumeMatching(tab.supersededNetworkNavigations)) {
-      if (tab.supersededNetworkNavigations.length === 0) tab.supersededNetworkNavigations = undefined;
-      return true;
-    }
-    const currentMatches = !!comparableUrl && provisional?.urls.has(comparableUrl) === true;
-    if (!currentMatches && provisional?.superseded.length) {
-      // Some Chromium failures omit or normalize validatedURL differently from
-      // did-start-navigation. Terminal events remain ordered, so consume the
-      // oldest superseded generation before allowing an unknown event to
-      // settle the current attempt.
-      provisional.superseded.shift();
+
+    // Tombstones can span a prior committed generation and the current
+    // provisional chain. Select by generation rather than bucket so the oldest
+    // request is retired first when rapid attempts target the same URL.
+    if (comparableUrl && consumeOldest((attempt) => attempt.urls.has(comparableUrl))) return true;
+    if (errorCode === -3 && consumeOldest(() => true)) {
+      // Chromium may omit validatedURL (or normalize it differently) for a
+      // superseded ERR_ABORTED. Terminal aborts remain ordered, so retire the
+      // oldest tombstone even when no URL can identify it. This also prevents
+      // that stale tombstone from suppressing a future real same-URL failure.
       return true;
     }
     return false;

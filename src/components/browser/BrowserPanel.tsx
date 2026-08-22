@@ -871,6 +871,22 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     setAuthPrompts([]);
     if (!browser || !conversationId) return;
     const unsubscribe = browser.onEvent((event: BrowserEvent) => {
+      if (event.type === 'config-applied') {
+        setAppliedDataScope(event.dataScope);
+        if (event.enabled) {
+          // Config persistence and React rendering intentionally do not wait
+          // for serialized Chromium/profile work. A first mount can therefore
+          // fail while the native manager is still disabled. The applied event
+          // is the authoritative retry edge; do not require a resize, focus,
+          // or sidebar remount to recover the retained tab surface.
+          setAvailable(true);
+          setError(null);
+          void refreshNativeMountRef.current().catch(reportError);
+          void refreshState();
+          void refreshBookmarks();
+        }
+        return;
+      }
       if (event.type === 'profile-scope-changed') {
         stateRequestRef.current++;
         tabSnapshotRevisionRef.current++;
@@ -1040,7 +1056,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       suggestionRequestRef.current++;
       unsubscribe();
     };
-  }, [browser, conversationId, focusOmnibox, openFind, refreshBookmarks, refreshState]);
+  }, [browser, conversationId, focusOmnibox, openFind, refreshBookmarks, refreshState, reportError]);
 
   useEffect(() => {
     if (active && !urlFocused) setUrlDraft(active.url === 'about:blank' ? '' : active.url);
