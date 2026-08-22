@@ -11319,6 +11319,7 @@ describe('browser manager renderer lifecycle', () => {
     const assertTabNotSensitive = vi.fn(async () => undefined);
     const manager = managerWithoutConstructor({
       activeTabs: new Map([['chat-1', 'tab-1']]),
+      chromeFocusConversationId: 'chat-1',
       assertBrowserPageLease,
       assertTabNotSensitive,
       captureBrowserPageLease,
@@ -11352,6 +11353,7 @@ describe('browser manager renderer lifecycle', () => {
     const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' } };
     const manager = managerWithoutConstructor({
       activeTabs: new Map([['chat-1', 'tab-1']]),
+      chromeFocusConversationId: 'chat-1',
       assertBrowserPageLease: vi.fn(),
       assertTabNotSensitive: vi.fn(async () => undefined),
       captureBrowserPageLease: vi.fn(() => ({ tabId: 'tab-1' })),
@@ -11394,6 +11396,32 @@ describe('browser manager renderer lifecycle', () => {
     await expect(printing).rejects.toThrow(/page changed while printing/i);
     expect(print).not.toHaveBeenCalled();
     expect(replacementContents.print).not.toHaveBeenCalled();
+  });
+
+  it('does not open the print dialog after Browser presentation is withdrawn during its sensitivity scan', async () => {
+    const scan = deferred<void>();
+    const print = vi.fn();
+    const contents = { print };
+    const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' } };
+    let dialogAuthorized = true;
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'tab-1']]),
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(() => scan.promise),
+      captureBrowserPageLease: vi.fn(() => ({ tabId: 'tab-1' })),
+      ensureView: vi.fn(async () => ({ webContents: contents })),
+      hasBrowserNativeDialogAuthority: vi.fn(() => dialogAuthorized),
+      requireTab: vi.fn(() => tab),
+      runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
+    });
+
+    const printing = manager.menuAction('chat-1', 'print');
+    await vi.waitFor(() => expect(Reflect.get(manager, 'assertTabNotSensitive')).toHaveBeenCalledOnce());
+    dialogAuthorized = false;
+    scan.resolve();
+
+    await expect(printing).resolves.toBeUndefined();
+    expect(print).not.toHaveBeenCalled();
   });
 
   it('cancels a pending AI network release when its tab is destroyed', () => {
@@ -16737,6 +16765,7 @@ describe('browser manager renderer lifecycle', () => {
       })),
       assertBrowserPageLease,
       assertTabNotSensitive,
+      hasBrowserNativeDialogAuthority: vi.fn(() => true),
       runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
       emitTabs: vi.fn(),
     });
@@ -16751,6 +16780,49 @@ describe('browser manager renderer lifecycle', () => {
     await vi.waitFor(() => expect(print).toHaveBeenCalledWith({ printBackground: true }, expect.any(Function)));
     expect(assertTabNotSensitive).toHaveBeenCalledWith(tab, contents, 'Printing');
     expect(assertBrowserPageLease).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not open context-menu printing after Browser presentation is withdrawn during its sensitivity scan', async () => {
+    const scan = deferred<void>();
+    const print = vi.fn();
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      getURL: () => 'https://example.com',
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+      print,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', title: 'Example', sensitive: false },
+      view: { webContents: contents },
+    };
+    let dialogAuthorized = true;
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+      captureBrowserPageLease: vi.fn(() => ({
+        tabId: 'tab-1',
+        tabGeneration: 1,
+        userNavigationLease: 0,
+        contents,
+      })),
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(() => scan.promise),
+      hasBrowserNativeDialogAuthority: vi.fn(() => dialogAuthorized),
+      runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
+      emitTabs: vi.fn(),
+    });
+
+    const menu = invokePrivate(manager, 'buildContextMenu', tab, contents, {}) as {
+      items: Array<{ label?: string; click?: () => void }>;
+    };
+    menu.items.find((item) => item.label === 'Print…')?.click?.();
+    await vi.waitFor(() => expect(Reflect.get(manager, 'assertTabNotSensitive')).toHaveBeenCalledOnce());
+    dialogAuthorized = false;
+    scan.resolve();
+
+    await vi.waitFor(() => expect(Reflect.get(manager, 'hasBrowserNativeDialogAuthority')).toHaveBeenCalledOnce());
+    expect(print).not.toHaveBeenCalled();
   });
 
   it('rejects context-menu image coordinates after the originating document changes', async () => {
@@ -19644,6 +19716,44 @@ describe('browser manager renderer lifecycle', () => {
     expect(closeTab).toHaveBeenCalledWith(staleAssistantTab);
     expect(destroyView).not.toHaveBeenCalled();
     expect(generationIfActive).toHaveBeenCalledWith('chat-1', 'run-live');
+  });
+
+  it('keeps an unmounted idle user tab rendered while detached DevTools is open', () => {
+    const isDevToolsOpened = vi.fn(() => true);
+    const tab = {
+      shell: {
+        id: 'devtools-tab',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        audible: false,
+      },
+      assistantOwnerId: null,
+      aiControlOwnerId: null,
+      aiActionDepth: 0,
+      lastUsedAt: 0,
+      view: {
+        webContents: {
+          isDestroyed: () => false,
+          isDevToolsOpened,
+        },
+      },
+    };
+    const destroyView = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      destroyView,
+      getConfig: () => ({ browser: { idleDiscardMinutes: 10 } }),
+      mountedConversationId: null,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    invokePrivate(manager, 'discardIdleTabs');
+    expect(destroyView).not.toHaveBeenCalled();
+
+    isDevToolsOpened.mockReturnValue(false);
+    invokePrivate(manager, 'discardIdleTabs');
+    expect(destroyView).toHaveBeenCalledWith(tab);
   });
 
   it('binds assistant document leases to the host realm and assistant run', () => {

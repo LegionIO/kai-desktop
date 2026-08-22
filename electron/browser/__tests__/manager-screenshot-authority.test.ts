@@ -32,6 +32,16 @@ vi.mock('../../utils/atomic-write.js', () => ({ atomicWriteFileSync }));
 const { BrowserManager } = await import('../manager.js');
 const { BrowserActionQueue } = await import('../action-queue.js');
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAfterCapture?: boolean }) {
   const contents = { isDestroyed: () => false };
   const tab = {
@@ -80,6 +90,7 @@ function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAft
     hostRendererAuthorityGeneration: 3,
     mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
     mountedConversationId: 'chat-1',
+    panelAuthorityGenerations: new Map(),
     panelStateWaiters: new Map(),
     pendingCleanupQuarantineUnreadable: false,
     removedConversations: new Set<string>(),
@@ -183,6 +194,26 @@ describe('assistant screenshot renderer authority', () => {
     resolveDialog({ canceled: false, filePath: '/tmp/exported-browser.png' });
 
     await expect(screenshot).rejects.toThrow(/page changed while this screenshot/i);
+    expect(atomicWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('does not open an export dialog after Browser presentation is withdrawn during tab preparation', async () => {
+    const preparation = deferred<void>();
+    const manager = screenshotManager();
+    const tab = Reflect.get(manager, 'tabs').get('tab-1') as { view: unknown };
+    Reflect.set(manager, 'runTabOperation', async (_tab: unknown, operation: () => Promise<unknown>) => {
+      await preparation.promise;
+      return operation();
+    });
+
+    const screenshot = manager.screenshot('chat-1', { mode: 'viewport', exportToFile: true });
+    Reflect.set(manager, 'mountedConversationId', null);
+    (Reflect.get(manager, 'panelAuthorityGenerations') as Map<string, number>).set('chat-1', 1);
+    preparation.resolve();
+
+    await expect(screenshot).resolves.toMatchObject({ canceled: true });
+    expect(tab.view).not.toBeNull();
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
     expect(atomicWriteFileSync).not.toHaveBeenCalled();
   });
 

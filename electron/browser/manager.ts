@@ -1907,6 +1907,7 @@ export class BrowserManager {
         if (!targetTab || this.tabs.get(targetTab.shell.id) !== targetTab) return;
         const view = await this.ensureView(targetTab);
         if (this.tabs.get(targetTab.shell.id) !== targetTab || targetTab.view !== view) return;
+        targetTab.lastUsedAt = Date.now();
         view.webContents.toggleDevTools();
         return;
       }
@@ -4926,6 +4927,27 @@ export class BrowserManager {
   private isHostWindowInteractive(): boolean {
     const win = this.getWindow();
     return !!win && !win.isDestroyed() && win.isVisible() && !win.isMinimized() && win.isFocused();
+  }
+
+  /** Native dialogs are user presentation, never background Browser work.
+   * Revalidate the exact tab and panel generation after every asynchronous
+   * preparation step so a stale click cannot surface UI over another chat or
+   * after the Browser panel or window has gone away. */
+  private hasBrowserNativeDialogAuthority(
+    tab: InternalTab,
+    contents: WebContents,
+    panelAuthorityGeneration: number,
+  ): boolean {
+    const conversationId = tab.shell.conversationId;
+    if (
+      panelAuthorityGeneration !== this.panelAuthorityGeneration(conversationId) ||
+      this.activeTabs.get(conversationId) !== tab.shell.id ||
+      !this.isHostWindowInteractive()
+    ) {
+      return false;
+    }
+    if (this.chromeFocusConversationId === conversationId) return true;
+    return this.isTargetViewPresented(tab, contents) && this.isNativeBrowserPageFocused(contents);
   }
 
   /** Acquire manager ownership of the target debugger until the returned
@@ -8855,6 +8877,11 @@ export class BrowserManager {
       tab.shell.error = undefined;
       this.emitTabs(tab.shell.conversationId);
     });
+    const recordDevToolsActivity = (): void => {
+      if (ownsContents()) tab.lastUsedAt = Date.now();
+    };
+    contents.on('devtools-opened', recordDevToolsActivity);
+    contents.on('devtools-closed', recordDevToolsActivity);
     contents.on('did-stop-loading', () => {
       if (!ownsContents()) return;
       this.finishAssistantPopupBootstrap(tab, contents);
@@ -10535,6 +10562,7 @@ export class BrowserManager {
     const navigation = contents.navigationHistory;
     const pageLease = this.captureBrowserPageLease(tab, contents);
     const pageToken = this.browserPageLeaseToken(pageLease);
+    const nativeDialogPanelGeneration = this.panelAuthorityGeneration(tab.shell.conversationId);
     const contextPageTitle = tab.shell.title;
     const contextPageUrl = contents.getURL();
     const assertContextPageCurrent = (): void => this.assertBrowserPageLease(tab, pageLease, 'context-menu action');
@@ -10741,6 +10769,7 @@ export class BrowserManager {
             this.runTabOperation(tab, async () => {
               await this.assertTabNotSensitive(tab, contents, 'Printing');
               assertContextPageCurrent();
+              if (!this.hasBrowserNativeDialogAuthority(tab, contents, nativeDialogPanelGeneration)) return;
               await this.printPage(contents);
             }),
           ),
@@ -14024,6 +14053,7 @@ export class BrowserManager {
       source === 'assistant'
         ? this.requireAssistantTab(conversationId, assistantRun!, request.tabId)
         : this.requireTab(conversationId, request.tabId);
+    const nativeDialogPanelGeneration = this.panelAuthorityGeneration(conversationId);
     let exportFilePath: string | undefined;
     let exportPageLease: BrowserPageLease | undefined;
     const prepareExportSelection = async (
@@ -14051,6 +14081,12 @@ export class BrowserManager {
           ? this.withAssistantControl(tab, assistantRun!, captureExportPageLease, approvedDocument)
           : captureExportPageLease(),
       );
+      this.assertHostRendererOperationCurrent();
+      this.assertBrowserPageLease(tab, exportPageLease, 'screenshot export selection');
+      const exportContents = tab.view?.webContents;
+      if (!exportContents || !this.hasBrowserNativeDialogAuthority(tab, exportContents, nativeDialogPanelGeneration)) {
+        return true;
+      }
       const win = this.getWindow();
       const options = {
         title: 'Save browser screenshot',
@@ -15452,16 +15488,21 @@ export class BrowserManager {
     if (!activeId) return;
     const tab = this.requireTab(conversationId, activeId);
     if (action === 'print') {
+      const nativeDialogPanelGeneration = this.panelAuthorityGeneration(conversationId);
       await this.runTabOperation(tab, async () => {
         const contents = (await this.ensureView(tab)).webContents;
         const pageLease = this.captureBrowserPageLease(tab, contents);
         this.assertBrowserPageLease(tab, pageLease, 'printing');
         await this.assertTabNotSensitive(tab, contents, 'Printing');
         this.assertBrowserPageLease(tab, pageLease, 'printing');
+        if (!this.hasBrowserNativeDialogAuthority(tab, contents, nativeDialogPanelGeneration)) return;
         await this.printPage(contents);
       });
-    } else if (action === 'devtools') (await this.ensureView(tab)).webContents.openDevTools({ mode: 'detach' });
-    else if (action === 'find') this.emit({ type: 'shortcut', conversationId, action: 'find' });
+    } else if (action === 'devtools') {
+      const view = await this.ensureView(tab);
+      tab.lastUsedAt = Date.now();
+      view.webContents.openDevTools({ mode: 'detach' });
+    } else if (action === 'find') this.emit({ type: 'shortcut', conversationId, action: 'find' });
   }
 
   async dataSummary(conversationId?: string): Promise<BrowserDataSummary[]> {
@@ -16198,6 +16239,16 @@ export class BrowserManager {
         continue;
       }
       if (!tab.view) continue;
+      let devToolsOpen = false;
+      try {
+        devToolsOpen =
+          !tab.view.webContents.isDestroyed() &&
+          typeof tab.view.webContents.isDevToolsOpened === 'function' &&
+          tab.view.webContents.isDevToolsOpened();
+      } catch {
+        // A renderer can disappear between the liveness probe and Electron's
+        // DevTools query. The ordinary discard path below owns that cleanup.
+      }
       if (
         !shouldDiscardBrowserTab(
           tab.shell,
@@ -16205,7 +16256,7 @@ export class BrowserManager {
           cutoff,
           this.activeTabs.get(tab.shell.conversationId),
           this.mountedConversationId,
-          assistantActivityActive,
+          assistantActivityActive || devToolsOpen,
         )
       )
         continue;
