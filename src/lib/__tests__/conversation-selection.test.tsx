@@ -1651,6 +1651,43 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
 
+  it('waits for workspace observation before validating the renderer workspace cursor', async () => {
+    let rendererWorkspaceId = 'workspace-a';
+    let resolveObservation: (observed: boolean) => void = () => {};
+    let settled = false;
+    const discardActiveWorkspaceTransition = vi.fn();
+
+    const preparation = prepareConversationWorkspaceSwitch({
+      conversationId: 'chat-b',
+      conversationWorkspaceId: 'workspace-b',
+      activeWorkspaceId: 'workspace-a',
+      knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+      saveLastConversation: async () => undefined,
+      setActiveWorkspace: async () => ({ ok: true, previousWorkspaceId: 'workspace-a' }),
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      isCurrentAfterSwitch: () => rendererWorkspaceId === 'workspace-b',
+      discardActiveWorkspaceTransition,
+    }).then((ready) => {
+      settled = true;
+      return ready;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(discardActiveWorkspaceTransition).not.toHaveBeenCalled();
+
+    rendererWorkspaceId = 'workspace-b';
+    resolveObservation(true);
+
+    await expect(preparation).resolves.toBe(true);
+    expect(discardActiveWorkspaceTransition).not.toHaveBeenCalled();
+  });
+
   it('discards the exact Browser transition when workspace observation fails', async () => {
     const discardActiveWorkspaceTransition = vi.fn();
 

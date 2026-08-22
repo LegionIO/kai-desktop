@@ -545,11 +545,12 @@ export async function openBrowserConversationInWorkspace(options: {
   const selectionIsCurrent = (): boolean =>
     options.getSelectionGeneration() === options.selectionGeneration &&
     options.getActiveConversationId() === selectionWhenStarted;
-  const selectionIsCompatibleAfterWorkspaceSwitch = (workspaceId: string): boolean =>
+  const selectionIntentIsCompatibleAfterWorkspaceSwitch = (): boolean =>
     options.getSelectionGeneration() === options.selectionGeneration &&
-    options.getActiveWorkspaceId() === workspaceId &&
     (options.getActiveConversationId() === selectionWhenStarted ||
       options.getActiveConversationId() === options.conversationId);
+  const selectionIsCompatibleAfterWorkspaceSwitch = (workspaceId: string): boolean =>
+    selectionIntentIsCompatibleAfterWorkspaceSwitch() && options.getActiveWorkspaceId() === workspaceId;
   const [conversation, backendSelectionWhenStarted] = await Promise.all([
     options.getConversation(options.conversationId),
     options.getBackendActiveConversationId(),
@@ -590,6 +591,7 @@ export async function openBrowserConversationInWorkspace(options: {
       setActiveWorkspace: options.setActiveWorkspace,
       createWorkspaceObservationWait: options.createWorkspaceObservationWait,
       isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
+      isCurrentAfterSwitchIntent: selectionIntentIsCompatibleAfterWorkspaceSwitch,
       isCurrentAfterSwitch: () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId),
       resolveStaleSwitchDisposition: async () => {
         // Explicit workspace selection owns the authoritative state and must
@@ -664,6 +666,9 @@ export async function prepareConversationWorkspaceSwitch(options: {
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
+  /** Check post-mutation ownership without requiring React's workspace cursor,
+   * which is expected to lag until createWorkspaceObservationWait resolves. */
+  isCurrentAfterSwitchIntent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
   resolveStaleSwitchDisposition?: () => StaleWorkspaceSwitchDisposition | Promise<StaleWorkspaceSwitchDisposition>;
   discardActiveWorkspaceTransition?: (workspaceId: string) => void;
@@ -711,9 +716,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
           ? (options.activeWorkspaceId ?? null)
           : switchResult.previousWorkspaceId;
     switchedWorkspace = previousWorkspaceId !== targetWorkspaceId;
-    if (options.isCurrentAfterSwitch && !options.isCurrentAfterSwitch()) {
-      return false;
-    }
+    if (options.isCurrentAfterSwitchIntent?.() === false) return false;
     const observed = await observation.promise;
     if (!observed) return false;
     if (options.isCurrentAfterSwitch?.() === false) {
