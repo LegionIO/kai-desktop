@@ -63,6 +63,7 @@ export function commitLocalConversationSelection(
 
 export type BrowserWorkspaceTransitionMarker = {
   navigationGeneration: number;
+  browserAttentionGeneration: number;
   workspaceSelectionGeneration: number;
   operation: 'navigate' | 'rollback';
   departingWorkspaceId: string | null;
@@ -75,6 +76,7 @@ export type BrowserWorkspaceTransitionMarker = {
  * for a later unrelated transition to consume. */
 export function createBrowserWorkspaceTransitionMarker(options: {
   navigationGeneration: number;
+  browserAttentionGeneration: number;
   workspaceSelectionGeneration: number;
   operation: 'navigate' | 'rollback';
   departingWorkspaceId: string | null;
@@ -95,6 +97,7 @@ export function adoptBrowserWorkspaceTransitionMarker(options: {
   activeWorkspaceId: string;
   previousWorkspaceId: string | null | undefined;
   navigationGeneration: number;
+  browserAttentionGeneration: number;
   currentWorkspaceSelectionGeneration: number;
 }): BrowserWorkspaceTransitionMarker | undefined {
   const marker = options.marker;
@@ -103,11 +106,16 @@ export function adoptBrowserWorkspaceTransitionMarker(options: {
     marker.operation !== 'navigate' ||
     marker.destinationWorkspaceId !== options.activeWorkspaceId ||
     marker.departingWorkspaceId !== options.previousWorkspaceId ||
-    marker.workspaceSelectionGeneration !== options.currentWorkspaceSelectionGeneration
+    marker.workspaceSelectionGeneration !== options.currentWorkspaceSelectionGeneration ||
+    marker.browserAttentionGeneration >= options.browserAttentionGeneration
   ) {
     return marker;
   }
-  return { ...marker, navigationGeneration: options.navigationGeneration };
+  return {
+    ...marker,
+    navigationGeneration: options.navigationGeneration,
+    browserAttentionGeneration: options.browserAttentionGeneration,
+  };
 }
 
 /** Decide whether an observed workspace change belongs to a Browser request
@@ -120,6 +128,7 @@ export function resolveConversationWorkspaceTransition(options: {
   currentConversationId: string | null;
   browserTransition?: BrowserWorkspaceTransitionMarker;
   currentNavigationGeneration: number;
+  currentBrowserAttentionGeneration: number;
   currentWorkspaceSelectionGeneration: number;
 }): {
   staleBrowserTransition: boolean;
@@ -136,6 +145,11 @@ export function resolveConversationWorkspaceTransition(options: {
     markerDescribesTransition &&
     options.browserTransition?.operation === 'navigate' &&
     options.browserTransition.navigationGeneration !== options.currentNavigationGeneration &&
+    // A newer Browser-attention request inherits a workspace mutation that has
+    // already committed. The older request can no longer roll it back, so the
+    // effect must reconcile the real departing cursor instead of discarding it
+    // while the newer request is still loading its conversation record.
+    options.browserTransition.browserAttentionGeneration >= options.currentBrowserAttentionGeneration &&
     options.browserTransition.workspaceSelectionGeneration === options.currentWorkspaceSelectionGeneration;
   return {
     staleBrowserTransition,
@@ -218,6 +232,19 @@ export type ActiveWorkspaceCasResult = {
   activeWorkspaceId?: string | null;
 };
 
+export type WorkspaceLastConversationCasResult = {
+  ok: boolean;
+  error?: 'workspace-not-found' | 'last-conversation-changed';
+  previousConversationId?: string | null;
+  lastActiveConversationId?: string | null;
+};
+
+type SaveWorkspaceLastConversation = (args: {
+  workspaceId: string;
+  conversationId: string | null;
+  expectedCurrentConversationId?: string | null;
+}) => Promise<WorkspaceLastConversationCasResult | void>;
+
 const MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS = 4;
 
 /** A newer Browser-attention request may observe a workspace CAS failure after
@@ -251,7 +278,7 @@ export async function openBrowserConversationInWorkspace(options: {
   getSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
   getKnownWorkspaceIds: () => Iterable<string>;
-  saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
+  saveLastConversation: SaveWorkspaceLastConversation;
   getWorkspaceSelectionGeneration: () => number;
   workspaceSelectionGeneration: number;
   getBrowserAttentionGeneration: () => number;
@@ -288,11 +315,15 @@ export async function openBrowserConversationInWorkspace(options: {
   // target was selected by the workspace restoration we initiated, the request
   // already succeeded and must not issue a second selection CAS.
   const activeWorkspaceAfterLookup = options.getActiveWorkspaceId();
+  const requestOwnsNavigation = options.getSelectionGeneration() === options.selectionGeneration;
+  if (!requestOwnsNavigation) return false;
+  if (conversation.workspaceId && conversation.workspaceId === activeWorkspaceAfterLookup) {
+    options.adoptActiveWorkspaceTransition?.(conversation.workspaceId);
+  }
   if (
     options.getActiveConversationId() === options.conversationId &&
     (!conversation.workspaceId || conversation.workspaceId === activeWorkspaceAfterLookup)
   ) {
-    if (conversation.workspaceId) options.adoptActiveWorkspaceTransition?.(conversation.workspaceId);
     return true;
   }
   if (!selectionIsCurrent()) return false;
@@ -332,7 +363,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   conversationWorkspaceId?: string | null;
   activeWorkspaceId?: string | null;
   knownWorkspaceIds: Iterable<string>;
-  saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
+  saveLastConversation: SaveWorkspaceLastConversation;
   setActiveWorkspace: (
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
@@ -347,12 +378,24 @@ export async function prepareConversationWorkspaceSwitch(options: {
   if (!targetWorkspaceId) return true;
   if (!new Set(options.knownWorkspaceIds).has(targetWorkspaceId)) return false;
   const observation = options.createWorkspaceObservationWait(targetWorkspaceId);
+  let destinationUpdate: WorkspaceLastConversationCasResult | void;
+  let committed = false;
+  const restoreDestination = async (): Promise<void> => {
+    if (!destinationUpdate?.ok || destinationUpdate.previousConversationId === undefined) return;
+    await options.saveLastConversation({
+      workspaceId: targetWorkspaceId,
+      conversationId: destinationUpdate.previousConversationId,
+      expectedCurrentConversationId: options.conversationId,
+    });
+  };
   try {
     if (targetWorkspaceId !== options.activeWorkspaceId) {
-      await options.saveLastConversation({
+      if (options.isCurrent?.() === false) return false;
+      destinationUpdate = await options.saveLastConversation({
         workspaceId: targetWorkspaceId,
         conversationId: options.conversationId,
       });
+      if (destinationUpdate && !destinationUpdate.ok) return false;
       if (options.isCurrent && !options.isCurrent()) return false;
       const switched = await options.setActiveWorkspace(
         targetWorkspaceId,
@@ -375,9 +418,11 @@ export async function prepareConversationWorkspaceSwitch(options: {
       }
       return false;
     }
+    committed = true;
     return true;
   } finally {
     observation.cancel();
+    if (!committed) await restoreDestination();
   }
 }
 

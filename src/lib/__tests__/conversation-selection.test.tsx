@@ -52,6 +52,7 @@ describe('resolveConversationWorkspaceTransition', () => {
       currentConversationId: 'chat-a',
       browserTransition: {
         navigationGeneration: 1,
+        browserAttentionGeneration: 1,
         workspaceSelectionGeneration: 7,
         operation: 'navigate',
         departingWorkspaceId: 'workspace-a',
@@ -59,6 +60,7 @@ describe('resolveConversationWorkspaceTransition', () => {
         departingConversationId: 'chat-a',
       },
       currentNavigationGeneration: 2,
+      currentBrowserAttentionGeneration: 1,
       currentWorkspaceSelectionGeneration: 7,
     });
 
@@ -74,6 +76,7 @@ describe('resolveConversationWorkspaceTransition', () => {
       activeWorkspaceId: 'workspace-c',
       currentConversationId: 'chat-b',
       currentNavigationGeneration: 2,
+      currentBrowserAttentionGeneration: 1,
       currentWorkspaceSelectionGeneration: 7,
     });
     expect(next).toEqual({
@@ -87,6 +90,7 @@ describe('resolveConversationWorkspaceTransition', () => {
   it('lets a newer Browser request adopt a pending switch without losing the departing cursor', () => {
     const pending = createBrowserWorkspaceTransitionMarker({
       navigationGeneration: 1,
+      browserAttentionGeneration: 1,
       workspaceSelectionGeneration: 7,
       operation: 'navigate',
       departingWorkspaceId: 'workspace-a',
@@ -98,6 +102,7 @@ describe('resolveConversationWorkspaceTransition', () => {
       activeWorkspaceId: 'workspace-b',
       previousWorkspaceId: 'workspace-a',
       navigationGeneration: 2,
+      browserAttentionGeneration: 2,
       currentWorkspaceSelectionGeneration: 7,
     });
 
@@ -108,6 +113,7 @@ describe('resolveConversationWorkspaceTransition', () => {
         currentConversationId: 'chat-b',
         browserTransition: adopted,
         currentNavigationGeneration: 2,
+        currentBrowserAttentionGeneration: 2,
         currentWorkspaceSelectionGeneration: 7,
       }),
     ).toEqual({
@@ -118,10 +124,61 @@ describe('resolveConversationWorkspaceTransition', () => {
     });
   });
 
+  it('reconciles a committed transition when a newer Browser request supersedes its rollback owner', () => {
+    expect(
+      resolveConversationWorkspaceTransition({
+        previousWorkspaceId: 'workspace-a',
+        activeWorkspaceId: 'workspace-b',
+        currentConversationId: 'chat-a',
+        browserTransition: {
+          navigationGeneration: 1,
+          browserAttentionGeneration: 1,
+          workspaceSelectionGeneration: 7,
+          operation: 'navigate',
+          departingWorkspaceId: 'workspace-a',
+          destinationWorkspaceId: 'workspace-b',
+          departingConversationId: 'chat-a',
+        },
+        currentNavigationGeneration: 2,
+        currentBrowserAttentionGeneration: 2,
+        currentWorkspaceSelectionGeneration: 7,
+      }),
+    ).toEqual({
+      staleBrowserTransition: false,
+      departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
+      nextPreviousWorkspaceId: 'workspace-b',
+    });
+  });
+
+  it('does not let an older Browser request downgrade a newer transition marker', () => {
+    const newer = createBrowserWorkspaceTransitionMarker({
+      navigationGeneration: 4,
+      browserAttentionGeneration: 4,
+      workspaceSelectionGeneration: 7,
+      operation: 'navigate',
+      departingWorkspaceId: 'workspace-a',
+      destinationWorkspaceId: 'workspace-b',
+      departingConversationId: 'chat-a',
+    });
+
+    expect(
+      adoptBrowserWorkspaceTransitionMarker({
+        marker: newer,
+        activeWorkspaceId: 'workspace-b',
+        previousWorkspaceId: 'workspace-a',
+        navigationGeneration: 3,
+        browserAttentionGeneration: 3,
+        currentWorkspaceSelectionGeneration: 7,
+      }),
+    ).toBe(newer);
+  });
+
   it('does not create markers for same-workspace operations or rollbacks', () => {
     expect(
       createBrowserWorkspaceTransitionMarker({
         navigationGeneration: 1,
+        browserAttentionGeneration: 1,
         workspaceSelectionGeneration: 2,
         operation: 'navigate',
         departingWorkspaceId: 'workspace-a',
@@ -132,6 +189,7 @@ describe('resolveConversationWorkspaceTransition', () => {
     expect(
       createBrowserWorkspaceTransitionMarker({
         navigationGeneration: 1,
+        browserAttentionGeneration: 1,
         workspaceSelectionGeneration: 2,
         operation: 'rollback',
         departingWorkspaceId: 'workspace-b',
@@ -319,6 +377,64 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
     expect(setActiveWorkspace).not.toHaveBeenCalled();
     expect(switchConversation).not.toHaveBeenCalled();
+  });
+
+  it('adopts a pending transition before selecting another chat in the already-active workspace', async () => {
+    const adoptActiveWorkspaceTransition = vi.fn();
+    const switchConversation = vi.fn(async () => true);
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-b',
+        selectionGeneration: 2,
+        getConversation: async () => ({ workspaceId: 'workspace-b' }),
+        getActiveConversationId: () => 'chat-a',
+        getBackendActiveConversationId: async () => 'chat-a',
+        getSelectionGeneration: () => 2,
+        getActiveWorkspaceId: () => 'workspace-b',
+        getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+        saveLastConversation: async () => undefined,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 2,
+        browserAttentionGeneration: 2,
+        setActiveWorkspace: async () => true,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        adoptActiveWorkspaceTransition,
+        switchConversation,
+      }),
+    ).resolves.toBe(true);
+
+    expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 2);
+  });
+
+  it('does not let a delayed older request adopt a newer transition', async () => {
+    const adoptActiveWorkspaceTransition = vi.fn();
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-b',
+        selectionGeneration: 1,
+        getConversation: async () => ({ workspaceId: 'workspace-b' }),
+        getActiveConversationId: () => 'chat-b',
+        getBackendActiveConversationId: async () => 'chat-b',
+        getSelectionGeneration: () => 2,
+        getActiveWorkspaceId: () => 'workspace-b',
+        getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+        saveLastConversation: async () => undefined,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 2,
+        browserAttentionGeneration: 1,
+        setActiveWorkspace: async () => true,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        adoptActiveWorkspaceTransition,
+        switchConversation: vi.fn(async () => true),
+      }),
+    ).resolves.toBe(false);
+
+    expect(adoptActiveWorkspaceTransition).not.toHaveBeenCalled();
   });
 
   it('switches workspaces when Browser attention targets the already-selected conversation', async () => {
@@ -656,7 +772,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
   it('waits for the departing-workspace effect before the caller selects the destination chat', async () => {
     const calls: string[] = [];
-    const lastConversation = new Map<string, string>();
+    const lastConversation = new Map<string, string | null>();
     let currentConversation = 'chat-a';
     let resolveObservation: (observed: boolean) => void = () => {};
     let signalWorkspaceSet: () => void = () => {};
@@ -710,6 +826,109 @@ describe('prepareConversationWorkspaceSwitch', () => {
       ]),
     );
     expect(calls).toEqual(['wait:workspace-b', 'save:workspace-b:chat-b', 'switch:workspace-b', 'cancel:workspace-b']);
+  });
+
+  it('restores destination metadata when navigation loses ownership before switching workspaces', async () => {
+    let current = true;
+    let lastConversation: string | null = 'chat-b-previous';
+    const saveLastConversation = vi.fn(
+      async ({
+        conversationId,
+        expectedCurrentConversationId,
+      }: {
+        conversationId: string | null;
+        expectedCurrentConversationId?: string | null;
+      }) => {
+        const previousConversationId = lastConversation;
+        if (expectedCurrentConversationId !== undefined && expectedCurrentConversationId !== lastConversation) {
+          return {
+            ok: false,
+            error: 'last-conversation-changed' as const,
+            lastActiveConversationId: lastConversation,
+          };
+        }
+        lastConversation = conversationId;
+        if (expectedCurrentConversationId === undefined) current = false;
+        return { ok: true, previousConversationId, lastActiveConversationId: conversationId };
+      },
+    );
+    const setActiveWorkspace = vi.fn(async () => true);
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b-canceled',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+        saveLastConversation,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrent: () => current,
+      }),
+    ).resolves.toBe(false);
+
+    expect(lastConversation).toBe('chat-b-previous');
+    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(saveLastConversation).toHaveBeenNthCalledWith(1, {
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b-canceled',
+    });
+    expect(saveLastConversation).toHaveBeenNthCalledWith(2, {
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b-previous',
+      expectedCurrentConversationId: 'chat-b-canceled',
+    });
+  });
+
+  it('does not overwrite newer destination metadata while undoing canceled navigation', async () => {
+    let current = true;
+    let lastConversation: string | null = 'chat-b-previous';
+    const saveLastConversation = vi.fn(
+      async ({
+        conversationId,
+        expectedCurrentConversationId,
+      }: {
+        conversationId: string | null;
+        expectedCurrentConversationId?: string | null;
+      }) => {
+        const previousConversationId = lastConversation;
+        if (expectedCurrentConversationId !== undefined && expectedCurrentConversationId !== lastConversation) {
+          return {
+            ok: false,
+            error: 'last-conversation-changed' as const,
+            lastActiveConversationId: lastConversation,
+          };
+        }
+        lastConversation = conversationId;
+        if (expectedCurrentConversationId === undefined) {
+          current = false;
+          // Model a newer request updating the same workspace before the
+          // canceled request's continuation gets a chance to undo its write.
+          lastConversation = 'chat-b-newer';
+        }
+        return { ok: true, previousConversationId, lastActiveConversationId: conversationId };
+      },
+    );
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b-canceled',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+        saveLastConversation,
+        setActiveWorkspace: vi.fn(async () => true),
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrent: () => current,
+      }),
+    ).resolves.toBe(false);
+
+    expect(lastConversation).toBe('chat-b-newer');
+    expect(saveLastConversation).toHaveBeenLastCalledWith({
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b-previous',
+      expectedCurrentConversationId: 'chat-b-canceled',
+    });
   });
 
   it('fails closed when the conversation references a workspace that no longer exists', async () => {

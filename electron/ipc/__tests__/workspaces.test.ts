@@ -51,6 +51,16 @@ beforeEach(() => {
 const create = (args: { name: string; directory: string }) => handlers.get('workspaces:create')!(null, args);
 const setActive = (id: string | null, expectedCurrentId?: string | null) =>
   handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId });
+const saveLastConversation = (
+  workspaceId: string,
+  conversationId: string | null,
+  expectedCurrentConversationId?: string | null,
+) =>
+  handlers.get('workspaces:save-last-conversation')!(null, {
+    workspaceId,
+    conversationId,
+    expectedCurrentConversationId,
+  });
 
 describe('workspaces:create validation', () => {
   it('rejects an empty name', async () => {
@@ -105,5 +115,51 @@ describe('workspaces:set-active integrity', () => {
       activeWorkspaceId: second.id,
     });
     expect(config.ui.activeWorkspaceId).toBe(second.id);
+  });
+});
+
+describe('workspaces:save-last-conversation integrity', () => {
+  it('returns the previous value so a canceled navigation can restore it', async () => {
+    dirs.add('/work/a');
+    const workspace = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+
+    await expect(saveLastConversation(workspace.id, 'chat-a')).resolves.toEqual({
+      ok: true,
+      previousConversationId: null,
+      lastActiveConversationId: 'chat-a',
+    });
+    await expect(saveLastConversation(workspace.id, 'chat-b', 'chat-a')).resolves.toEqual({
+      ok: true,
+      previousConversationId: 'chat-a',
+      lastActiveConversationId: 'chat-b',
+    });
+    expect(config.ui.workspaces).toEqual([
+      expect.objectContaining({ id: workspace.id, lastActiveConversationId: 'chat-b' }),
+    ]);
+  });
+
+  it('rejects a stale compare-and-set without overwriting newer metadata', async () => {
+    dirs.add('/work/a');
+    const workspace = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    await saveLastConversation(workspace.id, 'chat-newer');
+    sets.length = 0;
+
+    await expect(saveLastConversation(workspace.id, 'chat-previous', 'chat-canceled')).resolves.toEqual({
+      ok: false,
+      error: 'last-conversation-changed',
+      lastActiveConversationId: 'chat-newer',
+    });
+    expect(sets).toEqual([]);
+    expect(config.ui.workspaces).toEqual([
+      expect.objectContaining({ id: workspace.id, lastActiveConversationId: 'chat-newer' }),
+    ]);
+  });
+
+  it('reports a missing workspace without mutating configuration', async () => {
+    await expect(saveLastConversation('missing', 'chat-a')).resolves.toEqual({
+      ok: false,
+      error: 'workspace-not-found',
+    });
+    expect(sets).toEqual([]);
   });
 });

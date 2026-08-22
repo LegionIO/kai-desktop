@@ -85,6 +85,10 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
 
   const handleSelectWorkspace = async (workspaceId: string) => {
     setDropdownOpen(false);
+    // Reselecting the current row is a UI no-op. Advancing the navigation
+    // generation here would cancel an in-flight last-conversation restoration,
+    // while the unchanged workspace id gives the effect no chance to restart it.
+    if (workspaceId === activeWorkspaceId) return;
     onWorkspaceNavigationIntent();
     await app.workspaces.setActive({ id: workspaceId });
   };

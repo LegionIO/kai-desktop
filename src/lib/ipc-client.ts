@@ -225,7 +225,16 @@ type AppAPI = {
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
     }>;
-    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) => Promise<void>;
+    saveLastConversation: (args: {
+      workspaceId: string;
+      conversationId: string | null;
+      expectedCurrentConversationId?: string | null;
+    }) => Promise<{
+      ok: boolean;
+      error?: 'workspace-not-found' | 'last-conversation-changed';
+      previousConversationId?: string | null;
+      lastActiveConversationId?: string | null;
+    }>;
     browseDirectory: () => Promise<{ path: string; name: string } | null>;
   };
   memory: {

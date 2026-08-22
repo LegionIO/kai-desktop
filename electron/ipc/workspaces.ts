@@ -145,14 +145,43 @@ export function registerWorkspaceHandlers(
 
   ipcMain.handle(
     'workspaces:save-last-conversation',
-    async (_event, args: { workspaceId: string; conversationId: string | null }): Promise<void> => {
+    async (
+      _event,
+      args: {
+        workspaceId: string;
+        conversationId: string | null;
+        expectedCurrentConversationId?: string | null;
+      },
+    ): Promise<{
+      ok: boolean;
+      error?: 'workspace-not-found' | 'last-conversation-changed';
+      previousConversationId?: string | null;
+      lastActiveConversationId?: string | null;
+    }> => {
       const config = getConfig();
       const workspaces = [...(config.ui?.workspaces ?? [])];
       const idx = workspaces.findIndex((w) => w.id === args.workspaceId);
-      if (idx === -1) return;
+      if (idx === -1) return { ok: false, error: 'workspace-not-found' };
+
+      const previousConversationId = workspaces[idx].lastActiveConversationId ?? null;
+      if (
+        args.expectedCurrentConversationId !== undefined &&
+        args.expectedCurrentConversationId !== previousConversationId
+      ) {
+        return {
+          ok: false,
+          error: 'last-conversation-changed',
+          lastActiveConversationId: previousConversationId,
+        };
+      }
 
       workspaces[idx] = { ...workspaces[idx], lastActiveConversationId: args.conversationId };
       setConfig('ui.workspaces', workspaces);
+      return {
+        ok: true,
+        previousConversationId,
+        lastActiveConversationId: args.conversationId,
+      };
     },
   );
 

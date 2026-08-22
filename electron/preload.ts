@@ -277,8 +277,17 @@ const appAPI = {
         error?: 'active-workspace-changed';
         activeWorkspaceId?: string | null;
       }>,
-    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) =>
-      ipcRenderer.invoke('workspaces:save-last-conversation', args),
+    saveLastConversation: (args: {
+      workspaceId: string;
+      conversationId: string | null;
+      expectedCurrentConversationId?: string | null;
+    }) =>
+      ipcRenderer.invoke('workspaces:save-last-conversation', args) as Promise<{
+        ok: boolean;
+        error?: 'workspace-not-found' | 'last-conversation-changed';
+        previousConversationId?: string | null;
+        lastActiveConversationId?: string | null;
+      }>,
     browseDirectory: () =>
       ipcRenderer.invoke('workspaces:browse-directory') as Promise<{ path: string; name: string } | null>,
   },

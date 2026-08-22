@@ -821,6 +821,7 @@ function AppShell() {
       currentConversationId: activeConversationIdRef.current,
       browserTransition,
       currentNavigationGeneration: navigationIntentGenerationRef.current,
+      currentBrowserAttentionGeneration: browserAttentionIntentGenerationRef.current,
       currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
     });
 
@@ -870,7 +871,11 @@ function AppShell() {
         if (!isCurrent()) return;
         if (!activation.ok) {
           if (activation.error === 'conversation-not-found') {
-            await app.workspaces.saveLastConversation({ workspaceId: restoringWorkspaceId, conversationId: null });
+            await app.workspaces.saveLastConversation({
+              workspaceId: restoringWorkspaceId,
+              conversationId: null,
+              expectedCurrentConversationId: restoredId,
+            });
           }
           return;
         }
@@ -879,7 +884,11 @@ function AppShell() {
         if (!conv) {
           const cleared = await app.conversations.setActiveId(null, restoredId);
           if (cleared.ok && isCurrent()) {
-            await app.workspaces.saveLastConversation({ workspaceId: restoringWorkspaceId, conversationId: null });
+            await app.workspaces.saveLastConversation({
+              workspaceId: restoringWorkspaceId,
+              conversationId: null,
+              expectedCurrentConversationId: restoredId,
+            });
           }
           return;
         }
@@ -1433,6 +1442,7 @@ function AppShell() {
             const transitionKey = id ?? '';
             const transition = createBrowserWorkspaceTransitionMarker({
               navigationGeneration: selectionGeneration,
+              browserAttentionGeneration,
               workspaceSelectionGeneration,
               operation,
               departingWorkspaceId: expectedCurrentId,
@@ -1506,6 +1516,7 @@ function AppShell() {
             activeWorkspaceId: workspaceId,
             previousWorkspaceId: prevWorkspaceIdRef.current,
             navigationGeneration: selectionGeneration,
+            browserAttentionGeneration,
             currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
           });
           if (adopted && adopted !== transition) {
