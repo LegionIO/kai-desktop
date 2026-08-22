@@ -156,6 +156,7 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={createOpen}
         onOpenChange={setCreateOpen}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        createLocalWorkspaceMutationToken={createLocalWorkspaceMutationToken}
         onWorkspaceNavigationFailure={(navigationGeneration) =>
           onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration)
         }
@@ -166,6 +167,7 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={deleteOpen}
         onOpenChange={handleDeleteOpenChange}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        createLocalWorkspaceMutationToken={createLocalWorkspaceMutationToken}
         onWorkspaceNavigationFailure={(navigationGeneration) =>
           onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration)
         }

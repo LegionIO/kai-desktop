@@ -150,8 +150,8 @@ import {
 } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import {
-  isAllowedPrimaryRendererFrameNavigation,
   isCanonicalPrimaryRendererUrl,
+  primaryRendererFrameNavigationDisposition,
   resolvePrimaryRendererUrl,
 } from './primary-renderer-url.js';
 import { safeFetch, readCappedArrayBuffer } from './utils/ssrf-guard.js';
@@ -1106,14 +1106,17 @@ function createWindow(): BrowserWindow {
   // in the main process BEFORE the request and can't be defeated by the frame:
   // allow only the exact privileged renderer document at top level. Artifact
   // subframes may additionally use about:blank/about:srcdoc and PDF data URLs
-  // used by the attachment preview. Anything else is
-  // denied + safe-routed to the OS browser (a user-clicked http(s) link still
-  // opens). Exact matching also prevents same-origin Vite /@fs resources or a
-  // sibling packaged file from inheriting the primary preload's authority.
+  // used by the attachment preview. Anything else is denied. Only a blocked
+  // TOP-LEVEL navigation is safe-routed to the OS browser: a subframe can
+  // navigate itself without a user gesture, so forwarding its URL would leak
+  // artifact-controlled query data. Exact matching also prevents same-origin
+  // Vite /@fs resources or a sibling packaged file from inheriting the primary
+  // preload's authority.
   mainWindow.webContents.on('will-frame-navigate', (event) => {
-    if (isAllowedPrimaryRendererFrameNavigation(event.url, primaryRendererUrl, event.isMainFrame)) return;
+    const disposition = primaryRendererFrameNavigationDisposition(event.url, primaryRendererUrl, event.isMainFrame);
+    if (disposition === 'allow') return;
     event.preventDefault();
-    openExternalSafely(event.url);
+    if (disposition === 'external') openExternalSafely(event.url);
   });
 
   // Grant the small set of renderer permissions we explicitly support.

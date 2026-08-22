@@ -9303,14 +9303,17 @@ export class BrowserManager {
       if (!ownsContents()) return;
       if (!isMain) return;
       this.finishAssistantPopupBootstrap(tab, contents);
-      if (isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, validatedURL)) {
-        this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
-      }
       // A superseded main-frame request may report its terminal failure after a
       // newer attempt has already started (or even committed). Electron does
       // not expose a request id on did-fail-load, so consume the generation/url
-      // tombstone instead of rolling back or failing the newer document.
+      // tombstone before touching the current request's URL-matched user lease.
+      // Two rapid navigations may target the same URL; in that case the stale
+      // ERR_ABORTED must not revoke the newer request's private-network/auth
+      // authority.
       if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL)) return;
+      if (isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, validatedURL)) {
+        this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
+      }
       if (errorCode === -3) {
         // ERR_ABORTED leaves the previously committed document alive. Restore
         // its diagnostics and retain the failed attempt as additional bounded

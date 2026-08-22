@@ -7,6 +7,7 @@ interface CreateWorkspaceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onWorkspaceNavigationIntent: () => number;
+  createLocalWorkspaceMutationToken: () => string;
   onWorkspaceNavigationFailure: (navigationGeneration: number) => void;
 }
 
@@ -14,6 +15,7 @@ export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
   open,
   onOpenChange,
   onWorkspaceNavigationIntent,
+  createLocalWorkspaceMutationToken,
   onWorkspaceNavigationFailure,
 }) => {
   const [name, setName] = useState('');
@@ -37,8 +39,9 @@ export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
     setIsCreating(true);
     setError(null);
     const navigationGeneration = onWorkspaceNavigationIntent();
+    const mutationToken = createLocalWorkspaceMutationToken();
     try {
-      await app.workspaces.create({ name: name.trim(), directory });
+      await app.workspaces.create({ name: name.trim(), directory, mutationToken });
       onOpenChange(false);
       // Reset form
       setName('');

@@ -422,6 +422,22 @@ type SaveWorkspaceLastConversation = (args: {
 
 const MAX_WORKSPACE_CAS_ATTEMPTS = 4;
 
+// Browser-attention requests may resolve their conversation records in either
+// order, but their destination-cursor writes and workspace CAS/rollback pairs
+// form one transaction chain. Serialize only that stateful portion: lookups
+// remain concurrent, while every canceled transition fully restores its
+// predecessor before the next request can mutate workspace state.
+let browserWorkspaceTransitionTail: Promise<void> = Promise.resolve();
+
+function serializeBrowserWorkspaceTransition<T>(operation: () => Promise<T>): Promise<T> {
+  const result = browserWorkspaceTransitionTail.then(operation, operation);
+  browserWorkspaceTransitionTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 /** A user workspace click may race an older Browser-attention or user mutation
  * from this renderer. Rebase only across that locally attributable mutation,
  * reuse one provenance token for every attempt, and stop as soon as a newer
@@ -538,92 +554,94 @@ export async function openBrowserConversationInWorkspace(options: {
   ]);
   if (!conversation) return false;
 
-  // A Browser-attention click is navigation intent, but it must not become a
-  // newer intent merely because its record/workspace lookup was slow. If the
-  // target was selected by the workspace restoration we initiated, the request
-  // already succeeded and must not issue a second selection CAS.
-  const activeWorkspaceAfterLookup = options.getActiveWorkspaceId();
-  const requestOwnsNavigation = options.getSelectionGeneration() === options.selectionGeneration;
-  if (!requestOwnsNavigation) return false;
-  if (conversation.workspaceId && conversation.workspaceId === activeWorkspaceAfterLookup) {
-    options.adoptActiveWorkspaceTransition?.(conversation.workspaceId);
-  }
-  if (!selectionIsCurrent()) return false;
-  const activeWorkspaceAtPreparation = activeWorkspaceAfterLookup;
   const targetWorkspaceId = conversation.workspaceId ?? null;
   const selectTargetConversation = async (): Promise<boolean> => {
     if (options.getActiveConversationId() === options.conversationId) return true;
     if (!selectionIsCurrent()) return false;
     return options.switchConversation(options.conversationId, backendSelectionWhenStarted, options.selectionGeneration);
   };
+  if (!targetWorkspaceId) {
+    if (!selectionIsCurrent()) return false;
+    return selectTargetConversation();
+  }
 
-  // Read workspace state only after the async record lookup. Browser attention
-  // can arrive while the user is changing workspaces, and render-captured state
-  // from before this await could otherwise select the chat under the workspace
-  // the user just left.
-  const workspaceReady = await prepareConversationWorkspaceSwitch({
-    conversationId: options.conversationId,
-    conversationWorkspaceId: conversation.workspaceId,
-    activeWorkspaceId: activeWorkspaceAtPreparation,
-    knownWorkspaceIds: options.getKnownWorkspaceIds(),
-    saveLastConversation: options.saveLastConversation,
-    setActiveWorkspace: options.setActiveWorkspace,
-    createWorkspaceObservationWait: options.createWorkspaceObservationWait,
-    isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
-    isCurrentAfterSwitch: targetWorkspaceId
-      ? () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId)
-      : undefined,
-    resolveStaleSwitchDisposition: async () => {
-      if (!targetWorkspaceId) return 'superseded';
-      const workspaceAndBrowserIntentStillCurrent = (): boolean =>
-        options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
-        options.getBrowserAttentionGeneration() === options.browserAttentionGeneration;
-      if (!workspaceAndBrowserIntentStillCurrent()) return 'superseded';
-      if (options.getConversationSelectionGeneration() === options.conversationSelectionGeneration) {
+  return serializeBrowserWorkspaceTransition(async () => {
+    // Read workspace state only after both the async record lookup and earlier
+    // Browser transitions. A faster successor may enter first; the generation
+    // check then makes this stale request a no-op.
+    const activeWorkspaceAtPreparation = options.getActiveWorkspaceId();
+    if (options.getSelectionGeneration() !== options.selectionGeneration) return false;
+    // Adoption is transaction ownership. Perform it under the same queue as
+    // rollback so an older request cannot relinquish its marker in the gap
+    // between a newer request's lookup and this transfer.
+    if (targetWorkspaceId === activeWorkspaceAtPreparation) {
+      options.adoptActiveWorkspaceTransition?.(targetWorkspaceId);
+    }
+    if (!selectionIsCurrent()) return false;
+
+    const workspaceReady = await prepareConversationWorkspaceSwitch({
+      conversationId: options.conversationId,
+      conversationWorkspaceId: targetWorkspaceId,
+      activeWorkspaceId: activeWorkspaceAtPreparation,
+      knownWorkspaceIds: options.getKnownWorkspaceIds(),
+      saveLastConversation: options.saveLastConversation,
+      setActiveWorkspace: options.setActiveWorkspace,
+      createWorkspaceObservationWait: options.createWorkspaceObservationWait,
+      isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
+      isCurrentAfterSwitch: () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId),
+      resolveStaleSwitchDisposition: async () => {
+        // Explicit workspace selection owns the authoritative state and must
+        // never be overwritten by Browser rollback.
+        if (options.getWorkspaceSelectionGeneration() !== options.workspaceSelectionGeneration) {
+          return 'superseded';
+        }
+        // A newer Browser request cannot have entered this serialized mutation
+        // section yet. Restore our predecessor first; its successor will then
+        // adopt or create a transition from that authoritative state.
+        if (options.getBrowserAttentionGeneration() !== options.browserAttentionGeneration) {
+          return 'rollback';
+        }
+        if (options.getConversationSelectionGeneration() === options.conversationSelectionGeneration) {
+          return 'rollback';
+        }
+
+        // A newer user chat choice should keep the Browser-selected workspace
+        // only when that chat actually belongs to the destination. Follow rapid
+        // choices until one snapshot survives its local record read.
+        for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
+          const selectedConversationId = options.getActiveConversationId();
+          if (!selectedConversationId) return 'rollback';
+          const selectedConversationGeneration = options.getConversationSelectionGeneration();
+          let selectedConversation: { workspaceId?: string | null } | null = null;
+          try {
+            selectedConversation = await options.getConversation(selectedConversationId);
+          } catch {
+            // Only a positively identified destination chat suppresses rollback.
+          }
+          if (options.getWorkspaceSelectionGeneration() !== options.workspaceSelectionGeneration) {
+            return 'superseded';
+          }
+          if (options.getBrowserAttentionGeneration() !== options.browserAttentionGeneration) {
+            return 'rollback';
+          }
+          if (
+            options.getConversationSelectionGeneration() !== selectedConversationGeneration ||
+            options.getActiveConversationId() !== selectedConversationId
+          ) {
+            continue;
+          }
+          if (selectedConversation?.workspaceId !== targetWorkspaceId) return 'rollback';
+          if (options.getActiveWorkspaceId() !== targetWorkspaceId) return 'superseded';
+          options.retainActiveWorkspaceTransition?.(targetWorkspaceId);
+          return 'retain';
+        }
         return 'rollback';
-      }
-
-      // A newer chat choice should keep the Browser-selected workspace only
-      // when that chat actually belongs to the destination. In particular, the
-      // user can click another source-workspace chat before React observes the
-      // Browser's A -> B mutation; that newer selection requires a B -> A
-      // rollback rather than leaving B active and letting its restoration win.
-      // Follow rapid A2 -> B2 selections until one snapshot survives its local
-      // record read. The bounded fallback yields to the newest user intent if
-      // selection keeps changing, instead of risking a rollback underneath it.
-      for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
-        const selectedConversationId = options.getActiveConversationId();
-        if (!selectedConversationId) return 'rollback';
-        const selectedConversationGeneration = options.getConversationSelectionGeneration();
-        let selectedConversation: { workspaceId?: string | null } | null = null;
-        try {
-          selectedConversation = await options.getConversation(selectedConversationId);
-        } catch {
-          // Only a positively identified destination chat suppresses rollback.
-        }
-        if (!workspaceAndBrowserIntentStillCurrent()) return 'superseded';
-        if (
-          options.getConversationSelectionGeneration() !== selectedConversationGeneration ||
-          options.getActiveConversationId() !== selectedConversationId
-        ) {
-          continue;
-        }
-        if (selectedConversation?.workspaceId !== targetWorkspaceId) return 'rollback';
-        if (options.getActiveWorkspaceId() !== targetWorkspaceId) return 'superseded';
-        // Transfer the pending marker while the stable conversation/workspace
-        // snapshot above is still current. The generic finalizer awaits this
-        // result and would otherwise introduce a gap in which newer intent
-        // could be incorrectly adopted by the old Browser request.
-        options.retainActiveWorkspaceTransition?.(targetWorkspaceId);
-        return 'retain';
-      }
-      return 'superseded';
-    },
-    discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
-    commitConversationSelection: targetWorkspaceId ? selectTargetConversation : undefined,
+      },
+      discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
+      commitConversationSelection: selectTargetConversation,
+    });
+    return workspaceReady;
   });
-  if (!workspaceReady) return false;
-  return targetWorkspaceId ? true : selectTargetConversation();
 }
 
 /** Prepare cross-workspace navigation initiated by Browser attention. Saving

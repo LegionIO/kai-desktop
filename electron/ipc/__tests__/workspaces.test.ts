@@ -48,7 +48,10 @@ beforeEach(() => {
   registerWorkspaceHandlers(fakeIpc as never, '/home', getConfig, setConfig);
 });
 
-const create = (args: { name: string; directory: string }) => handlers.get('workspaces:create')!(null, args);
+const create = (args: { name: string; directory: string; mutationToken?: string }) =>
+  handlers.get('workspaces:create')!(null, args);
+const deleteWorkspace = (id: string, mutationToken?: string) =>
+  handlers.get('workspaces:delete')!(null, { id, mutationToken });
 const setActive = (id: string | null, expectedCurrentId?: string | null, mutationToken?: string) =>
   handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId, mutationToken });
 const saveLastConversation = (
@@ -144,6 +147,35 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: second.id,
       activeWorkspaceLastConversationId: null,
+    });
+  });
+
+  it('preserves local mutation provenance when create or active delete selects a workspace', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    const first = (await create({
+      name: 'a',
+      directory: '/work/a',
+      mutationToken: 'local-create-request',
+    })) as { id: string };
+
+    await expect(setActive(null, null)).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: first.id,
+      activeWorkspaceLastConversationId: null,
+      activeWorkspaceMutationToken: 'local-create-request',
+    });
+
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+    await deleteWorkspace(second.id, 'local-delete-request');
+
+    await expect(setActive(null, second.id)).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: first.id,
+      activeWorkspaceLastConversationId: null,
+      activeWorkspaceMutationToken: 'local-delete-request',
     });
   });
 });

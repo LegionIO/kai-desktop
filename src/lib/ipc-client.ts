@@ -220,9 +220,9 @@ type AppAPI = {
     onNavigate: (callback: (payload: { alertId?: string }) => void) => () => void;
   };
   workspaces: {
-    create: (args: { name: string; directory: string }) => Promise<unknown>;
+    create: (args: { name: string; directory: string; mutationToken?: string }) => Promise<unknown>;
     rename: (args: { id: string; name: string }) => Promise<void>;
-    delete: (args: { id: string }) => Promise<void>;
+    delete: (args: { id: string; mutationToken?: string }) => Promise<void>;
     setActive: (args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string }) => Promise<{
       ok: boolean;
       error?: 'active-workspace-changed';

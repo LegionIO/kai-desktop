@@ -37,6 +37,7 @@ describe('workspace mutation dialogs', () => {
         open
         onOpenChange={() => undefined}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        createLocalWorkspaceMutationToken={() => 'local-create-request'}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
@@ -44,7 +45,11 @@ describe('workspace mutation dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Browse…' }));
     await user.click(screen.getByRole('button', { name: 'Create' }));
 
-    expect(create).toHaveBeenCalledWith({ name: 'New workspace', directory: '/work/new' });
+    expect(create).toHaveBeenCalledWith({
+      name: 'New workspace',
+      directory: '/work/new',
+      mutationToken: 'local-create-request',
+    });
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
     expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith(13);
     expect(await screen.findByText('Create failed')).toBeInTheDocument();
@@ -55,6 +60,7 @@ describe('workspace mutation dialogs', () => {
     const deleteWorkspace = vi.fn(async () => undefined);
     installAppBridgeStub({ workspaces: { delete: deleteWorkspace } });
     const onWorkspaceNavigationIntent = vi.fn(() => 17);
+    const createLocalWorkspaceMutationToken = vi.fn(() => 'local-delete-inactive');
     const onWorkspaceNavigationFailure = vi.fn();
 
     render(
@@ -64,6 +70,7 @@ describe('workspace mutation dialogs', () => {
         open
         onOpenChange={() => undefined}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        createLocalWorkspaceMutationToken={createLocalWorkspaceMutationToken}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
@@ -73,6 +80,7 @@ describe('workspace mutation dialogs', () => {
 
     expect(deleteWorkspace).toHaveBeenCalledWith({ id: 'workspace-b' });
     expect(onWorkspaceNavigationIntent).not.toHaveBeenCalled();
+    expect(createLocalWorkspaceMutationToken).not.toHaveBeenCalled();
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
   });
 
@@ -83,6 +91,7 @@ describe('workspace mutation dialogs', () => {
     });
     installAppBridgeStub({ workspaces: { delete: deleteWorkspace } });
     const onWorkspaceNavigationIntent = vi.fn(() => 19);
+    const createLocalWorkspaceMutationToken = vi.fn(() => 'local-delete-active');
     const onWorkspaceNavigationFailure = vi.fn();
 
     render(
@@ -92,6 +101,7 @@ describe('workspace mutation dialogs', () => {
         open
         onOpenChange={() => undefined}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        createLocalWorkspaceMutationToken={createLocalWorkspaceMutationToken}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
@@ -100,6 +110,11 @@ describe('workspace mutation dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Delete Workspace' }));
 
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
+    expect(deleteWorkspace).toHaveBeenCalledWith({
+      id: 'workspace-b',
+      mutationToken: 'local-delete-active',
+    });
+    expect(createLocalWorkspaceMutationToken).toHaveBeenCalledOnce();
     expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith(19);
     expect(await screen.findByText('Delete failed')).toBeInTheDocument();
   });

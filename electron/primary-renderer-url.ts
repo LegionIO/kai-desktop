@@ -43,3 +43,19 @@ export function isAllowedPrimaryRendererFrameNavigation(
   if (candidate === 'about:blank' || candidate === 'about:srcdoc') return true;
   return isPdfDataUrl(candidate);
 }
+
+export type PrimaryRendererFrameNavigationDisposition = 'allow' | 'block' | 'external';
+
+/** Block every untrusted renderer navigation before Chromium issues it. Only a
+ * top-level navigation is an app-level "open this link" request that may be
+ * handed to the OS browser; a sandboxed artifact subframe can navigate itself
+ * without a user gesture, so forwarding its URL would become an exfiltration
+ * channel even though the embedded request itself was denied. */
+export function primaryRendererFrameNavigationDisposition(
+  candidate: string,
+  canonicalUrl: string,
+  isMainFrame: boolean,
+): PrimaryRendererFrameNavigationDisposition {
+  if (isAllowedPrimaryRendererFrameNavigation(candidate, canonicalUrl, isMainFrame)) return 'allow';
+  return isMainFrame ? 'external' : 'block';
+}

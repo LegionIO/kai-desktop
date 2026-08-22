@@ -10,6 +10,7 @@ interface DeleteWorkspaceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onWorkspaceNavigationIntent: () => number;
+  createLocalWorkspaceMutationToken: () => string;
   onWorkspaceNavigationFailure: (navigationGeneration: number) => void;
 }
 
@@ -19,6 +20,7 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
   open,
   onOpenChange,
   onWorkspaceNavigationIntent,
+  createLocalWorkspaceMutationToken,
   onWorkspaceNavigationFailure,
 }) => {
   const [confirmText, setConfirmText] = useState('');
@@ -33,8 +35,9 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
     setError(null);
     const deletingActiveWorkspace = workspace.id === activeWorkspaceId;
     const navigationGeneration = deletingActiveWorkspace ? onWorkspaceNavigationIntent() : null;
+    const mutationToken = deletingActiveWorkspace ? createLocalWorkspaceMutationToken() : undefined;
     try {
-      await app.workspaces.delete({ id: workspace.id });
+      await app.workspaces.delete({ id: workspace.id, ...(mutationToken ? { mutationToken } : {}) });
       onOpenChange(false);
     } catch (err) {
       if (navigationGeneration !== null) onWorkspaceNavigationFailure(navigationGeneration);

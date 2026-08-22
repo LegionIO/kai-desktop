@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   isAllowedPrimaryRendererFrameNavigation,
   isCanonicalPrimaryRendererUrl,
+  primaryRendererFrameNavigationDisposition,
   resolvePrimaryRendererUrl,
 } from '../primary-renderer-url.js';
 
@@ -47,5 +48,15 @@ describe('primary renderer URL authority', () => {
     expect(allowed('data:text/html,<script>location="https://attacker.example"</script>')).toBe(false);
     expect(allowed('data:application/pdfx,not-a-pdf')).toBe(false);
     expect(allowed('https://attacker.example/')).toBe(false);
+  });
+
+  it('never forwards a blocked subframe URL to the external browser', () => {
+    const renderer = 'file:///Applications/Kai.app/Contents/Resources/app.asar/renderer/index.html';
+
+    expect(primaryRendererFrameNavigationDisposition('https://attacker.example/?secret=1', renderer, false)).toBe(
+      'block',
+    );
+    expect(primaryRendererFrameNavigationDisposition('https://example.com/', renderer, true)).toBe('external');
+    expect(primaryRendererFrameNavigationDisposition('about:srcdoc', renderer, false)).toBe('allow');
   });
 });

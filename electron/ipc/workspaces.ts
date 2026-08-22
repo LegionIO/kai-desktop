@@ -29,61 +29,64 @@ export function registerWorkspaceHandlers(
 
   // ── Create ──────────────────────────────────────────────────────────────
 
-  ipcMain.handle('workspaces:create', async (_event, args: { name: string; directory: string }): Promise<Workspace> => {
-    const { name, directory } = args;
+  ipcMain.handle(
+    'workspaces:create',
+    async (_event, args: { name: string; directory: string; mutationToken?: string }): Promise<Workspace> => {
+      const { name, directory } = args;
 
-    const trimmedName = typeof name === 'string' ? name.trim() : '';
-    if (!trimmedName) throw new Error('Workspace name is required');
-    if (trimmedName.length > 200) throw new Error('Workspace name is too long');
-    if (typeof directory !== 'string' || !isAbsolute(directory)) {
-      throw new Error('Workspace directory must be an absolute path');
-    }
-
-    // Validate the directory exists AND canonicalize it (resolve symlinks/..)
-    // so the stored path is stable — and so duplicate detection can't be
-    // bypassed by a symlink / trailing-slash / `..` alias of an existing one.
-    const dirStat = await stat(directory).catch(() => null);
-    if (!dirStat?.isDirectory()) {
-      throw new Error(`Directory does not exist: ${directory}`);
-    }
-    const canonicalDir = await realpath(directory).catch(() => null);
-    if (!canonicalDir) {
-      throw new Error(`Directory could not be resolved: ${directory}`);
-    }
-
-    const config = getConfig();
-    const workspaces = config.ui?.workspaces ?? [];
-
-    // Prevent duplicate directory (compare canonical paths on both sides so an
-    // alias of an existing workspace's directory is still caught).
-    let dup: Workspace | undefined;
-    for (const w of workspaces) {
-      const wCanon = await realpath(w.directory).catch(() => w.directory);
-      if (wCanon === canonicalDir) {
-        dup = w;
-        break;
+      const trimmedName = typeof name === 'string' ? name.trim() : '';
+      if (!trimmedName) throw new Error('Workspace name is required');
+      if (trimmedName.length > 200) throw new Error('Workspace name is too long');
+      if (typeof directory !== 'string' || !isAbsolute(directory)) {
+        throw new Error('Workspace directory must be an absolute path');
       }
-    }
-    if (dup) {
-      throw new Error(`A workspace already exists for this directory: ${dup.name}`);
-    }
 
-    const workspace: Workspace = {
-      id: randomUUID(),
-      name: trimmedName,
-      directory: canonicalDir,
-      color: nextWorkspaceColor(workspaces),
-      lastActiveAt: Date.now(),
-      createdAt: Date.now(),
-      lastActiveConversationId: null,
-    };
+      // Validate the directory exists AND canonicalize it (resolve symlinks/..)
+      // so the stored path is stable — and so duplicate detection can't be
+      // bypassed by a symlink / trailing-slash / `..` alias of an existing one.
+      const dirStat = await stat(directory).catch(() => null);
+      if (!dirStat?.isDirectory()) {
+        throw new Error(`Directory does not exist: ${directory}`);
+      }
+      const canonicalDir = await realpath(directory).catch(() => null);
+      if (!canonicalDir) {
+        throw new Error(`Directory could not be resolved: ${directory}`);
+      }
 
-    setConfig('ui.workspaces', [...workspaces, workspace]);
-    setConfig('ui.activeWorkspaceId', workspace.id);
-    recordActiveWorkspaceMutation(workspace.id);
+      const config = getConfig();
+      const workspaces = config.ui?.workspaces ?? [];
 
-    return workspace;
-  });
+      // Prevent duplicate directory (compare canonical paths on both sides so an
+      // alias of an existing workspace's directory is still caught).
+      let dup: Workspace | undefined;
+      for (const w of workspaces) {
+        const wCanon = await realpath(w.directory).catch(() => w.directory);
+        if (wCanon === canonicalDir) {
+          dup = w;
+          break;
+        }
+      }
+      if (dup) {
+        throw new Error(`A workspace already exists for this directory: ${dup.name}`);
+      }
+
+      const workspace: Workspace = {
+        id: randomUUID(),
+        name: trimmedName,
+        directory: canonicalDir,
+        color: nextWorkspaceColor(workspaces),
+        lastActiveAt: Date.now(),
+        createdAt: Date.now(),
+        lastActiveConversationId: null,
+      };
+
+      setConfig('ui.workspaces', [...workspaces, workspace]);
+      setConfig('ui.activeWorkspaceId', workspace.id);
+      recordActiveWorkspaceMutation(workspace.id, args.mutationToken);
+
+      return workspace;
+    },
+  );
 
   // ── Rename ──────────────────────────────────────────────────────────────
 
@@ -99,7 +102,7 @@ export function registerWorkspaceHandlers(
 
   // ── Delete ──────────────────────────────────────────────────────────────
 
-  ipcMain.handle('workspaces:delete', async (_event, args: { id: string }): Promise<void> => {
+  ipcMain.handle('workspaces:delete', async (_event, args: { id: string; mutationToken?: string }): Promise<void> => {
     const config = getConfig();
     const workspaces = (config.ui?.workspaces ?? []).filter((w) => w.id !== args.id);
     setConfig('ui.workspaces', workspaces);
@@ -109,10 +112,10 @@ export function registerWorkspaceHandlers(
       if (workspaces.length > 0) {
         const sorted = [...workspaces].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
         setConfig('ui.activeWorkspaceId', sorted[0].id);
-        recordActiveWorkspaceMutation(sorted[0].id);
+        recordActiveWorkspaceMutation(sorted[0].id, args.mutationToken);
       } else {
         setConfig('ui.activeWorkspaceId', null);
-        recordActiveWorkspaceMutation(null);
+        recordActiveWorkspaceMutation(null, args.mutationToken);
       }
     }
   });

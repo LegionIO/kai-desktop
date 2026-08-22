@@ -5164,6 +5164,78 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(tab, 'networkRedactionKey')).toBe(secondRedactionKey);
   });
 
+  it('does not let a superseded same-URL failure revoke the newer trusted navigation lease', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const navigationUrl = 'https://same.example/private';
+    let currentUrl = 'https://committed.example';
+    const tab = {
+      shell: {
+        id: 'tab-same-url-navigation',
+        conversationId: 'chat-1',
+        url: currentUrl,
+        title: 'Committed',
+        sensitive: false,
+        reloadRequired: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      scriptTainted: false,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationPanelGeneration: null,
+      trustedUserNavigationLease: 0,
+      trustedUserNavigationTimer: null,
+      networkRequests: new Map(),
+      activeNetworkRequests: new Map(),
+      networkRequestSequence: 0,
+    };
+    const manager = managerWithoutConstructor({
+      cancelFaviconFetch: vi.fn(),
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const contents = {
+      getTitle: () => 'Current',
+      getURL: () => currentUrl,
+      isCurrentlyAudible: () => false,
+      isDestroyed: () => false,
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false, clear: vi.fn() },
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    Object.assign(tab, { view: { webContents: contents } });
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+
+    invokePrivate(manager, 'beginTrustedUserNavigation', tab, navigationUrl);
+    invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+      id: 10,
+      method: 'GET',
+      resourceType: 'mainFrame',
+      url: navigationUrl,
+    });
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+
+    const newerLease = invokePrivate(manager, 'beginTrustedUserNavigation', tab, navigationUrl) as number;
+    invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+      id: 11,
+      method: 'GET',
+      resourceType: 'mainFrame',
+      url: navigationUrl,
+    });
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', navigationUrl, true);
+
+    expect(tab.trustedUserNavigation).toBe(true);
+    expect(tab.trustedUserNavigationTarget).toBe(navigationUrl);
+    expect(tab.trustedUserNavigationLease).toBe(newerLease);
+
+    currentUrl = navigationUrl;
+    listeners.get('did-navigate')?.({}, navigationUrl);
+    expect(tab.trustedUserNavigation).toBe(false);
+  });
+
   it('contains profile-marker filesystem failures inside Electron navigation callbacks', () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const cancelFaviconFetch = vi.fn();
