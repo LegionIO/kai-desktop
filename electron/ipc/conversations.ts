@@ -60,6 +60,7 @@ import {
   clearAllConversations,
   conversationIdsForClear,
   getActiveConversationId,
+  getActiveConversationState,
   setActiveConversationId,
   nextCompactionRevision,
   isRecentlyDeleted,
@@ -2951,24 +2952,34 @@ export function registerConversationHandlers(
     return getActiveConversationId(appHome);
   });
 
-  ipcMain.handle('conversations:set-active-id', (_event, id: string | null, expectedCurrentId?: string | null) => {
-    const current = getActiveConversationId(appHome);
-    if (expectedCurrentId !== undefined && current !== expectedCurrentId) {
-      return { ok: false, error: 'active-conversation-changed', activeConversationId: current };
-    }
-    if (id !== null) {
-      try {
-        if (!readConversationStrict(appHome, id)) {
-          return { ok: false, error: 'conversation-not-found', activeConversationId: current };
-        }
-      } catch {
-        return { ok: false, error: 'conversation-unavailable', activeConversationId: current };
-      }
-    }
-    setActiveConversationId(appHome, id);
-    broadcastActive(appHome);
-    return { ok: true };
+  ipcMain.handle('conversations:get-active-state', () => {
+    return getActiveConversationState(appHome);
   });
+
+  ipcMain.handle(
+    'conversations:set-active-id',
+    (_event, id: string | null, expectedCurrentId?: string | null, expectedCurrentRevision?: number) => {
+      const current = getActiveConversationState(appHome);
+      if (
+        (expectedCurrentId !== undefined && current.activeConversationId !== expectedCurrentId) ||
+        (expectedCurrentRevision !== undefined && current.activeConversationRevision !== expectedCurrentRevision)
+      ) {
+        return { ok: false, error: 'active-conversation-changed', ...current };
+      }
+      if (id !== null) {
+        try {
+          if (!readConversationStrict(appHome, id)) {
+            return { ok: false, error: 'conversation-not-found', ...current };
+          }
+        } catch {
+          return { ok: false, error: 'conversation-unavailable', ...current };
+        }
+      }
+      const activeConversationRevision = setActiveConversationId(appHome, id);
+      broadcastActive(appHome);
+      return { ok: true, activeConversationId: id, activeConversationRevision };
+    },
+  );
 
   // Fast single-round-trip selection change for the CLI: patch only the
   // selected model or profile on one conversation (one read + one write; no

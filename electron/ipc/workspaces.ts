@@ -19,12 +19,31 @@ export function registerWorkspaceHandlers(
   getConfig: () => AppConfig,
   setConfig: (path: string, value: unknown) => void,
 ): void {
+  const normalizeMutationToken = (mutationToken: unknown): string | null =>
+    typeof mutationToken === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(mutationToken) ? mutationToken : null;
   let activeWorkspaceMutationToken: string | null = null;
   let mutationTokenWorkspaceId = getConfig().ui?.activeWorkspaceId ?? null;
   const recordActiveWorkspaceMutation = (workspaceId: string | null, mutationToken?: string): void => {
     mutationTokenWorkspaceId = workspaceId;
-    activeWorkspaceMutationToken =
-      typeof mutationToken === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(mutationToken) ? mutationToken : null;
+    activeWorkspaceMutationToken = normalizeMutationToken(mutationToken);
+  };
+  const lastConversationMutations = new Map<string, { conversationId: string | null; mutationToken: string | null }>();
+  const getLastConversationMutationToken = (workspaceId: string, conversationId: string | null): string | null => {
+    const mutation = lastConversationMutations.get(workspaceId);
+    if (!mutation || mutation.conversationId !== conversationId) {
+      lastConversationMutations.delete(workspaceId);
+      return null;
+    }
+    return mutation.mutationToken;
+  };
+  const recordLastConversationMutation = (
+    workspaceId: string,
+    conversationId: string | null,
+    mutationToken?: string,
+  ): string | null => {
+    const normalized = normalizeMutationToken(mutationToken);
+    lastConversationMutations.set(workspaceId, { conversationId, mutationToken: normalized });
+    return normalized;
   };
 
   // ── Create ──────────────────────────────────────────────────────────────
@@ -106,6 +125,7 @@ export function registerWorkspaceHandlers(
     const config = getConfig();
     const workspaces = (config.ui?.workspaces ?? []).filter((w) => w.id !== args.id);
     setConfig('ui.workspaces', workspaces);
+    lastConversationMutations.delete(args.id);
 
     // If the deleted workspace was active, fall back to most-recent or null
     if (config.ui?.activeWorkspaceId === args.id) {
@@ -126,7 +146,12 @@ export function registerWorkspaceHandlers(
     'workspaces:set-active',
     async (
       _event,
-      args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string },
+      args: {
+        id: string | null;
+        expectedCurrentId?: string | null;
+        expectedCurrentMutationToken?: string | null;
+        mutationToken?: string;
+      },
     ): Promise<{
       ok: boolean;
       error?: 'active-workspace-changed';
@@ -142,7 +167,11 @@ export function registerWorkspaceHandlers(
         activeWorkspaceMutationToken = null;
       }
 
-      if (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) {
+      if (
+        (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) ||
+        (args.expectedCurrentMutationToken !== undefined &&
+          args.expectedCurrentMutationToken !== activeWorkspaceMutationToken)
+      ) {
         const activeWorkspaceLastConversationId =
           workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.lastActiveConversationId ?? null;
         return {
@@ -150,7 +179,9 @@ export function registerWorkspaceHandlers(
           error: 'active-workspace-changed',
           activeWorkspaceId,
           activeWorkspaceLastConversationId,
-          ...(activeWorkspaceMutationToken ? { activeWorkspaceMutationToken } : {}),
+          ...(args.expectedCurrentMutationToken !== undefined || activeWorkspaceMutationToken
+            ? { activeWorkspaceMutationToken }
+            : {}),
         };
       }
 
@@ -184,12 +215,15 @@ export function registerWorkspaceHandlers(
         workspaceId: string;
         conversationId: string | null;
         expectedCurrentConversationId?: string | null;
+        expectedCurrentMutationToken?: string | null;
+        mutationToken?: string;
       },
     ): Promise<{
       ok: boolean;
       error?: 'workspace-not-found' | 'last-conversation-changed';
       previousConversationId?: string | null;
       lastActiveConversationId?: string | null;
+      lastActiveConversationMutationToken?: string | null;
     }> => {
       const config = getConfig();
       const workspaces = [...(config.ui?.workspaces ?? [])];
@@ -197,23 +231,28 @@ export function registerWorkspaceHandlers(
       if (idx === -1) return { ok: false, error: 'workspace-not-found' };
 
       const previousConversationId = workspaces[idx].lastActiveConversationId ?? null;
+      const previousMutationToken = getLastConversationMutationToken(args.workspaceId, previousConversationId);
       if (
-        args.expectedCurrentConversationId !== undefined &&
-        args.expectedCurrentConversationId !== previousConversationId
+        (args.expectedCurrentConversationId !== undefined &&
+          args.expectedCurrentConversationId !== previousConversationId) ||
+        (args.expectedCurrentMutationToken !== undefined && args.expectedCurrentMutationToken !== previousMutationToken)
       ) {
         return {
           ok: false,
           error: 'last-conversation-changed',
           lastActiveConversationId: previousConversationId,
+          ...(previousMutationToken ? { lastActiveConversationMutationToken: previousMutationToken } : {}),
         };
       }
 
       workspaces[idx] = { ...workspaces[idx], lastActiveConversationId: args.conversationId };
       setConfig('ui.workspaces', workspaces);
+      const mutationToken = recordLastConversationMutation(args.workspaceId, args.conversationId, args.mutationToken);
       return {
         ok: true,
         previousConversationId,
         lastActiveConversationId: args.conversationId,
+        ...(mutationToken ? { lastActiveConversationMutationToken: mutationToken } : {}),
       };
     },
   );

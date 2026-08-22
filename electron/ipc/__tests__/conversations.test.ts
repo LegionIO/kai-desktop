@@ -71,6 +71,7 @@ import {
   setActiveConversationId,
   __resetMigrationGuardForTests,
   __resetDeleteTombstonesForTests,
+  __resetActiveConversationRevisionsForTests,
   markIndexMayHaveGhosts,
   clearIndexGhostFlag,
   type ConversationRecord,
@@ -161,6 +162,7 @@ beforeEach(() => {
   // each fresh temp appHome is evaluated independently.
   __resetMigrationGuardForTests();
   __resetDeleteTombstonesForTests();
+  __resetActiveConversationRevisionsForTests();
   clearIndexGhostFlag();
 });
 
@@ -977,7 +979,11 @@ describe('conversations IPC: active-id handling', () => {
 
     await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('conv-active'));
     const setResult = await harness.invoke<{ ok: boolean }>('conversations:set-active-id', FAKE_EVENT, 'conv-active');
-    expect(setResult).toEqual({ ok: true });
+    expect(setResult).toEqual({
+      ok: true,
+      activeConversationId: 'conv-active',
+      activeConversationRevision: 1,
+    });
 
     const after = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(after).toBe('conv-active');
@@ -1002,11 +1008,14 @@ describe('conversations IPC: active-id handling', () => {
       ok: false,
       error: 'active-conversation-changed',
       activeConversationId: 'conv-a',
+      activeConversationRevision: 1,
     });
     await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('conv-a');
 
     await expect(harness.invoke('conversations:set-active-id', FAKE_EVENT, 'fallback', 'conv-a')).resolves.toEqual({
       ok: true,
+      activeConversationId: 'fallback',
+      activeConversationRevision: 2,
     });
     await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('fallback');
   });
@@ -1022,6 +1031,7 @@ describe('conversations IPC: active-id handling', () => {
       ok: false,
       error: 'conversation-not-found',
       activeConversationId: null,
+      activeConversationRevision: 0,
     });
 
     setActiveConversationId(appHome, 'legacy-stale-chat');
@@ -1045,8 +1055,39 @@ describe('conversations IPC: active-id handling', () => {
       ok: false,
       error: 'conversation-unavailable',
       activeConversationId: 'current-chat',
+      activeConversationRevision: 1,
     });
     await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('current-chat');
+  });
+
+  it('rejects an A-to-B-to-A selection ABA using the monotonic active revision', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('conv-a'));
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('conv-b'));
+
+    await expect(harness.invoke('conversations:get-active-state', FAKE_EVENT)).resolves.toEqual({
+      activeConversationId: null,
+      activeConversationRevision: 0,
+    });
+    await harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-a', null, 0);
+    await harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-b', 'conv-a', 1);
+    await harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-a', 'conv-b', 2);
+
+    await expect(harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-b', 'conv-a', 1)).resolves.toEqual({
+      ok: false,
+      error: 'active-conversation-changed',
+      activeConversationId: 'conv-a',
+      activeConversationRevision: 3,
+    });
+    await expect(harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-a', 'conv-a', 3)).resolves.toEqual({
+      ok: true,
+      activeConversationId: 'conv-a',
+      activeConversationRevision: 4,
+    });
   });
 
   it('returns a tri-state snapshot for workspace restoration reads', async () => {

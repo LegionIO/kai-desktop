@@ -168,11 +168,17 @@ const appAPI = {
       ipcRenderer.invoke('conversations:deleteMany', ids) as Promise<ConversationDeleteManyResult>,
     clear: () => ipcRenderer.invoke('conversations:clear') as Promise<ConversationClearResult>,
     getActiveId: () => ipcRenderer.invoke('conversations:get-active-id'),
-    setActiveId: (id: string | null, expectedCurrentId?: string | null) =>
-      ipcRenderer.invoke('conversations:set-active-id', id, expectedCurrentId) as Promise<{
+    getActiveState: () =>
+      ipcRenderer.invoke('conversations:get-active-state') as Promise<{
+        activeConversationId: string | null;
+        activeConversationRevision: number;
+      }>,
+    setActiveId: (id: string | null, expectedCurrentId?: string | null, expectedCurrentRevision?: number) =>
+      ipcRenderer.invoke('conversations:set-active-id', id, expectedCurrentId, expectedCurrentRevision) as Promise<{
         ok: boolean;
         error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
         activeConversationId?: string | null;
+        activeConversationRevision?: number;
       }>,
     getForRestore: (id: string) =>
       ipcRenderer.invoke('conversations:get-for-restore', id) as Promise<
@@ -276,7 +282,12 @@ const appAPI = {
       ipcRenderer.invoke('workspaces:create', args),
     rename: (args: { id: string; name: string }) => ipcRenderer.invoke('workspaces:rename', args),
     delete: (args: { id: string; mutationToken?: string }) => ipcRenderer.invoke('workspaces:delete', args),
-    setActive: (args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string }) =>
+    setActive: (args: {
+      id: string | null;
+      expectedCurrentId?: string | null;
+      expectedCurrentMutationToken?: string | null;
+      mutationToken?: string;
+    }) =>
       ipcRenderer.invoke('workspaces:set-active', args) as Promise<{
         ok: boolean;
         error?: 'active-workspace-changed';
@@ -288,12 +299,15 @@ const appAPI = {
       workspaceId: string;
       conversationId: string | null;
       expectedCurrentConversationId?: string | null;
+      expectedCurrentMutationToken?: string | null;
+      mutationToken?: string;
     }) =>
       ipcRenderer.invoke('workspaces:save-last-conversation', args) as Promise<{
         ok: boolean;
         error?: 'workspace-not-found' | 'last-conversation-changed';
         previousConversationId?: string | null;
         lastActiveConversationId?: string | null;
+        lastActiveConversationMutationToken?: string | null;
       }>,
     browseDirectory: () =>
       ipcRenderer.invoke('workspaces:browse-directory') as Promise<{ path: string; name: string } | null>,

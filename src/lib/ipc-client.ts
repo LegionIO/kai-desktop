@@ -149,13 +149,19 @@ type AppAPI = {
     deleteMany: (ids: string[]) => Promise<ConversationDeleteManyResult>;
     clear: () => Promise<ConversationClearResult>;
     getActiveId: () => Promise<string | null>;
+    getActiveState: () => Promise<{
+      activeConversationId: string | null;
+      activeConversationRevision: number;
+    }>;
     setActiveId: (
       id: string | null,
       expectedCurrentId?: string | null,
+      expectedCurrentRevision?: number,
     ) => Promise<{
       ok: boolean;
       error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
       activeConversationId?: string | null;
+      activeConversationRevision?: number;
     }>;
     getForRestore: (
       id: string,
@@ -223,7 +229,12 @@ type AppAPI = {
     create: (args: { name: string; directory: string; mutationToken?: string }) => Promise<unknown>;
     rename: (args: { id: string; name: string }) => Promise<void>;
     delete: (args: { id: string; mutationToken?: string }) => Promise<void>;
-    setActive: (args: { id: string | null; expectedCurrentId?: string | null; mutationToken?: string }) => Promise<{
+    setActive: (args: {
+      id: string | null;
+      expectedCurrentId?: string | null;
+      expectedCurrentMutationToken?: string | null;
+      mutationToken?: string;
+    }) => Promise<{
       ok: boolean;
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
@@ -234,11 +245,14 @@ type AppAPI = {
       workspaceId: string;
       conversationId: string | null;
       expectedCurrentConversationId?: string | null;
+      expectedCurrentMutationToken?: string | null;
+      mutationToken?: string;
     }) => Promise<{
       ok: boolean;
       error?: 'workspace-not-found' | 'last-conversation-changed';
       previousConversationId?: string | null;
       lastActiveConversationId?: string | null;
+      lastActiveConversationMutationToken?: string | null;
     }>;
     browseDirectory: () => Promise<{ path: string; name: string } | null>;
   };

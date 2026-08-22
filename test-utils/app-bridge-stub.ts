@@ -73,6 +73,7 @@ function buildDefaultStub(): AppLike {
       deleteMany: async () => ({ ok: true, deleted: 0, removedIds: [] }),
       clear: async () => ({ ok: true }),
       getActiveId: async () => null,
+      getActiveState: async () => ({ activeConversationId: null, activeConversationRevision: 0 }),
       setActiveId: async () => ({ ok: true }),
       onChanged: (_cb: (s: unknown) => void): UnsubFn => noopUnsub(),
     },

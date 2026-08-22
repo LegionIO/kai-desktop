@@ -1680,6 +1680,15 @@ export function clearAllConversations(
 
 // ── active id + settings ───────────────────────────────────────────────────────
 
+export type ActiveConversationState = {
+  activeConversationId: string | null;
+  /** Process-local monotonic selection revision. Unlike the id, this detects
+   * A→B→A changes while an asynchronous navigation is in flight. */
+  activeConversationRevision: number;
+};
+
+const activeConversationRevisions = new Map<string, number>();
+
 export function getActiveConversationId(appHome: string): string | null {
   const index = readIndex(appHome);
   const activeId = index.activeConversationId;
@@ -1687,6 +1696,13 @@ export function getActiveConversationId(appHome: string): string | null {
   // without an indexed conversation as empty so restart cannot restore a
   // deleted chat into Browser ownership or any other conversation-scoped UI.
   return activeId && index.conversations[activeId] ? activeId : null;
+}
+
+export function getActiveConversationState(appHome: string): ActiveConversationState {
+  return {
+    activeConversationId: getActiveConversationId(appHome),
+    activeConversationRevision: activeConversationRevisions.get(appHome) ?? 0,
+  };
 }
 
 /**
@@ -1716,12 +1732,15 @@ export function resetStaleRunStatus(appHome: string): number {
   return reset;
 }
 
-export function setActiveConversationId(appHome: string, id: string | null): void {
+export function setActiveConversationId(appHome: string, id: string | null): number {
   // Guard: writing the index before a pending migration would strand the monolith.
   assertMigratedBeforeWrite(appHome);
   const index = readIndex(appHome);
   index.activeConversationId = id;
   writeIndex(appHome, index);
+  const revision = (activeConversationRevisions.get(appHome) ?? 0) + 1;
+  activeConversationRevisions.set(appHome, revision);
+  return revision;
 }
 
 // ── migration ────────────────────────────────────────────────────────────────
@@ -1828,4 +1847,9 @@ export function __resetDeleteTombstonesForTests(): void {
   recentlyDeletedConversations.clear();
   lastWriteSuppressed.clear();
   lastTombstoneSweep = 0;
+}
+
+/** Test-only: reset process-local active-selection revisions. */
+export function __resetActiveConversationRevisionsForTests(): void {
+  activeConversationRevisions.clear();
 }

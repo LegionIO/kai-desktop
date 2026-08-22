@@ -229,6 +229,12 @@ export type ActiveConversationCasResult = {
   ok: boolean;
   error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
   activeConversationId?: string | null;
+  activeConversationRevision?: number;
+};
+
+export type ActiveConversationState = {
+  activeConversationId: string | null;
+  activeConversationRevision: number;
 };
 
 export type WorkspaceRestorationReadResult<T> =
@@ -405,6 +411,8 @@ export type BrowserWorkspaceSwitchResult = {
   previousWorkspaceId?: string | null;
   /** Current authoritative workspace when a compare-and-set is rejected. */
   activeWorkspaceId?: string | null;
+  /** Current authoritative mutation owner when known. */
+  activeWorkspaceMutationToken?: string | null;
 };
 
 export type StaleWorkspaceSwitchDisposition = 'rollback' | 'retain' | 'superseded';
@@ -414,12 +422,15 @@ export type WorkspaceLastConversationCasResult = {
   error?: 'workspace-not-found' | 'last-conversation-changed';
   previousConversationId?: string | null;
   lastActiveConversationId?: string | null;
+  lastActiveConversationMutationToken?: string | null;
 };
 
 type SaveWorkspaceLastConversation = (args: {
   workspaceId: string;
   conversationId: string | null;
   expectedCurrentConversationId?: string | null;
+  expectedCurrentMutationToken?: string | null;
+  mutationToken?: string;
 }) => Promise<WorkspaceLastConversationCasResult | void>;
 
 const MAX_WORKSPACE_CAS_ATTEMPTS = 4;
@@ -514,9 +525,10 @@ export async function openBrowserConversationInWorkspace(options: {
   conversationId: string;
   selectionGeneration: number;
   conversationSelectionGeneration: number;
+  workspaceMutationToken: string;
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
   getActiveConversationId: () => string | null;
-  getBackendActiveConversationId: () => Promise<string | null>;
+  getBackendActiveConversationState: () => Promise<ActiveConversationState>;
   getSelectionGeneration: () => number;
   getConversationSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
@@ -530,6 +542,7 @@ export async function openBrowserConversationInWorkspace(options: {
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
+    expectedCurrentMutationToken?: string,
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
@@ -539,6 +552,7 @@ export async function openBrowserConversationInWorkspace(options: {
     conversationId: string,
     expectedCurrentConversationId: string | null,
     selectionGeneration: number,
+    expectedCurrentConversationRevision: number,
   ) => Promise<boolean>;
 }): Promise<boolean> {
   const selectionWhenStarted = options.getActiveConversationId();
@@ -553,7 +567,7 @@ export async function openBrowserConversationInWorkspace(options: {
     selectionIntentIsCompatibleAfterWorkspaceSwitch() && options.getActiveWorkspaceId() === workspaceId;
   const [conversation, backendSelectionWhenStarted] = await Promise.all([
     options.getConversation(options.conversationId),
-    options.getBackendActiveConversationId(),
+    options.getBackendActiveConversationState(),
   ]);
   if (!conversation) return false;
 
@@ -561,7 +575,12 @@ export async function openBrowserConversationInWorkspace(options: {
   const selectTargetConversation = async (): Promise<boolean> => {
     if (options.getActiveConversationId() === options.conversationId) return true;
     if (!selectionIsCurrent()) return false;
-    return options.switchConversation(options.conversationId, backendSelectionWhenStarted, options.selectionGeneration);
+    return options.switchConversation(
+      options.conversationId,
+      backendSelectionWhenStarted.activeConversationId,
+      options.selectionGeneration,
+      backendSelectionWhenStarted.activeConversationRevision,
+    );
   };
   if (!targetWorkspaceId) {
     if (!selectionIsCurrent()) return false;
@@ -586,6 +605,7 @@ export async function openBrowserConversationInWorkspace(options: {
       conversationId: options.conversationId,
       conversationWorkspaceId: targetWorkspaceId,
       activeWorkspaceId: activeWorkspaceAtPreparation,
+      workspaceMutationToken: options.workspaceMutationToken,
       knownWorkspaceIds: options.getKnownWorkspaceIds(),
       saveLastConversation: options.saveLastConversation,
       setActiveWorkspace: options.setActiveWorkspace,
@@ -657,12 +677,14 @@ export async function prepareConversationWorkspaceSwitch(options: {
   conversationId: string;
   conversationWorkspaceId?: string | null;
   activeWorkspaceId?: string | null;
+  workspaceMutationToken: string;
   knownWorkspaceIds: Iterable<string>;
   saveLastConversation: SaveWorkspaceLastConversation;
   setActiveWorkspace: (
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
+    expectedCurrentMutationToken?: string,
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
@@ -689,6 +711,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
       workspaceId: targetWorkspaceId,
       conversationId: destinationUpdate.previousConversationId,
       expectedCurrentConversationId: options.conversationId,
+      expectedCurrentMutationToken: options.workspaceMutationToken,
     });
   };
   try {
@@ -699,6 +722,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
     destinationUpdate = await options.saveLastConversation({
       workspaceId: targetWorkspaceId,
       conversationId: options.conversationId,
+      mutationToken: options.workspaceMutationToken,
     });
     if (destinationUpdate && !destinationUpdate.ok) return false;
     if (options.isCurrent && !options.isCurrent()) return false;
@@ -739,16 +763,22 @@ export async function prepareConversationWorkspaceSwitch(options: {
                 previousWorkspaceId,
                 targetWorkspaceId,
                 'rollback',
+                options.workspaceMutationToken,
               );
               const rolledBack = typeof rollbackResult === 'boolean' ? rollbackResult : rollbackResult.ok;
               if (!rolledBack) {
                 const authoritativeWorkspaceId =
                   typeof rollbackResult === 'boolean' ? undefined : rollbackResult.activeWorkspaceId;
+                const authoritativeMutationToken =
+                  typeof rollbackResult === 'boolean' ? undefined : rollbackResult.activeWorkspaceMutationToken;
                 // Preserve the marker only when the failed rollback may have
                 // left the destination authoritative. A rejected CAS that names
-                // another workspace proves its owner will reconcile that edge.
+                // another workspace or another mutation owner proves that owner
+                // will reconcile the edge.
                 shouldDiscardTransition =
-                  authoritativeWorkspaceId !== undefined && authoritativeWorkspaceId !== targetWorkspaceId;
+                  (authoritativeWorkspaceId !== undefined && authoritativeWorkspaceId !== targetWorkspaceId) ||
+                  (authoritativeMutationToken !== undefined &&
+                    authoritativeMutationToken !== options.workspaceMutationToken);
               }
             }
           } catch (error) {

@@ -1448,7 +1448,12 @@ function AppShell() {
   }, [dragState, sidebarWidth, updateConfig]);
 
   const handleSwitchConversation = useCallback(
-    async (id: string, expectedCurrentId?: string | null, inheritedNavigationGeneration?: number): Promise<boolean> => {
+    async (
+      id: string,
+      expectedCurrentId?: string | null,
+      inheritedNavigationGeneration?: number,
+      expectedCurrentRevision?: number,
+    ): Promise<boolean> => {
       const navigationGeneration = inheritedNavigationGeneration ?? ++navigationIntentGenerationRef.current;
       if (inheritedNavigationGeneration === undefined) {
         cancelWorkspaceObservationWaits();
@@ -1465,7 +1470,7 @@ function AppShell() {
       // ordering; this ref covers this renderer's intent ordering.
       activeConversationIdRef.current = id;
       try {
-        const result = await app.conversations.setActiveId(id, expectedCurrentId);
+        const result = await app.conversations.setActiveId(id, expectedCurrentId, expectedCurrentRevision);
         if (!result.ok) {
           const targetAlreadyActive =
             result.error === 'active-conversation-changed' && result.activeConversationId === id;
@@ -1518,10 +1523,11 @@ function AppShell() {
         conversationId: id,
         selectionGeneration,
         conversationSelectionGeneration,
+        workspaceMutationToken,
         getConversation: (conversationId) =>
           app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
         getActiveConversationId: () => activeConversationIdRef.current,
-        getBackendActiveConversationId: () => app.conversations.getActiveId(),
+        getBackendActiveConversationState: () => app.conversations.getActiveState(),
         getSelectionGeneration: () => navigationIntentGenerationRef.current,
         getConversationSelectionGeneration: () => conversationSelectionIntentGenerationRef.current,
         getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
@@ -1531,7 +1537,12 @@ function AppShell() {
         workspaceSelectionGeneration,
         getBrowserAttentionGeneration: () => browserAttentionIntentGenerationRef.current,
         browserAttentionGeneration,
-        setActiveWorkspace: async (workspaceId, expectedCurrentWorkspaceId, operation) => {
+        setActiveWorkspace: async (
+          workspaceId,
+          expectedCurrentWorkspaceId,
+          operation,
+          expectedCurrentMutationToken,
+        ) => {
           const setActiveWorkspaceOnce = async (
             id: string | null,
             expectedCurrentId: string | null,
@@ -1552,6 +1563,7 @@ function AppShell() {
               const result = await app.workspaces.setActive({
                 id,
                 expectedCurrentId,
+                ...(expectedCurrentMutationToken !== undefined ? { expectedCurrentMutationToken } : {}),
                 mutationToken: workspaceMutationToken,
               });
               if (
@@ -1662,8 +1674,18 @@ function AppShell() {
             browserWorkspaceTransitionsRef.current.delete(transitionKey);
           }
         },
-        switchConversation: (conversationId, expectedCurrentConversationId, navigationGeneration) =>
-          handleSwitchConversation(conversationId, expectedCurrentConversationId, navigationGeneration),
+        switchConversation: (
+          conversationId,
+          expectedCurrentConversationId,
+          navigationGeneration,
+          expectedCurrentConversationRevision,
+        ) =>
+          handleSwitchConversation(
+            conversationId,
+            expectedCurrentConversationId,
+            navigationGeneration,
+            expectedCurrentConversationRevision,
+          ),
       });
       return opened && navigationIntentGenerationRef.current === selectionGeneration;
     },

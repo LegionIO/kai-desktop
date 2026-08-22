@@ -29,6 +29,11 @@ import {
   shouldRetryWorkspaceConversationRestoration,
 } from '../conversation-selection';
 
+const activeConversationState = (activeConversationId: string | null, activeConversationRevision = 1) => ({
+  activeConversationId,
+  activeConversationRevision,
+});
+
 describe('isConversationWorkspaceRestorationCurrent', () => {
   const current = {
     workspaceId: 'workspace-b',
@@ -736,9 +741,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation,
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -760,9 +766,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveConversation({ workspaceId: 'workspace-b' });
 
     await expect(opening).resolves.toBe(true);
-    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-b', conversationId: 'chat-b' });
+    expect(saveLastConversation).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b',
+      mutationToken: 'browser_request-test',
+    });
     expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration);
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration, 1);
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
 
@@ -774,9 +784,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-browser',
         selectionGeneration: 1,
         conversationSelectionGeneration: 1,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-a' }),
         getActiveConversationId: () => 'chat-renderer',
-        getBackendActiveConversationId: async () => 'chat-backend',
+        getBackendActiveConversationState: async () => activeConversationState('chat-backend', 42),
         getSelectionGeneration: () => 1,
         getConversationSelectionGeneration: () => 1,
         getActiveWorkspaceId: () => 'workspace-a',
@@ -792,7 +803,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(true);
 
-    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1);
+    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1, 42);
   });
 
   it('adopts a pending workspace transition when the target is already selected', async () => {
@@ -805,9 +816,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         selectionGeneration: 2,
         conversationSelectionGeneration: 2,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-b' }),
         getActiveConversationId: () => 'chat-b',
-        getBackendActiveConversationId: async () => 'chat-b',
+        getBackendActiveConversationState: async () => activeConversationState('chat-b'),
         getSelectionGeneration: () => 2,
         getConversationSelectionGeneration: () => 2,
         getActiveWorkspaceId: () => 'workspace-b',
@@ -838,9 +850,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         selectionGeneration: 2,
         conversationSelectionGeneration: 2,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-b' }),
         getActiveConversationId: () => 'chat-a',
-        getBackendActiveConversationId: async () => 'chat-a',
+        getBackendActiveConversationState: async () => activeConversationState('chat-a'),
         getSelectionGeneration: () => 2,
         getConversationSelectionGeneration: () => 2,
         getActiveWorkspaceId: () => 'workspace-b',
@@ -858,7 +871,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ).resolves.toBe(true);
 
     expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 2);
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 2, 1);
   });
 
   it('does not let a delayed older request adopt a newer transition', async () => {
@@ -869,9 +882,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         selectionGeneration: 1,
         conversationSelectionGeneration: 1,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-b' }),
         getActiveConversationId: () => 'chat-b',
-        getBackendActiveConversationId: async () => 'chat-b',
+        getBackendActiveConversationState: async () => activeConversationState('chat-b'),
         getSelectionGeneration: () => 2,
         getConversationSelectionGeneration: () => 2,
         getActiveWorkspaceId: () => 'workspace-b',
@@ -906,9 +920,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-a',
         selectionGeneration: 1,
         conversationSelectionGeneration: 1,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-a' }),
         getActiveConversationId: () => 'chat-a',
-        getBackendActiveConversationId: async () => 'chat-a',
+        getBackendActiveConversationState: async () => activeConversationState('chat-a'),
         getSelectionGeneration: () => 1,
         getConversationSelectionGeneration: () => 1,
         getActiveWorkspaceId: () => activeWorkspaceId,
@@ -924,7 +939,11 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(true);
 
-    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-a', conversationId: 'chat-a' });
+    expect(saveLastConversation).toHaveBeenCalledWith({
+      workspaceId: 'workspace-a',
+      conversationId: 'chat-a',
+      mutationToken: 'browser_request-test',
+    });
     expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-a', 'workspace-b', 'navigate');
     expect(switchConversation).not.toHaveBeenCalled();
     expect(cancelObservation).toHaveBeenCalledOnce();
@@ -948,9 +967,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1002,11 +1022,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: async (conversationId) => ({
         workspaceId: conversationId === 'chat-b' ? 'workspace-b' : 'workspace-a',
       }),
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1034,7 +1055,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     await expect(opening).resolves.toBe(false);
     expect(switchConversation).not.toHaveBeenCalled();
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -1055,6 +1081,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: (conversationId) => {
         if (conversationId === 'chat-b') return Promise.resolve({ workspaceId: 'workspace-b' });
         if (conversationId === 'chat-b-newer') {
@@ -1066,7 +1093,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         return Promise.resolve({ workspaceId: 'workspace-a' });
       },
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1098,7 +1125,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveFirstSelectionLookup({ workspaceId: 'workspace-b' });
 
     await expect(opening).resolves.toBe(false);
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -1122,9 +1154,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration: 1,
       conversationSelectionGeneration: 1,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => 1,
       getConversationSelectionGeneration: () => 1,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1150,7 +1183,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     await expect(opening).resolves.toBe(false);
     expect(switchConversation).not.toHaveBeenCalled();
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-c');
   });
 
@@ -1191,9 +1229,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         selectionGeneration: 1,
         conversationSelectionGeneration: 1,
+        workspaceMutationToken: 'browser_request-test',
         getConversation: async () => ({ workspaceId: 'workspace-b' }),
         getActiveConversationId: () => 'chat-a',
-        getBackendActiveConversationId: async () => 'chat-a',
+        getBackendActiveConversationState: async () => activeConversationState('chat-a'),
         getSelectionGeneration: () => 1,
         getConversationSelectionGeneration: () => 1,
         getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1209,8 +1248,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(false);
 
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1);
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1, 1);
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
     expect(destinationConversationId).toBe('chat-b-previous');
   });
@@ -1238,9 +1282,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1260,7 +1305,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveWorkspaceSwitch();
 
     await expect(opening).resolves.toBe(false);
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -1284,7 +1334,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     const common = {
       getConversation,
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => 'workspace-a',
@@ -1304,6 +1354,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration: ++selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration: selectionGeneration,
     });
     const second = openBrowserConversationInWorkspace({
@@ -1311,6 +1362,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-c',
       selectionGeneration: ++selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration: selectionGeneration,
     });
 
@@ -1318,7 +1370,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveFirstConversation({ workspaceId: 'workspace-a' });
     await expect(first).resolves.toBe(false);
     expect(switchConversation).toHaveBeenCalledOnce();
-    expect(switchConversation).toHaveBeenCalledWith('chat-c', 'chat-a', 2);
+    expect(switchConversation).toHaveBeenCalledWith('chat-c', 'chat-a', 2, 1);
   });
 
   it('rolls an older Browser transition back before the serialized successor mutates workspace state', async () => {
@@ -1336,7 +1388,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     );
     const common = {
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1357,6 +1409,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration,
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       createWorkspaceObservationWait: () => ({
@@ -1375,6 +1428,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-c',
       selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration,
       getConversation: () =>
         new Promise<{ workspaceId: string }>((resolve) => {
@@ -1386,7 +1440,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveOldObservation(true);
     await expect(oldOpening).resolves.toBe(false);
     expect(setActiveWorkspace).toHaveBeenCalledTimes(2);
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
 
     resolveNewConversation({ workspaceId: 'workspace-c' });
@@ -1412,7 +1472,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     );
     const common = {
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1430,6 +1490,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration,
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       createWorkspaceObservationWait: () => ({
@@ -1450,6 +1511,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'missing-chat',
         selectionGeneration,
         conversationSelectionGeneration,
+        workspaceMutationToken: 'browser_request-test',
         browserAttentionGeneration,
         getConversation: async () => null,
         createWorkspaceObservationWait: vi.fn(() => ({ promise: Promise.resolve(true), cancel: vi.fn() })),
@@ -1458,7 +1520,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     resolveOldObservation(false);
     await expect(oldOpening).resolves.toBe(false);
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith(
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -1505,7 +1572,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     const common = {
       getConversation,
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => conversationSelectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1527,6 +1594,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b-first',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration,
     });
     await vi.waitFor(() => expect(destinationConversationId).toBe('chat-b-first'));
@@ -1539,6 +1607,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b-second',
       selectionGeneration,
       conversationSelectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       browserAttentionGeneration,
     });
     await vi.waitFor(() => expect(getConversation).toHaveBeenCalledWith('chat-b-second'));
@@ -1555,17 +1624,27 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(activeWorkspaceId).toBe('workspace-a');
     expect(destinationConversationId).toBe('chat-b-original');
     expect(saveLastConversation.mock.calls.map(([args]) => args)).toEqual([
-      { workspaceId: 'workspace-b', conversationId: 'chat-b-first' },
+      {
+        workspaceId: 'workspace-b',
+        conversationId: 'chat-b-first',
+        mutationToken: 'browser_request-test',
+      },
       {
         workspaceId: 'workspace-b',
         conversationId: 'chat-b-original',
         expectedCurrentConversationId: 'chat-b-first',
+        expectedCurrentMutationToken: 'browser_request-test',
       },
-      { workspaceId: 'workspace-b', conversationId: 'chat-b-second' },
+      {
+        workspaceId: 'workspace-b',
+        conversationId: 'chat-b-second',
+        mutationToken: 'browser_request-test',
+      },
       {
         workspaceId: 'workspace-b',
         conversationId: 'chat-b-original',
         expectedCurrentConversationId: 'chat-b-second',
+        expectedCurrentMutationToken: 'browser_request-test',
       },
     ]);
   });
@@ -1586,9 +1665,10 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       selectionGeneration,
       conversationSelectionGeneration: selectionGeneration,
+      workspaceMutationToken: 'browser_request-test',
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
-      getBackendActiveConversationId: async () => activeConversationId,
+      getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -1627,6 +1707,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       conversationWorkspaceId: 'workspace-b',
       activeWorkspaceId: 'workspace-b',
+      workspaceMutationToken: 'browser_request-test',
       knownWorkspaceIds: ['workspace-a', 'workspace-b'],
       saveLastConversation,
       setActiveWorkspace,
@@ -1643,7 +1724,11 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-b', conversationId: 'chat-b' });
+    expect(saveLastConversation).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b',
+      mutationToken: 'browser_request-test',
+    });
     expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
 
     resolveObservation(true);
@@ -1661,6 +1746,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       conversationWorkspaceId: 'workspace-b',
       activeWorkspaceId: 'workspace-a',
+      workspaceMutationToken: 'browser_request-test',
       knownWorkspaceIds: ['workspace-a', 'workspace-b'],
       saveLastConversation: async () => undefined,
       setActiveWorkspace: async () => ({ ok: true, previousWorkspaceId: 'workspace-a' }),
@@ -1696,6 +1782,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace: async () => true,
@@ -1716,6 +1803,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1742,6 +1830,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-a',
         conversationWorkspaceId: 'workspace-a',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-authoritative'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1753,7 +1842,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ).resolves.toBe(false);
 
     expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-a', 'workspace-a', 'navigate');
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-authoritative', 'workspace-a', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-authoritative',
+      'workspace-a',
+      'rollback',
+      'browser_request-test',
+    );
   });
 
   it('retains the Browser transition when a stale workspace rollback is rejected', async () => {
@@ -1768,6 +1863,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1778,8 +1874,45 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(false);
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(discardActiveWorkspaceTransition).not.toHaveBeenCalled();
+  });
+
+  it('discards the Browser transition when the destination has another mutation owner', async () => {
+    const discardActiveWorkspaceTransition = vi.fn();
+    const setActiveWorkspace = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, previousWorkspaceId: 'workspace-a' })
+      .mockResolvedValueOnce({
+        ok: false,
+        activeWorkspaceId: 'workspace-b',
+        activeWorkspaceMutationToken: 'other_request',
+      });
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+        saveLastConversation: async () => undefined,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrentAfterSwitch: () => false,
+        resolveStaleSwitchDisposition: () => 'rollback',
+        discardActiveWorkspaceTransition,
+      }),
+    ).resolves.toBe(false);
+
+    expect(discardActiveWorkspaceTransition).toHaveBeenCalledOnce();
+    expect(discardActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
   });
 
   it('discards the Browser transition when a rejected rollback reports another authoritative workspace', async () => {
@@ -1794,6 +1927,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b', 'workspace-c'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1804,7 +1938,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).resolves.toBe(false);
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(discardActiveWorkspaceTransition).toHaveBeenCalledOnce();
     expect(discardActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
   });
@@ -1821,6 +1961,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1831,7 +1972,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
       }),
     ).rejects.toThrow('rollback unavailable');
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-a',
+      'workspace-b',
+      'rollback',
+      'browser_request-test',
+    );
     expect(discardActiveWorkspaceTransition).not.toHaveBeenCalled();
   });
 
@@ -1844,6 +1991,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation: async () => undefined,
         setActiveWorkspace,
@@ -1875,6 +2023,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       conversationId: 'chat-b',
       conversationWorkspaceId: 'workspace-b',
       activeWorkspaceId: 'workspace-a',
+      workspaceMutationToken: 'browser_request-test',
       knownWorkspaceIds: ['workspace-a', 'workspace-b'],
       saveLastConversation: async ({ workspaceId, conversationId }) => {
         calls.push(`save:${workspaceId}:${conversationId}`);
@@ -1949,6 +2098,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b-canceled',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation,
         setActiveWorkspace,
@@ -1962,11 +2112,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(saveLastConversation).toHaveBeenNthCalledWith(1, {
       workspaceId: 'workspace-b',
       conversationId: 'chat-b-canceled',
+      mutationToken: 'browser_request-test',
     });
     expect(saveLastConversation).toHaveBeenNthCalledWith(2, {
       workspaceId: 'workspace-b',
       conversationId: 'chat-b-previous',
       expectedCurrentConversationId: 'chat-b-canceled',
+      expectedCurrentMutationToken: 'browser_request-test',
     });
   });
 
@@ -2005,6 +2157,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-b-canceled',
         conversationWorkspaceId: 'workspace-b',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a', 'workspace-b'],
         saveLastConversation,
         setActiveWorkspace: vi.fn(async () => true),
@@ -2018,6 +2171,72 @@ describe('prepareConversationWorkspaceSwitch', () => {
       workspaceId: 'workspace-b',
       conversationId: 'chat-b-previous',
       expectedCurrentConversationId: 'chat-b-canceled',
+      expectedCurrentMutationToken: 'browser_request-test',
+    });
+  });
+
+  it('does not restore destination metadata after its value changes away and back', async () => {
+    let current = true;
+    let lastConversation: string | null = 'chat-b-previous';
+    let lastMutationToken: string | null = null;
+    const saveLastConversation = vi.fn(
+      async ({
+        conversationId,
+        expectedCurrentConversationId,
+        expectedCurrentMutationToken,
+        mutationToken,
+      }: {
+        conversationId: string | null;
+        expectedCurrentConversationId?: string | null;
+        expectedCurrentMutationToken?: string | null;
+        mutationToken?: string;
+      }) => {
+        if (
+          (expectedCurrentConversationId !== undefined && expectedCurrentConversationId !== lastConversation) ||
+          (expectedCurrentMutationToken !== undefined && expectedCurrentMutationToken !== lastMutationToken)
+        ) {
+          return {
+            ok: false,
+            error: 'last-conversation-changed' as const,
+            lastActiveConversationId: lastConversation,
+            lastActiveConversationMutationToken: lastMutationToken,
+          };
+        }
+        const previousConversationId = lastConversation;
+        lastConversation = conversationId;
+        lastMutationToken = mutationToken ?? null;
+        if (expectedCurrentConversationId === undefined) {
+          current = false;
+          lastConversation = 'chat-user-intermediate';
+          lastMutationToken = 'user_first';
+          lastConversation = 'chat-b-canceled';
+          lastMutationToken = 'user_second';
+        }
+        return { ok: true, previousConversationId, lastActiveConversationId: conversationId };
+      },
+    );
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b-canceled',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+        saveLastConversation,
+        setActiveWorkspace: vi.fn(async () => true),
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrent: () => current,
+      }),
+    ).resolves.toBe(false);
+
+    expect(lastConversation).toBe('chat-b-canceled');
+    expect(lastMutationToken).toBe('user_second');
+    expect(saveLastConversation).toHaveBeenLastCalledWith({
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-b-previous',
+      expectedCurrentConversationId: 'chat-b-canceled',
+      expectedCurrentMutationToken: 'browser_request-test',
     });
   });
 
@@ -2029,6 +2248,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         conversationId: 'chat-orphaned',
         conversationWorkspaceId: 'workspace-deleted',
         activeWorkspaceId: 'workspace-a',
+        workspaceMutationToken: 'browser_request-test',
         knownWorkspaceIds: ['workspace-a'],
         saveLastConversation,
         setActiveWorkspace,

@@ -52,17 +52,26 @@ const create = (args: { name: string; directory: string; mutationToken?: string 
   handlers.get('workspaces:create')!(null, args);
 const deleteWorkspace = (id: string, mutationToken?: string) =>
   handlers.get('workspaces:delete')!(null, { id, mutationToken });
-const setActive = (id: string | null, expectedCurrentId?: string | null, mutationToken?: string) =>
-  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId, mutationToken });
+const setActive = (
+  id: string | null,
+  expectedCurrentId?: string | null,
+  mutationToken?: string,
+  expectedCurrentMutationToken?: string | null,
+) =>
+  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId, mutationToken, expectedCurrentMutationToken });
 const saveLastConversation = (
   workspaceId: string,
   conversationId: string | null,
   expectedCurrentConversationId?: string | null,
+  mutationToken?: string,
+  expectedCurrentMutationToken?: string | null,
 ) =>
   handlers.get('workspaces:save-last-conversation')!(null, {
     workspaceId,
     conversationId,
     expectedCurrentConversationId,
+    mutationToken,
+    expectedCurrentMutationToken,
   });
 
 describe('workspaces:create validation', () => {
@@ -178,6 +187,29 @@ describe('workspaces:set-active integrity', () => {
       activeWorkspaceMutationToken: 'local-delete-request',
     });
   });
+
+  it('rejects a rollback after another mutation changes the workspace away and back', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    dirs.add('/work/c');
+    const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+    const third = (await create({ name: 'c', directory: '/work/c' })) as { id: string };
+
+    await setActive(first.id, third.id, 'setup');
+    await setActive(second.id, first.id, 'browser_forward');
+    await setActive(third.id, second.id, 'other_first');
+    await setActive(second.id, third.id, 'other_second');
+
+    await expect(setActive(first.id, second.id, 'browser_forward', 'browser_forward')).resolves.toEqual({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: second.id,
+      activeWorkspaceLastConversationId: null,
+      activeWorkspaceMutationToken: 'other_second',
+    });
+    expect(config.ui.activeWorkspaceId).toBe(second.id);
+  });
 });
 
 describe('workspaces:save-last-conversation integrity', () => {
@@ -221,6 +253,36 @@ describe('workspaces:save-last-conversation integrity', () => {
     await expect(saveLastConversation('missing', 'chat-a')).resolves.toEqual({
       ok: false,
       error: 'workspace-not-found',
+    });
+    expect(sets).toEqual([]);
+  });
+
+  it('restores a Browser cursor only while its mutation token still owns the value', async () => {
+    dirs.add('/work/a');
+    const workspace = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    await saveLastConversation(workspace.id, 'chat-previous');
+    await saveLastConversation(workspace.id, 'chat-browser', 'chat-previous', 'browser_cursor');
+
+    await expect(
+      saveLastConversation(workspace.id, 'chat-previous', 'chat-browser', undefined, 'browser_cursor'),
+    ).resolves.toEqual({
+      ok: true,
+      previousConversationId: 'chat-browser',
+      lastActiveConversationId: 'chat-previous',
+    });
+
+    await saveLastConversation(workspace.id, 'chat-browser', 'chat-previous', 'browser_cursor');
+    await saveLastConversation(workspace.id, 'chat-other', 'chat-browser', 'other_cursor');
+    await saveLastConversation(workspace.id, 'chat-browser', 'chat-other', 'other_cursor');
+    sets.length = 0;
+
+    await expect(
+      saveLastConversation(workspace.id, 'chat-previous', 'chat-browser', undefined, 'browser_cursor'),
+    ).resolves.toEqual({
+      ok: false,
+      error: 'last-conversation-changed',
+      lastActiveConversationId: 'chat-browser',
+      lastActiveConversationMutationToken: 'other_cursor',
     });
     expect(sets).toEqual([]);
   });

@@ -119,7 +119,10 @@ describe('preload bridge contract', () => {
         'onStreamEvent',
       ],
     },
-    { ns: 'conversations', methods: ['list', 'get', 'getForRestore', 'put', 'delete', 'getActiveId', 'setActiveId'] },
+    {
+      ns: 'conversations',
+      methods: ['list', 'get', 'getForRestore', 'put', 'delete', 'getActiveId', 'getActiveState', 'setActiveId'],
+    },
     { ns: 'workspaces', methods: ['create', 'rename', 'delete', 'setActive'] },
     { ns: 'memory', methods: ['clear', 'testEmbedding'] },
     { ns: 'mcp', methods: ['testConnection'] },
@@ -163,6 +166,42 @@ describe('preload bridge contract', () => {
     const payload = { id: 'c1', title: 't' };
     await conversationsNs.put(payload);
     expect(invokeMock).toHaveBeenCalledWith('conversations:put', payload);
+  });
+
+  it('forwards active-selection revision compare-and-set arguments', async () => {
+    invokeMock.mockClear();
+    const conversationsNs = exposedAPI?.conversations as {
+      getActiveState: () => Promise<unknown>;
+      setActiveId: (id: string, expectedId: string, expectedRevision: number) => Promise<unknown>;
+    };
+    await conversationsNs.getActiveState();
+    await conversationsNs.setActiveId('chat-b', 'chat-a', 17);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'conversations:get-active-state');
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'conversations:set-active-id', 'chat-b', 'chat-a', 17);
+  });
+
+  it('forwards workspace mutation provenance arguments intact', async () => {
+    invokeMock.mockClear();
+    const workspacesNs = exposedAPI?.workspaces as {
+      setActive: (args: Record<string, unknown>) => Promise<unknown>;
+      saveLastConversation: (args: Record<string, unknown>) => Promise<unknown>;
+    };
+    const activeArgs = {
+      id: 'workspace-a',
+      expectedCurrentId: 'workspace-b',
+      expectedCurrentMutationToken: 'browser_request-1',
+      mutationToken: 'browser_request-1',
+    };
+    const cursorArgs = {
+      workspaceId: 'workspace-b',
+      conversationId: 'chat-a',
+      expectedCurrentConversationId: 'chat-b',
+      expectedCurrentMutationToken: 'browser_request-1',
+    };
+    await workspacesNs.setActive(activeArgs);
+    await workspacesNs.saveLastConversation(cursorArgs);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'workspaces:set-active', activeArgs);
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'workspaces:save-last-conversation', cursorArgs);
   });
 
   it('agent.getToolApprovalPrivateDetails(...) uses the private approval channel', async () => {
