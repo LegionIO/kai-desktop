@@ -25,9 +25,11 @@ export class BrowserSessionOperationInterruptedError extends Error {
 
 /**
  * Electron Session mutations are not cancellable. Serialize them process-wide
- * per Session, bound the caller wait, and retain the real operation in the
- * queue after a timeout. A later mutation can therefore never be overtaken by
- * an older setProxy/connection/storage completion.
+ * per Session and bound the caller wait. A native operation that already
+ * started remains in the queue after interruption because Electron cannot
+ * cancel it; an operation whose deadline expires while still queued is skipped
+ * when it reaches the head. A later mutation can therefore never be overtaken
+ * by older native work without replaying expired queued mutations.
  */
 export function runBrowserSessionOperation<T>(
   targetSession: Session,
@@ -105,7 +107,7 @@ export function runBrowserSessionOperation<T>(
     timer = setTimeout(() => {
       interrupt(
         new BrowserSessionOperationInterruptedError(`${label} timed out after exceeding its ${timeoutMs} ms deadline.`),
-        false,
+        true,
       );
     }, timeoutMs);
     timer.unref?.();

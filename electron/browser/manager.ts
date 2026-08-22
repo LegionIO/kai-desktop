@@ -1415,6 +1415,11 @@ export class BrowserManager {
   private readonly suspendedScopes = new Set<string>();
   private readonly scopeActivityCounts = new Map<string, number>();
   private readonly scopeIdleWaiters = new Map<string, Set<() => void>>();
+  /** Non-network Browser/profile work. Idle profile teardown must let these
+   * operations finish before stopping workers or resetting shared connections;
+   * network request activity is drained by that teardown itself. */
+  private readonly scopeOperationActivityCounts = new Map<string, number>();
+  private readonly scopeOperationIdleWaiters = new Map<string, Set<() => void>>();
   private readonly scopeGenerations = new Map<string, number>();
   private scopeGenerationSerial = 0;
   private readonly scopeRequestActivities = new Map<string, Map<number, () => void>>();
@@ -2379,25 +2384,14 @@ export class BrowserManager {
     this.stores.delete(scopeKey);
   }
 
-  private store(conversationId: string): BrowserProfileStore {
-    const scopeKey = this.scopeKey(conversationId);
-    this.assertScopeAvailable(scopeKey);
-    return this.storeForScope(scopeKey);
-  }
-
   private vaultForScope(scopeKey: string): BrowserCredentialVault {
     let vault = this.vaults.get(scopeKey);
     if (!vault) {
       vault = new BrowserCredentialVault(scopeKey, this.appHome);
+      vault.setClipboardClearCallback(() => this.releaseScopeRuntimeWhenIdle(scopeKey));
       this.vaults.set(scopeKey, vault);
     }
     return vault;
-  }
-
-  private vault(conversationId: string): BrowserCredentialVault {
-    const scopeKey = this.scopeKey(conversationId);
-    this.assertScopeAvailable(scopeKey);
-    return this.vaultForScope(scopeKey);
   }
 
   private requireLiveWindow(): BrowserWindow {
@@ -2496,16 +2490,30 @@ export class BrowserManager {
     return this.scopeGenerationSerial;
   }
 
-  private beginScopeActivity(scopeKey: string): () => void {
+  private beginScopeActivity(scopeKey: string, kind: 'operation' | 'network' = 'operation'): () => void {
     this.assertScopeAvailable(scopeKey);
     // Any new profile operation cancels a pending last-tab release. The
     // releaser rechecks this token after each Chromium shutdown boundary.
     this.scopeRuntimeReleaseTokens.delete(scopeKey);
     this.scopeActivityCounts.set(scopeKey, (this.scopeActivityCounts.get(scopeKey) ?? 0) + 1);
+    if (kind === 'operation') {
+      this.scopeOperationActivityCounts.set(scopeKey, (this.scopeOperationActivityCounts.get(scopeKey) ?? 0) + 1);
+    }
     let finished = false;
     return () => {
       if (finished) return;
       finished = true;
+      if (kind === 'operation') {
+        const operationsRemaining = (this.scopeOperationActivityCounts.get(scopeKey) ?? 1) - 1;
+        if (operationsRemaining > 0) {
+          this.scopeOperationActivityCounts.set(scopeKey, operationsRemaining);
+        } else {
+          this.scopeOperationActivityCounts.delete(scopeKey);
+          const operationWaiters = this.scopeOperationIdleWaiters.get(scopeKey);
+          this.scopeOperationIdleWaiters.delete(scopeKey);
+          for (const resolve of operationWaiters ?? []) resolve();
+        }
+      }
       const remaining = (this.scopeActivityCounts.get(scopeKey) ?? 1) - 1;
       if (remaining > 0) {
         this.scopeActivityCounts.set(scopeKey, remaining);
@@ -2527,6 +2535,23 @@ export class BrowserManager {
       return result;
     } finally {
       finish();
+      // Profile-only operations can construct a store or credential vault
+      // without ever creating a tab. Reclaim those tabless runtimes after the
+      // operation settles so browsing through many conversation managers does
+      // not retain every profile in the main process. Persistent Session guards
+      // remain wired in releaseScopeRuntimeWhenIdle().
+      this.releaseScopeRuntimeWhenIdle(scopeKey);
+    }
+  }
+
+  private withSynchronousScopeActivity<T>(scopeKey: string, operation: () => T): T {
+    this.assertHostRendererOperationCurrent();
+    const finish = this.beginScopeActivity(scopeKey);
+    try {
+      return operation();
+    } finally {
+      finish();
+      this.releaseScopeRuntimeWhenIdle(scopeKey);
     }
   }
 
@@ -2536,6 +2561,15 @@ export class BrowserManager {
       const waiters = this.scopeIdleWaiters.get(scopeKey) ?? new Set<() => void>();
       waiters.add(resolve);
       this.scopeIdleWaiters.set(scopeKey, waiters);
+    });
+  }
+
+  private waitForScopeOperationsIdle(scopeKey: string): Promise<void> {
+    if (!this.scopeOperationActivityCounts.has(scopeKey)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiters = this.scopeOperationIdleWaiters.get(scopeKey) ?? new Set<() => void>();
+      waiters.add(resolve);
+      this.scopeOperationIdleWaiters.set(scopeKey, waiters);
     });
   }
 
@@ -9473,8 +9507,15 @@ export class BrowserManager {
     }
     this.stores.delete(scopeKey);
     const vault = this.vaults.get(scopeKey);
-    vault?.dispose();
-    this.vaults.delete(scopeKey);
+    // A password copied moments before the last tab/profile operation ended
+    // must remain pasteable for its documented 30-second lifetime. The vault's
+    // own timer retains only that bounded object and clears the plaintext;
+    // destructive teardown still disposes it immediately.
+    const retainClipboardLease = preserveSessionGuards && vault?.hasPendingClipboardClear?.() === true;
+    if (!retainClipboardLease) {
+      vault?.dispose();
+      this.vaults.delete(scopeKey);
+    }
     // Persistent service workers can restart after every currently running
     // version was stopped. Idle release may discard Kai metadata/vault state,
     // but must retain the Session request guard and its durable AI provenance.
@@ -9484,6 +9525,8 @@ export class BrowserManager {
     }
     this.scopeActivityCounts.delete(scopeKey);
     this.scopeIdleWaiters.delete(scopeKey);
+    this.scopeOperationActivityCounts.delete(scopeKey);
+    this.scopeOperationIdleWaiters.delete(scopeKey);
     this.scopeGenerations.delete(scopeKey);
     this.scopeRequestActivities.delete(scopeKey);
     this.scopeRuntimeReleaseTokens.delete(scopeKey);
@@ -9492,6 +9535,10 @@ export class BrowserManager {
 
   private releaseScopeRuntimeWhenIdle(scopeKey: string): void {
     if ([...this.tabs.values()].some((tab) => tab.scopeKey === scopeKey)) return;
+    // One release owns the profile until it completes or a newly admitted
+    // operation invalidates its token. Coalescing avoids spawning duplicate
+    // service-worker CDP targets and connection resets for paired UI reads.
+    if (this.scopeRuntimeReleaseTokens.has(scopeKey)) return;
     const token = {};
     this.scopeRuntimeReleaseTokens.set(scopeKey, token);
     const remainsReleasable = (): boolean => {
@@ -9512,6 +9559,12 @@ export class BrowserManager {
     };
     void (async () => {
       try {
+        if (!remainsReleasable()) return;
+        // Metadata/native operations can overlap a caller that just released
+        // its own lease. Wait for all non-network work before changing the
+        // Session. Network requests intentionally remain active until worker
+        // shutdown and connection reset below terminate them.
+        await this.waitForScopeOperationsIdle(scopeKey);
         if (!remainsReleasable()) return;
         const scopedSession = this.wiredSessionsByScope.get(scopeKey);
         if (scopedSession) {
@@ -9942,7 +9995,7 @@ export class BrowserManager {
       }
       if (!requests.has(details.id)) {
         try {
-          requests.set(details.id, this.beginScopeActivity(scopeKey));
+          requests.set(details.id, this.beginScopeActivity(scopeKey, 'network'));
         } catch {
           if (requests.size === 0) this.scopeRequestActivities.delete(scopeKey);
           callback({ cancel: true });
@@ -10276,8 +10329,11 @@ export class BrowserManager {
           matchedTrustedChromeNavigation =
             tab.trustedUserNavigationRequestId !== null &&
             isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, downloadUrl);
+          const trustedNavigationRequest = matchedTrustedChromeNavigation
+            ? this.trustedUserNavigationRequest(tab, downloadUrl)
+            : null;
           trustedChromeNavigation =
-            matchedTrustedChromeNavigation &&
+            trustedNavigationRequest?.requestId === tab.trustedUserNavigationRequestId &&
             tab.trustedUserNavigationPanelGeneration !== null &&
             this.hasBrowserNativeDialogAuthority(tab, contents, tab.trustedUserNavigationPanelGeneration);
           const contextMenuAuthority = this.consumeContextMenuDownloadAuthority(tab, contents, downloadUrl);
@@ -11328,7 +11384,7 @@ export class BrowserManager {
     const tab = tabId ? this.tabs.get(tabId) : undefined;
     if (this.validatingProxy?.isAuthenticationChallenge(authInfo)) {
       event.preventDefault();
-      const trustedUserNavigationAuth = tab ? this.trustedUserNavigationAuthRequest(tab, details.url) : false;
+      const trustedUserNavigationAuth = tab ? this.trustedUserNavigationRequest(tab, details.url) : false;
       // Proxy credentials are one-shot connection capabilities. A restricted
       // credential marks the exact request, while BrowserValidatingProxy also
       // elevates every same-host connection for the restriction's lifetime so
@@ -11342,7 +11398,7 @@ export class BrowserManager {
     const upstreamProxyAuthentication = this.validatingProxy?.isUpstreamAuthenticationChallenge(authInfo) === true;
     if (!tab) return;
     event.preventDefault();
-    const trustedUserNavigationAuth = this.trustedUserNavigationAuthRequest(tab, details.url);
+    const trustedUserNavigationAuth = this.trustedUserNavigationRequest(tab, details.url);
     if (tab.aiNetworkRestricted && !trustedUserNavigationAuth && !upstreamProxyAuthentication) {
       // HTTP-auth callbacks block navigation itself. Assistant-controlled loads
       // must terminate without waiting for Browser chrome to mount; the user can
@@ -11405,12 +11461,12 @@ export class BrowserManager {
     });
   };
 
-  /** Electron's app-level login event exposes a WebContents and URL but not the
-   * network request id. Admit the ordinary user-auth prompt only when the exact
-   * request claimed by Browser chrome is still the sole active request for that
-   * URL and is still a main-frame navigation. A delayed fetch from the previous
-   * document to the same URL therefore cannot inherit the user's credentials. */
-  private trustedUserNavigationAuthRequest(
+  /** Electron's app-level login and will-download events expose a WebContents
+   * and URL but not the originating network request id. Admit native UI only
+   * when the exact request claimed by Browser chrome is still the sole active
+   * request for that URL and is still a main-frame navigation. A page fetch to
+   * the same URL therefore cannot inherit the user's authority. */
+  private trustedUserNavigationRequest(
     tab: InternalTab,
     challengedUrl: string,
   ): { requestId: number; url: string } | null {
@@ -14655,37 +14711,52 @@ export class BrowserManager {
   }
 
   listHistory(conversationId: string, query?: string): BrowserHistoryEntry[] {
-    return this.store(conversationId).listHistory(query);
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => this.storeForScope(scopeKey).listHistory(query));
   }
 
   clearHistory(conversationId: string): Promise<void> {
-    return this.store(conversationId).clearHistory();
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withScopeActivity(scopeKey, () => this.storeForScope(scopeKey).clearHistory());
   }
 
   listBookmarks(conversationId: string, query?: string): BrowserBookmark[] {
-    return this.store(conversationId).listBookmarks(query);
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => this.storeForScope(scopeKey).listBookmarks(query));
   }
 
   addBookmark(conversationId: string, title: string, url: string, folder?: string): BrowserBookmark {
-    const bookmark = this.store(conversationId).addBookmark(title, url, folder);
-    this.emitBookmarksForScope(conversationId);
-    return bookmark;
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => {
+      const bookmark = this.storeForScope(scopeKey).addBookmark(title, url, folder);
+      this.emitBookmarksForScope(conversationId);
+      return bookmark;
+    });
   }
 
   updateBookmark(conversationId: string, bookmark: BrowserBookmark): BrowserBookmark {
-    const updated = this.store(conversationId).updateBookmark(bookmark);
-    this.emitBookmarksForScope(conversationId);
-    return updated;
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => {
+      const updated = this.storeForScope(scopeKey).updateBookmark(bookmark);
+      this.emitBookmarksForScope(conversationId);
+      return updated;
+    });
   }
 
   removeBookmark(conversationId: string, id: string): void {
-    this.store(conversationId).removeBookmark(id);
-    this.emitBookmarksForScope(conversationId);
+    const scopeKey = this.scopeKey(conversationId);
+    this.withSynchronousScopeActivity(scopeKey, () => {
+      this.storeForScope(scopeKey).removeBookmark(id);
+      this.emitBookmarksForScope(conversationId);
+    });
   }
 
   reorderBookmarks(conversationId: string, ids: string[]): void {
-    this.store(conversationId).reorderBookmarks(ids);
-    this.emitBookmarksForScope(conversationId);
+    const scopeKey = this.scopeKey(conversationId);
+    this.withSynchronousScopeActivity(scopeKey, () => {
+      this.storeForScope(scopeKey).reorderBookmarks(ids);
+      this.emitBookmarksForScope(conversationId);
+    });
   }
 
   async importBookmarks(conversationId: string): Promise<{ imported: number; canceled?: boolean }> {
@@ -14732,7 +14803,8 @@ export class BrowserManager {
   }
 
   listDownloads(conversationId: string): BrowserDownload[] {
-    return this.store(conversationId).listDownloads();
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => this.storeForScope(scopeKey).listDownloads());
   }
 
   private cacheDownload(scopeKey: string, download: BrowserDownload): void {
@@ -15010,13 +15082,14 @@ export class BrowserManager {
 
   showDownload(conversationId: string, downloadId: string): void {
     const scopeKey = this.scopeKey(conversationId);
-    this.assertScopeAvailable(scopeKey);
-    const download = this.requireDownloadForScope(scopeKey, downloadId);
-    if (!download.path) throw new Error('The downloaded file is unavailable because no saved path was recorded.');
-    if (download.quarantined) {
-      throw new Error('Assistant downloads must be explicitly exported before they can be opened.');
-    }
-    shell.showItemInFolder(download.path);
+    this.withSynchronousScopeActivity(scopeKey, () => {
+      const download = this.requireDownloadForScope(scopeKey, downloadId);
+      if (!download.path) throw new Error('The downloaded file is unavailable because no saved path was recorded.');
+      if (download.quarantined) {
+        throw new Error('Assistant downloads must be explicitly exported before they can be opened.');
+      }
+      shell.showItemInFolder(download.path);
+    });
   }
 
   async exportDownload(conversationId: string, downloadId: string): Promise<{ canceled?: boolean; filePath?: string }> {
@@ -15114,28 +15187,34 @@ export class BrowserManager {
 
   listSitePermissions(conversationId: string, origin: string): BrowserSitePermission[] {
     if (!isPersistentBrowserPermissionOrigin(origin)) return [];
-    return this.store(conversationId)
-      .listPermissions(origin)
-      .filter((permission) => !permission.permission.startsWith('fileSystem:'));
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () =>
+      this.storeForScope(scopeKey)
+        .listPermissions(origin)
+        .filter((permission) => !permission.permission.startsWith('fileSystem:')),
+    );
   }
 
   resetSitePermissions(conversationId: string, origin: string, permission?: string): void {
     if (!isPersistentBrowserPermissionOrigin(origin)) throw new Error('Site permissions require an HTTP(S) origin.');
     const scopeKey = this.scopeKey(conversationId);
-    this.store(conversationId).clearPermissions(origin, permission);
-    for (const tab of this.tabs.values()) {
-      if (tab.scopeKey !== scopeKey) continue;
-      const prefix = `${tab.shell.id}\u0000${origin}\u0000`;
-      for (const key of this.oneTimePermissions) {
-        if (key.startsWith(prefix) && (permission === undefined || key === `${prefix}${permission}`)) {
-          this.oneTimePermissions.delete(key);
+    this.withSynchronousScopeActivity(scopeKey, () => {
+      this.storeForScope(scopeKey).clearPermissions(origin, permission);
+      for (const tab of this.tabs.values()) {
+        if (tab.scopeKey !== scopeKey) continue;
+        const prefix = `${tab.shell.id}\u0000${origin}\u0000`;
+        for (const key of this.oneTimePermissions) {
+          if (key.startsWith(prefix) && (permission === undefined || key === `${prefix}${permission}`)) {
+            this.oneTimePermissions.delete(key);
+          }
         }
       }
-    }
+    });
   }
 
   listCredentials(conversationId: string, query?: string) {
-    return this.vault(conversationId).list(query);
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withSynchronousScopeActivity(scopeKey, () => this.vaultForScope(scopeKey).list(query));
   }
 
   async saveCredential(conversationId: string, origin: string, username: string, password: string): Promise<void> {
@@ -15349,7 +15428,7 @@ export class BrowserManager {
           tab.trustedUserNavigationLease !== pending.trustedUserNavigationLease ||
           pending.trustedUserNavigationRequestId === undefined ||
           pending.trustedUserNavigationUrl === undefined ||
-          this.trustedUserNavigationAuthRequest(tab, pending.trustedUserNavigationUrl)?.requestId !==
+          this.trustedUserNavigationRequest(tab, pending.trustedUserNavigationUrl)?.requestId !==
             pending.trustedUserNavigationRequestId))
     ) {
       this.finishPendingAuth(id);
@@ -16545,6 +16624,8 @@ export class BrowserManager {
     this.activeDownloads.clear();
     this.removedConversations.clear();
     this.scopeGenerations.clear();
+    this.scopeOperationActivityCounts.clear();
+    this.scopeOperationIdleWaiters.clear();
     this.pendingSessionMutationScopes?.clear();
     this.scopeRuntimeReleaseTokens.clear();
     this.pendingAssistantTabClosures.clear();

@@ -30,6 +30,7 @@ const clipboardPasswordOwners = new WeakMap<ClipboardAdapter, symbol>();
 export const MAX_BROWSER_CREDENTIALS = 1_000;
 export const MAX_CREDENTIAL_VAULT_BYTES = 32 * 1024 * 1024;
 export const BROWSER_CREDENTIAL_AUTHENTICATION_TIMEOUT_MS = 30_000;
+const BROWSER_CREDENTIAL_CLIPBOARD_CLEAR_MS = 30_000;
 
 export class BrowserCredentialAuthenticationInterruptedError extends Error {
   constructor(message: string) {
@@ -161,6 +162,7 @@ export class BrowserCredentialVault {
   private copiedPassword: string | null = null;
   private clipboardOwnershipToken: symbol | null = null;
   private clipboardClearTimer: ReturnType<typeof setTimeout> | null = null;
+  private clipboardClearCallback: (() => void) | null = null;
 
   constructor(
     private readonly scopeKey: string,
@@ -429,8 +431,19 @@ export class BrowserCredentialVault {
     this.copiedPassword = value;
     this.clipboardOwnershipToken = ownershipToken;
     clipboardPasswordOwners.set(this.clipboardApi, ownershipToken);
-    this.clipboardClearTimer = setTimeout(() => this.clearCopiedPassword(), 30_000);
+    this.clipboardClearTimer = setTimeout(() => {
+      this.clearCopiedPassword();
+      this.clipboardClearCallback?.();
+    }, BROWSER_CREDENTIAL_CLIPBOARD_CLEAR_MS);
     this.clipboardClearTimer.unref?.();
+  }
+
+  hasPendingClipboardClear(): boolean {
+    return this.clipboardClearTimer !== null && this.copiedPassword !== null;
+  }
+
+  setClipboardClearCallback(callback: () => void): void {
+    this.clipboardClearCallback = callback;
   }
 
   private clearCopiedPassword(): void {
@@ -478,6 +491,7 @@ export class BrowserCredentialVault {
 
   dispose(): void {
     this.clearCopiedPassword();
+    this.clipboardClearCallback = null;
   }
 }
 

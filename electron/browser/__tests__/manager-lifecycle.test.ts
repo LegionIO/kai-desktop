@@ -150,6 +150,8 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       scopeGenerations: new Map(),
       scopeGenerationSerial: 0,
       scopeIdleWaiters: new Map(),
+      scopeOperationActivityCounts: new Map(),
+      scopeOperationIdleWaiters: new Map(),
       scopeRequestActivities: new Map(),
       scopeRuntimeReleaseTokens: new Map(),
       stores: new Map(),
@@ -11626,6 +11628,8 @@ describe('browser manager renderer lifecycle', () => {
     };
     const tab = {
       scopeKey: 'global',
+      activeNetworkRequests: new Map([[7, 'mainFrame']]),
+      activeNetworkRequestUrls: new Map([[7, 'https://example.com/report.pdf']]),
       popupGesture: null,
       trustedUserNavigation: true,
       trustedUserNavigationTarget: 'https://example.com/report.pdf',
@@ -11718,6 +11722,26 @@ describe('browser manager renderer lifecycle', () => {
     willDownload?.({}, mismatchedItem, { id: 42 });
     expect(mismatchedItem.cancel).toHaveBeenCalledOnce();
     expect(tab.trustedUserNavigation).toBe(true);
+
+    tab.activeNetworkRequests.set(8, 'xhr');
+    tab.activeNetworkRequestUrls.set(8, 'https://example.com/report.pdf');
+    const ambiguousSameUrlItem = {
+      getURL: () => 'https://example.com/report.pdf',
+      cancel: vi.fn(),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, ambiguousSameUrlItem, { id: 42 });
+    expect(ambiguousSameUrlItem.cancel).toHaveBeenCalledOnce();
+    expect(ambiguousSameUrlItem.setSaveDialogOptions).not.toHaveBeenCalled();
+    expect(tab.trustedUserNavigation).toBe(false);
+
+    tab.activeNetworkRequests.delete(8);
+    tab.activeNetworkRequestUrls.delete(8);
+    tab.trustedUserNavigation = true;
+    tab.trustedUserNavigationTarget = 'https://example.com/report.pdf';
+    tab.trustedUserNavigationRequestId = 7;
+    tab.trustedUserNavigationPanelGeneration = 0;
 
     willDownload?.({}, item, { id: 42 });
     expect(item.setSaveDialogOptions).toHaveBeenCalledWith({ defaultPath: '/tmp/downloads/report.pdf' });
@@ -20245,6 +20269,7 @@ describe('browser manager renderer lifecycle', () => {
     const stopRunningServiceWorkers = vi.fn(async () => undefined);
     const closeAllConnections = vi.fn(async () => undefined);
     const waitForScopeIdle = vi.fn(async () => undefined);
+    const waitForScopeOperationsIdle = vi.fn(async () => undefined);
     const scopedSession = { closeAllConnections };
     const manager = managerWithoutConstructor({
       attachActiveView: vi.fn(),
@@ -20257,6 +20282,7 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([[tab.shell.id, tab]]),
       wiredSessionsByScope: new Map([[scopeKey, scopedSession]]),
       waitForScopeIdle,
+      waitForScopeOperationsIdle,
     });
 
     invokePrivate(manager, 'closeTab', tab, false, false);
@@ -20265,12 +20291,46 @@ describe('browser manager renderer lifecycle', () => {
     await vi.waitFor(() => expect(releaseScopeRuntime).toHaveBeenCalledOnce());
     expect(stopRunningServiceWorkers).toHaveBeenCalledWith(scopedSession, undefined, true);
     expect(closeAllConnections).toHaveBeenCalledOnce();
+    expect(waitForScopeOperationsIdle.mock.invocationCallOrder[0]).toBeLessThan(
+      stopRunningServiceWorkers.mock.invocationCallOrder[0],
+    );
     expect(stopRunningServiceWorkers.mock.invocationCallOrder[0]).toBeLessThan(
       waitForScopeIdle.mock.invocationCallOrder[0],
     );
     expect(flush).toHaveBeenCalledOnce();
     expect(flush.mock.invocationCallOrder[0]).toBeLessThan(releaseScopeRuntime.mock.invocationCallOrder[0]);
     expect(releaseScopeRuntime).toHaveBeenCalledWith(scopeKey, true);
+  });
+
+  it('coalesces idle release requests and waits for profile operations before Session teardown', async () => {
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    const operationGate = deferred<void>();
+    const stopRunningServiceWorkers = vi.fn(async () => undefined);
+    const closeAllConnections = vi.fn(async () => undefined);
+    const releaseScopeRuntime = vi.fn();
+    const waitForScopeOperationsIdle = vi.fn(() => operationGate.promise);
+    const manager = managerWithoutConstructor({
+      getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
+      releaseScopeRuntime,
+      stopRunningServiceWorkers,
+      tabs: new Map(),
+      waitForScopeOperationsIdle,
+      wiredSessionsByScope: new Map([[scopeKey, { closeAllConnections }]]),
+    });
+
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+    invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+
+    await Promise.resolve();
+    expect(waitForScopeOperationsIdle).toHaveBeenCalledOnce();
+    expect(stopRunningServiceWorkers).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'scopeRuntimeReleaseTokens')).toHaveLength(1);
+
+    operationGate.resolve();
+
+    await vi.waitFor(() => expect(releaseScopeRuntime).toHaveBeenCalledOnce());
+    expect(stopRunningServiceWorkers).toHaveBeenCalledOnce();
+    expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
   it('retains persistent-session request guards when releasing the last idle tab', () => {
@@ -20306,6 +20366,74 @@ describe('browser manager renderer lifecycle', () => {
     expect((Reflect.get(manager, 'stores') as Map<string, unknown>).has(scopeKey)).toBe(false);
   });
 
+  it('flushes and releases tabless metadata-only profile runtimes after synchronous reads', async () => {
+    const scopeKey = 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa';
+    const flush = vi.fn(async () => undefined);
+    const disposeVault = vi.fn();
+    const cleanupSession = vi.fn();
+    const closeAllConnections = vi.fn(async () => undefined);
+    const scopedSession = { closeAllConnections };
+    const store = {
+      flush,
+      listBookmarks: vi.fn(() => []),
+    };
+    const vault = {
+      dispose: disposeVault,
+      list: vi.fn(() => []),
+    };
+    const stores = new Map([[scopeKey, store]]);
+    const vaults = new Map([[scopeKey, vault]]);
+    const wiredSessionsByScope = new Map([[scopeKey, scopedSession]]);
+    const wiredSessionCleanups = new Map([[scopeKey, cleanupSession]]);
+    const restrictedBackgroundScopes = new Set([scopeKey]);
+    const manager = managerWithoutConstructor({
+      dataScope: 'conversation',
+      getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
+      restrictedBackgroundScopes,
+      scopeKey: vi.fn(() => scopeKey),
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      stores,
+      tabs: new Map(),
+      vaults,
+      wiredSessionCleanups,
+      wiredSessionsByScope,
+    });
+
+    expect(manager.listBookmarks('chat-1')).toEqual([]);
+    expect(manager.listCredentials('chat-1')).toEqual([]);
+
+    await vi.waitFor(() => expect(stores.has(scopeKey)).toBe(false));
+    expect(flush).toHaveBeenCalledOnce();
+    expect(disposeVault).toHaveBeenCalledOnce();
+    expect(closeAllConnections).toHaveBeenCalledOnce();
+    expect(wiredSessionsByScope.get(scopeKey)).toBe(scopedSession);
+    expect(wiredSessionCleanups.get(scopeKey)).toBe(cleanupSession);
+    expect(restrictedBackgroundScopes.has(scopeKey)).toBe(true);
+  });
+
+  it('retains a tabless vault only while its copied-password clipboard lease is active', () => {
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    let clipboardLeaseActive = true;
+    const dispose = vi.fn();
+    const vault = {
+      dispose,
+      hasPendingClipboardClear: () => clipboardLeaseActive,
+    };
+    const vaults = new Map([[scopeKey, vault]]);
+    const manager = managerWithoutConstructor({ tabs: new Map(), vaults });
+
+    invokePrivate(manager, 'releaseScopeRuntime', scopeKey, true);
+
+    expect(vaults.get(scopeKey)).toBe(vault);
+    expect(dispose).not.toHaveBeenCalled();
+
+    clipboardLeaseActive = false;
+    invokePrivate(manager, 'releaseScopeRuntime', scopeKey, true);
+
+    expect(vaults.has(scopeKey)).toBe(false);
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
   it('hydrates pending-clear quarantine before any profile API wires a Session', () => {
     const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-startup-quarantine-'));
     markPendingBrowserCleanupScopeKey(appHome, 'global');
@@ -20328,7 +20456,7 @@ describe('browser manager renderer lifecycle', () => {
     );
     try {
       expect((Reflect.get(manager, 'clearQuarantinedScopes') as Set<string>).has('global')).toBe(true);
-      expect(() => invokePrivate(manager, 'store', 'chat-before-view')).toThrow(/quarantined/i);
+      expect(() => manager.listHistory('chat-before-view')).toThrow(/quarantined/i);
       expect((Reflect.get(manager, 'stores') as Map<string, unknown>).size).toBe(0);
     } finally {
       manager.dispose();

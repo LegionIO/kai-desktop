@@ -260,13 +260,19 @@ describe('BrowserCredentialVault', () => {
   it('requires authentication for reveal/copy and clears an unchanged clipboard', async () => {
     vi.useFakeTimers();
     const { vault, authenticate, clipboardValue } = setup();
+    const onClipboardCleared = vi.fn();
+    vault.setClipboardClearCallback(onClipboardCleared);
     const created = vault.upsert('https://example.com', 'user', 'secret');
     await expect(vault.reveal(created.id)).resolves.toBe('secret');
     await vault.copy(created.id);
     expect(authenticate).toHaveBeenCalledTimes(2);
     expect(clipboardValue()).toBe('secret');
+    expect(vault.hasPendingClipboardClear()).toBe(true);
+    expect(onClipboardCleared).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(clipboardValue()).toBe('');
+    expect(vault.hasPendingClipboardClear()).toBe(false);
+    expect(onClipboardCleared).toHaveBeenCalledOnce();
   });
 
   it('does not copy a password after renderer authority expires during authentication', async () => {

@@ -267,21 +267,19 @@ describe('Browser validating proxy', () => {
         await timedOut;
 
         const retry = proxy.configureSession(session);
-        const retryTimedOut = expect(retry).rejects.toThrow(/timed out/i);
-        await vi.advanceTimersByTimeAsync(25);
-        await retryTimedOut;
+        expect(retry).toBe(first);
+        await expect(retry).rejects.toThrow(/timed out/i);
         expect(setProxy).toHaveBeenCalledTimes(1);
         expect(closeAllConnections).toHaveBeenCalledTimes(stalledOperation === 'setProxy' ? 0 : 1);
 
         releaseStalled();
         await vi.advanceTimersByTimeAsync(0);
         await expect(proxy.configureSession(session)).resolves.toBeUndefined();
-        // Both callers already admitted their serialized transactions before
-        // their public deadlines expired. They must finish in order after the
-        // native stall clears; the final call then establishes a cached,
-        // observed-successful configuration.
-        expect(setProxy).toHaveBeenCalledTimes(3);
-        expect(closeAllConnections).toHaveBeenCalledTimes(3);
+        // The failed attempt remains the single retry sentinel until its real
+        // native queue node settles. Recovery performs one fresh configuration
+        // instead of replaying every caller that arrived during the stall.
+        expect(setProxy).toHaveBeenCalledTimes(2);
+        expect(closeAllConnections).toHaveBeenCalledTimes(2);
       } finally {
         vi.useRealTimers();
       }
@@ -363,10 +361,12 @@ describe('Browser validating proxy', () => {
       await firstTimedOut;
 
       const retry = proxy.configureSession(session);
-      await vi.advanceTimersByTimeAsync(0);
+      expect(retry).toBe(first);
+      await expect(retry).rejects.toThrow(/configuration timed out/i);
       expect(events).toEqual(['set']);
       releaseStaleReset();
-      await expect(retry).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(proxy.configureSession(session)).resolves.toBeUndefined();
 
       expect(events).toEqual(['set', 'stale reset', 'set', 'current reset']);
     } finally {

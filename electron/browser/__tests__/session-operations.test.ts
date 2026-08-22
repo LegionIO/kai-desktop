@@ -83,4 +83,35 @@ describe('Browser Session operations', () => {
     expect(queuedMutation).not.toHaveBeenCalled();
     expect(lateSettlement).toHaveBeenCalledOnce();
   });
+
+  it('expires a timed-out queued mutation without replaying it after the queue recovers', async () => {
+    vi.useFakeTimers();
+    try {
+      const firstGate = deferred<void>();
+      const targetSession = {} as never;
+      const first = runBrowserSessionOperation(targetSession, 'first mutation', () => firstGate.promise, {
+        timeoutMs: 100,
+      });
+      const queuedMutation = vi.fn(async () => undefined);
+      const lateSettlement = vi.fn();
+      const second = runBrowserSessionOperation(targetSession, 'queued mutation', queuedMutation, {
+        timeoutMs: 25,
+        onSettledAfterInterruption: lateSettlement,
+      });
+
+      const secondRejected = expect(second).rejects.toBeInstanceOf(BrowserSessionOperationInterruptedError);
+      await vi.advanceTimersByTimeAsync(25);
+      await secondRejected;
+      expect(queuedMutation).not.toHaveBeenCalled();
+
+      firstGate.resolve();
+      await first;
+      await waitForBrowserSessionOperations(targetSession);
+
+      expect(queuedMutation).not.toHaveBeenCalled();
+      expect(lateSettlement).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

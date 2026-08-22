@@ -12,7 +12,7 @@ import { Agent as HttpsAgent, request as requestHttps } from 'node:https';
 import { connect, isIP, type Socket } from 'node:net';
 import { connect as connectTls } from 'node:tls';
 import type { AuthInfo, Session } from 'electron';
-import { runBrowserSessionOperation } from './session-operations.js';
+import { runBrowserSessionOperation, waitForBrowserSessionOperations } from './session-operations.js';
 import { isPrivateResolvedAddress } from './session.js';
 
 type ResolvedEndpoint = { address: string; family: 4 | 6 };
@@ -434,10 +434,13 @@ export class BrowserValidatingProxy {
     // Cache only a successful configuration (or its in-flight attempt). A
     // transient listener/session failure must not poison this profile forever;
     // later callers retry while concurrent callers still share one attempt.
-    void configured.catch(() => {
-      if (this.configuredSessions.get(session) === entry) {
-        this.configuredSessions.delete(session);
-      }
+    void configured.catch(async () => {
+      // Keep the rejected attempt as a retry sentinel until its real queue node
+      // has settled. Otherwise repeated request admission can enqueue one
+      // already-expired setProxy transaction per public deadline behind a
+      // stalled native operation and replay them all when Chromium recovers.
+      await waitForBrowserSessionOperations(session);
+      if (this.configuredSessions.get(session) === entry) this.configuredSessions.delete(session);
     });
     return configured;
   }
