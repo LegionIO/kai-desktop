@@ -65,6 +65,10 @@ export type BrowserWorkspaceTransitionMarker = {
   navigationGeneration: number;
   browserAttentionGeneration: number;
   workspaceSelectionGeneration: number;
+  /** A newer Browser request inherited this already-committed workspace
+   * mutation. The workspace cursor must advance, but restoring the arriving
+   * workspace's saved chat would invalidate that newer request. */
+  suppressArrivingWorkspaceRestoration?: boolean;
   operation: 'navigate' | 'rollback';
   departingWorkspaceId: string | null;
   destinationWorkspaceId: string | null;
@@ -115,6 +119,7 @@ export function adoptBrowserWorkspaceTransitionMarker(options: {
     ...marker,
     navigationGeneration: options.navigationGeneration,
     browserAttentionGeneration: options.browserAttentionGeneration,
+    suppressArrivingWorkspaceRestoration: true,
   };
 }
 
@@ -132,6 +137,7 @@ export function resolveConversationWorkspaceTransition(options: {
   currentWorkspaceSelectionGeneration: number;
 }): {
   staleBrowserTransition: boolean;
+  suppressArrivingWorkspaceRestoration: boolean;
   departingWorkspaceId: string | null;
   departingConversationId: string | null;
   nextPreviousWorkspaceId: string | null;
@@ -151,8 +157,15 @@ export function resolveConversationWorkspaceTransition(options: {
     // while the newer request is still loading its conversation record.
     options.browserTransition.browserAttentionGeneration >= options.currentBrowserAttentionGeneration &&
     options.browserTransition.workspaceSelectionGeneration === options.currentWorkspaceSelectionGeneration;
+  const suppressArrivingWorkspaceRestoration =
+    staleBrowserTransition ||
+    (markerDescribesTransition &&
+      options.browserTransition?.operation === 'navigate' &&
+      (options.browserTransition.suppressArrivingWorkspaceRestoration === true ||
+        options.browserTransition.browserAttentionGeneration < options.currentBrowserAttentionGeneration));
   return {
     staleBrowserTransition,
+    suppressArrivingWorkspaceRestoration,
     departingWorkspaceId: markerDescribesTransition
       ? (options.browserTransition?.departingWorkspaceId ?? null)
       : options.previousWorkspaceId,
@@ -183,6 +196,23 @@ export function isConversationWorkspaceRestorationCurrent(options: {
     options.currentSelectionSequence === options.selectionSequence &&
     options.currentSelection === options.selectionWhenStarted
   );
+}
+
+/** A strict read can fail after the backend selection CAS has already
+ * succeeded. Restore the prior backend selection only while this restoration
+ * still owns the renderer intent, and use a CAS so a newer selection wins. */
+export async function rollbackUnavailableWorkspaceRestoration(options: {
+  restoredConversationId: string;
+  previousConversationId: string | null;
+  isCurrent: () => boolean;
+  setActiveId: (
+    conversationId: string | null,
+    expectedCurrentConversationId: string | null,
+  ) => Promise<{ ok: boolean }>;
+}): Promise<boolean> {
+  if (!options.isCurrent()) return false;
+  const result = await options.setActiveId(options.previousConversationId, options.restoredConversationId);
+  return result.ok && options.isCurrent();
 }
 
 type ConversationFallbackCandidate = {

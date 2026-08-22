@@ -14,6 +14,7 @@ describe('WorkspaceSelector', () => {
         activeWorkspaceId={null}
         activeWorkspace={null}
         onWorkspaceNavigationIntent={() => undefined}
+        onWorkspaceNavigationFailure={() => undefined}
       />,
     );
 
@@ -43,6 +44,7 @@ describe('WorkspaceSelector', () => {
         activeWorkspaceId={workspace.id}
         activeWorkspace={workspace}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        onWorkspaceNavigationFailure={() => undefined}
       />,
     );
 
@@ -51,5 +53,50 @@ describe('WorkspaceSelector', () => {
 
     expect(onWorkspaceNavigationIntent).not.toHaveBeenCalled();
     expect(setActive).not.toHaveBeenCalled();
+  });
+
+  it('requests restoration retry when a workspace selection loses its CAS', async () => {
+    const user = userEvent.setup();
+    const setActive = vi.fn(async () => ({
+      ok: false,
+      error: 'active-workspace-changed' as const,
+      activeWorkspaceId: 'workspace-a',
+    }));
+    installAppBridgeStub({ workspaces: { setActive } });
+    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationFailure = vi.fn();
+    const workspaceA = {
+      id: 'workspace-a',
+      name: 'Workspace A',
+      directory: '/work/a',
+      color: '#123456',
+      lastActiveAt: 2,
+      createdAt: 1,
+      lastActiveConversationId: 'chat-a',
+    };
+    const workspaceB = {
+      ...workspaceA,
+      id: 'workspace-b',
+      name: 'Workspace B',
+      directory: '/work/b',
+      lastActiveAt: 1,
+    };
+
+    render(
+      <WorkspaceSelector
+        workspaces={[workspaceA, workspaceB]}
+        activeWorkspaceId={workspaceA.id}
+        activeWorkspace={workspaceA}
+        onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /workspace a/i }));
+    await user.click(await screen.findByRole('menuitem', { name: /workspace b/i }));
+
+    expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
+    expect(setActive).toHaveBeenCalledWith({ id: 'workspace-b', expectedCurrentId: 'workspace-a' });
+    expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith('workspace-a');
   });
 });

@@ -16,6 +16,7 @@ import {
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
   resolveConversationWorkspaceTransition,
+  rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
@@ -66,6 +67,7 @@ describe('resolveConversationWorkspaceTransition', () => {
 
     expect(stale).toEqual({
       staleBrowserTransition: true,
+      suppressArrivingWorkspaceRestoration: true,
       departingWorkspaceId: 'workspace-a',
       departingConversationId: 'chat-a',
       nextPreviousWorkspaceId: 'workspace-a',
@@ -81,6 +83,7 @@ describe('resolveConversationWorkspaceTransition', () => {
     });
     expect(next).toEqual({
       staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: false,
       departingWorkspaceId: 'workspace-a',
       departingConversationId: 'chat-b',
       nextPreviousWorkspaceId: 'workspace-c',
@@ -118,6 +121,7 @@ describe('resolveConversationWorkspaceTransition', () => {
       }),
     ).toEqual({
       staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: true,
       departingWorkspaceId: 'workspace-a',
       departingConversationId: 'chat-a',
       nextPreviousWorkspaceId: 'workspace-b',
@@ -145,6 +149,7 @@ describe('resolveConversationWorkspaceTransition', () => {
       }),
     ).toEqual({
       staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: true,
       departingWorkspaceId: 'workspace-a',
       departingConversationId: 'chat-a',
       nextPreviousWorkspaceId: 'workspace-b',
@@ -197,6 +202,38 @@ describe('resolveConversationWorkspaceTransition', () => {
         departingConversationId: 'chat-b',
       }),
     ).toBeUndefined();
+  });
+});
+
+describe('rollbackUnavailableWorkspaceRestoration', () => {
+  it('CAS-restores the prior backend selection while the restoration still owns navigation', async () => {
+    const setActiveId = vi.fn(async () => ({ ok: true }));
+
+    await expect(
+      rollbackUnavailableWorkspaceRestoration({
+        restoredConversationId: 'chat-b',
+        previousConversationId: 'chat-a',
+        isCurrent: () => true,
+        setActiveId,
+      }),
+    ).resolves.toBe(true);
+
+    expect(setActiveId).toHaveBeenCalledWith('chat-a', 'chat-b');
+  });
+
+  it('does not overwrite a newer renderer selection', async () => {
+    const setActiveId = vi.fn(async () => ({ ok: true }));
+
+    await expect(
+      rollbackUnavailableWorkspaceRestoration({
+        restoredConversationId: 'chat-b',
+        previousConversationId: 'chat-a',
+        isCurrent: () => false,
+        setActiveId,
+      }),
+    ).resolves.toBe(false);
+
+    expect(setActiveId).not.toHaveBeenCalled();
   });
 });
 

@@ -70,6 +70,7 @@ interface WorkspaceSelectorProps {
   activeWorkspaceId: string | null;
   activeWorkspace: Workspace | null;
   onWorkspaceNavigationIntent: () => void;
+  onWorkspaceNavigationFailure: (workspaceId: string | null) => void;
 }
 
 export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
@@ -77,6 +78,7 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
   activeWorkspaceId,
   activeWorkspace,
   onWorkspaceNavigationIntent,
+  onWorkspaceNavigationFailure,
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -90,7 +92,12 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     // while the unchanged workspace id gives the effect no chance to restart it.
     if (workspaceId === activeWorkspaceId) return;
     onWorkspaceNavigationIntent();
-    await app.workspaces.setActive({ id: workspaceId });
+    try {
+      const result = await app.workspaces.setActive({ id: workspaceId, expectedCurrentId: activeWorkspaceId });
+      if (!result.ok) onWorkspaceNavigationFailure(activeWorkspaceId);
+    } catch {
+      onWorkspaceNavigationFailure(activeWorkspaceId);
+    }
   };
 
   const handleCreateNew = () => {
@@ -128,12 +135,15 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={createOpen}
         onOpenChange={setCreateOpen}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        onWorkspaceNavigationFailure={() => onWorkspaceNavigationFailure(activeWorkspaceId)}
       />
       <DeleteWorkspaceDialog
         workspace={deleteTarget}
+        activeWorkspaceId={activeWorkspaceId}
         open={deleteOpen}
         onOpenChange={handleDeleteOpenChange}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
+        onWorkspaceNavigationFailure={() => onWorkspaceNavigationFailure(activeWorkspaceId)}
       />
     </>
   );

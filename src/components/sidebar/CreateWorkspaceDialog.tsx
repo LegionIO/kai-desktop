@@ -7,12 +7,14 @@ interface CreateWorkspaceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onWorkspaceNavigationIntent: () => void;
+  onWorkspaceNavigationFailure: () => void;
 }
 
 export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
   open,
   onOpenChange,
   onWorkspaceNavigationIntent,
+  onWorkspaceNavigationFailure,
 }) => {
   const [name, setName] = useState('');
   const [directory, setDirectory] = useState('');
@@ -42,6 +44,7 @@ export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
       setName('');
       setDirectory('');
     } catch (err) {
+      onWorkspaceNavigationFailure();
       setError(err instanceof Error ? err.message : 'Failed to create workspace');
     } finally {
       setIsCreating(false);

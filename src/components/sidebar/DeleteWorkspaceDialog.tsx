@@ -6,29 +6,39 @@ import type { Workspace } from '../../../electron/config/schema';
 
 interface DeleteWorkspaceDialogProps {
   workspace: Workspace | null;
+  activeWorkspaceId: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onWorkspaceNavigationIntent: () => void;
+  onWorkspaceNavigationFailure: () => void;
 }
 
 export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
   workspace,
+  activeWorkspaceId,
   open,
   onOpenChange,
   onWorkspaceNavigationIntent,
+  onWorkspaceNavigationFailure,
 }) => {
   const [confirmText, setConfirmText] = useState('');
   const [isDeleting, setIsDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const isMatch = workspace ? confirmText === workspace.name : false;
 
   const handleDelete = async () => {
     if (!isMatch || !workspace) return;
     setIsDeleting(true);
-    onWorkspaceNavigationIntent();
+    setError(null);
+    const deletingActiveWorkspace = workspace.id === activeWorkspaceId;
+    if (deletingActiveWorkspace) onWorkspaceNavigationIntent();
     try {
       await app.workspaces.delete({ id: workspace.id });
       onOpenChange(false);
+    } catch (err) {
+      if (deletingActiveWorkspace) onWorkspaceNavigationFailure();
+      setError(err instanceof Error ? err.message : 'Failed to delete workspace');
     } finally {
       setIsDeleting(false);
       setConfirmText('');
@@ -36,7 +46,10 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen) setConfirmText('');
+    if (!nextOpen) {
+      setConfirmText('');
+      setError(null);
+    }
     onOpenChange(nextOpen);
   };
 
@@ -89,6 +102,8 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
               }}
             />
           </div>
+
+          {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
 
           <div className="mt-5 flex justify-end gap-2">
             <Dialog.Close asChild>

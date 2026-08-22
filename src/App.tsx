@@ -92,6 +92,7 @@ import {
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   resolveConversationWorkspaceTransition,
+  rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
@@ -722,6 +723,8 @@ function AppShell() {
   const workspaceSelectionIntentGenerationRef = useRef(0);
   const browserAttentionIntentGenerationRef = useRef(0);
   const browserWorkspaceTransitionsRef = useRef<Map<string, BrowserWorkspaceTransitionMarker>>(new Map());
+  const [workspaceRestorationRetryGeneration, setWorkspaceRestorationRetryGeneration] = useState(0);
+  const handledWorkspaceRestorationRetryGenerationRef = useRef(0);
   const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>((next) => {
     navigationIntentGenerationRef.current++;
     setActiveViewState(next);
@@ -730,6 +733,14 @@ function AppShell() {
     workspaceSelectionIntentGenerationRef.current++;
     navigationIntentGenerationRef.current++;
     conversationSelectionIntentGenerationRef.current++;
+  }, []);
+  const retryWorkspaceConversationRestoration = useCallback((workspaceId: string | null) => {
+    // A concurrent successful workspace mutation will run the normal
+    // workspace-change effect. Retry only when the failed request left us in
+    // the workspace whose in-flight restoration it invalidated.
+    if (configuredWorkspaceIdRef.current === workspaceId) {
+      setWorkspaceRestorationRetryGeneration((generation) => generation + 1);
+    }
   }, []);
   const configuredWorkspaceIdRef = useRef<string | null>(null);
   const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
@@ -802,43 +813,53 @@ function AppShell() {
   // Restore the last active conversation when switching workspaces
   const prevWorkspaceIdRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
+    const retryRequested =
+      handledWorkspaceRestorationRetryGenerationRef.current !== workspaceRestorationRetryGeneration;
+    handledWorkspaceRestorationRetryGenerationRef.current = workspaceRestorationRetryGeneration;
     if (prevWorkspaceIdRef.current === undefined) {
       // First render — just record the initial value
       prevWorkspaceIdRef.current = activeWorkspaceId;
       return;
     }
+    const retryingCurrentWorkspace = prevWorkspaceIdRef.current === activeWorkspaceId;
     const browserTransitionKey = activeWorkspaceId ?? '';
-    const browserTransition = browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
+    const browserTransition = retryingCurrentWorkspace
+      ? undefined
+      : browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
     if (browserTransition) browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
     // Consume markers even when a successful no-op/rollback was coalesced back
     // to the workspace React already knows. Such a marker must never classify a
     // later unrelated transition into this destination.
-    if (prevWorkspaceIdRef.current === activeWorkspaceId) return;
+    if (retryingCurrentWorkspace && !retryRequested) return;
 
-    const transition = resolveConversationWorkspaceTransition({
-      previousWorkspaceId: prevWorkspaceIdRef.current,
-      activeWorkspaceId,
-      currentConversationId: activeConversationIdRef.current,
-      browserTransition,
-      currentNavigationGeneration: navigationIntentGenerationRef.current,
-      currentBrowserAttentionGeneration: browserAttentionIntentGenerationRef.current,
-      currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
-    });
+    const transition = retryingCurrentWorkspace
+      ? null
+      : resolveConversationWorkspaceTransition({
+          previousWorkspaceId: prevWorkspaceIdRef.current,
+          activeWorkspaceId,
+          currentConversationId: activeConversationIdRef.current,
+          browserTransition,
+          currentNavigationGeneration: navigationIntentGenerationRef.current,
+          currentBrowserAttentionGeneration: browserAttentionIntentGenerationRef.current,
+          currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
+        });
 
     // A Browser-attention request can lose to a newer local navigation while
     // its workspace IPC is in flight. Its compare-and-set rollback will restore
     // the prior workspace; do not let this transient stale config event launch
     // an arriving-workspace conversation restoration in the meantime.
-    if (transition.staleBrowserTransition) return;
-    prevWorkspaceIdRef.current = transition.nextPreviousWorkspaceId;
+    if (transition?.staleBrowserTransition) return;
+    if (transition) prevWorkspaceIdRef.current = transition.nextPreviousWorkspaceId;
 
     // Save the current conversation to the departing workspace
-    if (transition.departingWorkspaceId && transition.departingConversationId) {
+    if (transition?.departingWorkspaceId && transition.departingConversationId) {
       void app.workspaces.saveLastConversation({
         workspaceId: transition.departingWorkspaceId,
         conversationId: transition.departingConversationId,
       });
     }
+
+    if (transition?.suppressArrivingWorkspaceRestoration) return;
 
     // Restore the arriving workspace's last conversation without changing
     // the active view — this preserves the current tab (tasks, agents, etc.)
@@ -881,7 +902,16 @@ function AppShell() {
         }
         const restoration = await app.conversations.getForRestore(restoredId);
         if (!isCurrent()) return;
-        if (restoration.status === 'unavailable') return;
+        if (restoration.status === 'unavailable') {
+          await rollbackUnavailableWorkspaceRestoration({
+            restoredConversationId: restoredId,
+            previousConversationId: backendSelectionWhenStarted,
+            isCurrent,
+            setActiveId: (conversationId, expectedCurrentConversationId) =>
+              app.conversations.setActiveId(conversationId, expectedCurrentConversationId),
+          });
+          return;
+        }
         if (restoration.status === 'missing') {
           const cleared = await app.conversations.setActiveId(null, restoredId);
           if (cleared.ok && isCurrent()) {
@@ -898,7 +928,7 @@ function AppShell() {
         setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(restoredId)));
       })();
     }
-  }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
+  }, [activeWorkspaceId, workspaceRestorationRetryGeneration]);
 
   // Browser attention must not select its destination chat until the effect
   // above has recorded the chat belonging to the workspace we just left.
@@ -3351,6 +3381,7 @@ function AppShell() {
                           activeWorkspaceId={activeWorkspaceId}
                           activeWorkspace={activeWorkspace}
                           onWorkspaceNavigationIntent={recordWorkspaceNavigationIntent}
+                          onWorkspaceNavigationFailure={retryWorkspaceConversationRestoration}
                         />
                       </div>
                     </div>
