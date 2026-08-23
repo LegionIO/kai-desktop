@@ -5,6 +5,7 @@ import { launchElectronForSmoke, type ElectronHandle } from './electron-launcher
 type BrowserTabResult = {
   id: string;
   url: string;
+  documentToken?: string;
   owner?: 'user' | 'assistant';
   keepOpen?: boolean;
   discarded?: boolean;
@@ -620,7 +621,12 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
     if (!window) throw new Error('Kai window disappeared.');
     window.minimize();
   });
-  await expect.poll(async () => (await callIntegrationDriver('getPresentationState', [])).windowMinimized).toBe(true);
+  await expect
+    .poll(
+      async () =>
+        (await callIntegrationDriver<{ windowMinimized: boolean }>('getPresentationState', [])).windowMinimized,
+    )
+    .toBe(true);
   await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({
     mountedConversationId: null,
     chromeFocusConversationId: null,
@@ -754,7 +760,12 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
   });
   await callIntegrationDriver('endAssistantRun', [conversationId, backgroundRunId]);
   await handle.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.restore());
-  await expect.poll(async () => (await callIntegrationDriver('getPresentationState', [])).windowMinimized).toBe(false);
+  await expect
+    .poll(
+      async () =>
+        (await callIntegrationDriver<{ windowMinimized: boolean }>('getPresentationState', [])).windowMinimized,
+    )
+    .toBe(false);
 
   const openTabs = await browserState(conversationId);
   expect(openTabs.tabs.some((entry) => entry.url.endsWith('/popup'))).toBe(true);
