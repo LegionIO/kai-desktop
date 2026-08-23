@@ -16516,7 +16516,20 @@ export class BrowserManager {
             true,
             undefined,
             pageLease,
-          ).catch(() => false);
+          ).catch((error: unknown) => {
+            // Page exceptions may include the evaluated source (and therefore
+            // the password), so collapse only a still-current page failure.
+            // Deadline, cancellation, renderer loss, and navigation errors are
+            // lifecycle signals callers must be able to distinguish.
+            if (error instanceof BrowserRendererDeadlineError) throw error;
+            throwIfBrowserAborted(abortSignal);
+            if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+            assertAutofillPageCurrent();
+            if (tab.view?.webContents !== contents || contents.isDestroyed()) {
+              throw new Error('The browser page changed during saved-password autofill.');
+            }
+            return false;
+          });
           if (filled !== true) {
             throw new Error('Saved-password autofill could not fill the selected login form.');
           }

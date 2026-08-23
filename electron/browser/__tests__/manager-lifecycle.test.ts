@@ -11323,6 +11323,20 @@ describe('browser manager renderer lifecycle', () => {
     expect((hostileError as Error).message).not.toContain('never-expose-this-password');
     expect(decrypted.password).toBe('');
 
+    decrypted.password = 'document-bound-password';
+    evaluateWithDeadline.mockReset();
+    evaluateWithDeadline.mockResolvedValueOnce(true).mockImplementationOnce(async () => {
+      tab.documentEpoch++;
+      throw new Error('Execution context was destroyed.');
+    });
+    await expect(
+      manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
+    ).rejects.toThrow(/page changed while this saved-password autofill was in progress/i);
+    expect(decrypted.password).toBe('');
+    tab.documentEpoch = 7;
+    evaluateWithDeadline.mockReset();
+    evaluateWithDeadline.mockResolvedValue(true);
+
     vault.findForOrigin.mockReturnValueOnce({
       ...credential,
       updatedAt: '2026-08-16T00:30:00.000Z',
@@ -11330,13 +11344,13 @@ describe('browser manager renderer lifecycle', () => {
     await expect(
       manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
     ).rejects.toThrow(/credential or destination changed while autofill was waiting/i);
-    expect(vault.decrypt).toHaveBeenCalledTimes(2);
+    expect(vault.decrypt).toHaveBeenCalledTimes(3);
 
     listCredentials.mockReturnValue([{ ...credential, updatedAt: '2026-08-16T01:00:00.000Z' }]);
     await expect(
       manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
     ).rejects.toThrow(/credential or destination changed while approval was pending/i);
-    expect(vault.decrypt).toHaveBeenCalledTimes(2);
+    expect(vault.decrypt).toHaveBeenCalledTimes(3);
   });
 
   it('rejects user autofill when the renderer document token is stale', async () => {
