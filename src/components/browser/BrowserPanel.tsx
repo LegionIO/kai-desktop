@@ -1015,6 +1015,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         findTabIdRef.current = null;
         findTextRef.current = '';
         findRequestRef.current++;
+        zoomTargetsRef.current.clear();
         setAppliedDataScope(event.dataScope);
         setBookmarks([]);
         setSuggestions([]);
@@ -1508,7 +1509,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       setError(null);
       try {
         await browser.createTab({ conversationId, url, owner: 'user' });
-        if (!url || url === 'about:blank') focusOmnibox();
+        if (
+          (!url || url === 'about:blank') &&
+          request === navigationRequestRef.current &&
+          conversationIdRef.current === requestedConversationId
+        ) {
+          focusOmnibox();
+        }
       } catch (reason) {
         if (request !== navigationRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
         setError(String(reason));
@@ -1520,9 +1527,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const command = useCallback(
     async (tab: BrowserTab, action: Parameters<NonNullable<typeof browser>['commandTab']>[2]) => {
       if (!browser || !conversationId) return;
-      navigationRequestRef.current++;
+      const requestedConversationId = conversationId;
+      const request = ++navigationRequestRef.current;
       setError(null);
-      await browser.commandTab(conversationId, tab.id, action).catch((reason) => setError(String(reason)));
+      await browser.commandTab(conversationId, tab.id, action).catch((reason) => {
+        if (request !== navigationRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
+        setError(String(reason));
+      });
     },
     [browser, conversationId],
   );

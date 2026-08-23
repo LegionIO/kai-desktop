@@ -1040,6 +1040,64 @@ describe('BrowserPanel', () => {
     expect(screen.queryByText(/Stale tab creation failed/)).not.toBeInTheDocument();
   });
 
+  it('ignores a stale tab-command failure after a newer navigation starts', async () => {
+    const staleCommand = deferred<void>();
+    const commandTab = vi.fn(() => staleCommand.promise);
+    const navigate = vi.fn().mockResolvedValue(undefined);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        commandTab,
+        navigate,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.click(screen.getByTitle('Back'));
+    await waitFor(() => expect(commandTab).toHaveBeenCalledWith('chat-1', tab.id, 'back'));
+    fireEvent.change(omnibox, { target: { value: 'current.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('chat-1', tab.id, 'current.example'));
+
+    await act(async () => staleCommand.reject(new Error('Stale command failed')));
+    expect(screen.queryByText(/Stale command failed/)).not.toBeInTheDocument();
+  });
+
+  it('does not let a stale blank-tab completion steal omnibox focus', async () => {
+    const pendingCreation = deferred<BrowserTab>();
+    const createTab = vi.fn(() => pendingCreation.promise);
+    const commandTab = vi.fn().mockResolvedValue(undefined);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        createTab,
+        commandTab,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.click(screen.getByTitle('New tab (⌘/Ctrl+T)'));
+    await waitFor(() => expect(createTab).toHaveBeenCalledTimes(1));
+    const back = screen.getByTitle('Back');
+    back.focus();
+    fireEvent.click(back);
+    await waitFor(() => expect(commandTab).toHaveBeenCalledWith('chat-1', tab.id, 'back'));
+
+    await act(async () => pendingCreation.resolve(tab));
+    expect(back).toHaveFocus();
+    expect(omnibox).not.toHaveFocus();
+  });
+
   it('detaches a script-evaluated page behind a reload-required interstitial', async () => {
     const mount = vi.fn().mockResolvedValue(undefined);
     const commandTab = vi.fn().mockResolvedValue(undefined);
