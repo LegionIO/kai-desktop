@@ -42,7 +42,11 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAfterCapture?: boolean }) {
+function screenshotManager(options?: {
+  revokeAfterCapture?: boolean;
+  revokePanelAfterCapture?: boolean;
+  navigateAfterCapture?: boolean;
+}) {
   const contents = { isDestroyed: () => false };
   const tab = {
     shell: {
@@ -120,6 +124,9 @@ function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAft
         Reflect.set(manager, 'hostRendererAuthorityAvailable', false);
         Reflect.set(manager, 'hostRendererAuthorityGeneration', 4);
       }
+      if (options?.revokePanelAfterCapture) {
+        (Reflect.get(manager, 'panelAuthorityGenerations') as Map<string, number>).set('chat-1', 1);
+      }
       if (options?.navigateAfterCapture) tab.generation++;
       return { png: Buffer.from('png'), width: 1, height: 1 };
     },
@@ -194,6 +201,30 @@ describe('assistant screenshot renderer authority', () => {
     resolveDialog({ canceled: false, filePath: '/tmp/exported-browser.png' });
 
     await expect(screenshot).rejects.toThrow(/page changed while this screenshot/i);
+    expect(atomicWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('cancels an export when its Browser panel is withdrawn while the native dialog is open', async () => {
+    const selected = deferred<{ canceled: boolean; filePath: string }>();
+    electronMocks.showSaveDialog.mockReturnValue(selected.promise);
+    const manager = screenshotManager();
+    const screenshot = manager.screenshot('chat-1', { mode: 'viewport', exportToFile: true });
+    await vi.waitFor(() => expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce());
+
+    (Reflect.get(manager, 'panelAuthorityGenerations') as Map<string, number>).set('chat-1', 1);
+    selected.resolve({ canceled: false, filePath: '/tmp/exported-browser.png' });
+
+    await expect(screenshot).resolves.toMatchObject({ canceled: true });
+    expect(atomicWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('does not write an export when its Browser panel is withdrawn during capture', async () => {
+    electronMocks.showSaveDialog.mockResolvedValue({ canceled: false, filePath: '/tmp/exported-browser.png' });
+    const manager = screenshotManager({ revokePanelAfterCapture: true });
+
+    await expect(manager.screenshot('chat-1', { mode: 'viewport', exportToFile: true })).rejects.toThrow(
+      /Browser panel changed/i,
+    );
     expect(atomicWriteFileSync).not.toHaveBeenCalled();
   });
 

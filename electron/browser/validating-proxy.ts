@@ -10,7 +10,7 @@ import {
 } from 'node:http';
 import { Agent as HttpsAgent, request as requestHttps } from 'node:https';
 import { connect, isIP, type Socket } from 'node:net';
-import { connect as connectTls } from 'node:tls';
+import { connect as connectTls, getCACertificates, type ConnectionOptions as TlsConnectionOptions } from 'node:tls';
 import type { AuthInfo, Session } from 'electron';
 import { runBrowserSessionOperation, waitForBrowserSessionOperations } from './session-operations.js';
 import { isPrivateResolvedAddress } from './session.js';
@@ -57,7 +57,17 @@ const MAX_UPSTREAM_PROXY_AUTH_ROUNDS = 8;
 export type BrowserValidatingProxyOptions = {
   operationTimeoutMs?: number;
   resolveHost?: (hostname: string) => Promise<ResolvedEndpoint[]>;
+  connectTls?: (options: TlsConnectionOptions) => Socket;
+  trustedCertificateAuthorities?: () => string[];
 };
+
+/** Node TLS normally uses its bundled CA set, while Electron navigation uses
+ * the operating system trust store. HTTPS PAC/system proxies are part of the
+ * Browser transport, so include both sets (plus any configured default/extra
+ * roots) without changing trust for unrelated Node clients in the process. */
+function loadProxyCertificateAuthorities(): string[] {
+  return [...new Set([...getCACertificates('default'), ...getCACertificates('system')])];
+}
 
 class UpstreamProxyAuthenticationError extends Error {
   constructor(
@@ -368,6 +378,9 @@ export class BrowserValidatingProxy {
   private readonly clientSockets = new Set<Socket>();
   private readonly operationTimeoutMs: number;
   private readonly resolveHost: (hostname: string) => Promise<ResolvedEndpoint[]>;
+  private readonly connectTls: (options: TlsConnectionOptions) => Socket;
+  private readonly loadTrustedCertificateAuthorities: () => string[];
+  private trustedCertificateAuthorities: string[] | null = null;
   private server: Server | null = null;
   private startPromise: Promise<number> | null = null;
   private readonly retiredServerClosures = new Set<Promise<void>>();
@@ -387,6 +400,8 @@ export class BrowserValidatingProxy {
       throw new Error('Invalid Browser proxy operation timeout.');
     }
     this.operationTimeoutMs = timeout;
+    this.connectTls = options.connectTls ?? connectTls;
+    this.loadTrustedCertificateAuthorities = options.trustedCertificateAuthorities ?? loadProxyCertificateAuthorities;
     this.resolveHost =
       options.resolveHost ??
       (async (hostname) =>
@@ -827,10 +842,11 @@ export class BrowserValidatingProxy {
   ): Promise<Socket> {
     const socket =
       route.kind === 'https'
-        ? connectTls({
+        ? this.connectTls({
             host: route.hostname,
             port: route.port,
             servername: isIP(route.hostname) ? undefined : route.hostname,
+            ca: (this.trustedCertificateAuthorities ??= this.loadTrustedCertificateAuthorities()),
           })
         : connect({ host: route.hostname, port: route.port });
     this.trackPendingSocket(targetHostname, socket);

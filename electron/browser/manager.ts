@@ -5215,6 +5215,21 @@ export class BrowserManager {
     return this.isTargetViewPresented(tab, contents) && this.isNativeBrowserPageFocused(contents);
   }
 
+  /** A native picker temporarily owns focus, so completion cannot require the
+   * page or Browser chrome to be focused. It must still belong to the same
+   * mounted panel generation and selected tab; otherwise a picker opened by an
+   * old chat/tab could authorize work against a now-hidden authenticated page. */
+  private hasBrowserNativeDialogCompletionAuthority(tab: InternalTab, panelAuthorityGeneration: number): boolean {
+    const conversationId = tab.shell.conversationId;
+    return (
+      !this.disposed &&
+      !this.shuttingDown &&
+      !this.removedConversations.has(conversationId) &&
+      panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId) &&
+      this.activeTabs.get(conversationId) === tab.shell.id
+    );
+  }
+
   private hasBrowserChromeNativeDialogAuthority(conversationId: string, panelAuthorityGeneration: number): boolean {
     return (
       !this.removedConversations.has(conversationId) &&
@@ -11331,6 +11346,7 @@ export class BrowserManager {
         click: () =>
           runContextMenuTask(async () => {
             assertContextPageCurrent();
+            if (!this.hasBrowserNativeDialogAuthority(tab, contents, nativeDialogPanelGeneration)) return;
             const win = this.getWindow();
             const options = {
               title: 'Save web page',
@@ -11345,11 +11361,14 @@ export class BrowserManager {
                 ? await dialog.showSaveDialog(win, options)
                 : await dialog.showSaveDialog(options);
             assertContextPageCurrent();
+            if (!this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) return;
             if (!result.canceled && result.filePath) {
               await this.runTabOperation(tab, async () => {
                 assertContextPageCurrent();
+                if (!this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) return;
                 await this.assertTabNotSensitive(tab, contents, 'Saving the page');
                 assertContextPageCurrent();
+                if (!this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) return;
                 await contents.savePage(result.filePath!, 'HTMLComplete');
                 assertContextPageCurrent();
               });
@@ -14864,6 +14883,7 @@ export class BrowserManager {
       this.assertHostRendererOperationCurrent();
       if (this.tabs.get(tab.shell.id) !== tab) throw new Error('The browser tab closed while choosing an export path.');
       this.assertBrowserPageLease(tab, exportPageLease, 'screenshot export selection');
+      if (!this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) return true;
       if (chosen.canceled || !chosen.filePath) {
         return true;
       }
@@ -14895,6 +14915,9 @@ export class BrowserManager {
       if (documentLease) this.assertBrowserDocumentApproval(tab, approvedDocument);
       if (reveal && documentLease) await reveal(contents, documentLease);
       if (exportPageLease) this.assertBrowserPageLease(tab, exportPageLease, 'screenshot export selection');
+      if (exportFilePath && !this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) {
+        throw new Error('The Browser panel changed while this screenshot export was in progress.');
+      }
       const pageLease = exportPageLease ?? this.captureBrowserPageLease(tab, contents);
       if (request.documentToken && request.documentToken !== this.browserPageLeaseToken(pageLease)) {
         throw new Error('The browser page changed after the element was picked. Pick the element again.');
@@ -15105,6 +15128,9 @@ export class BrowserManager {
           throwIfBrowserAborted(abortSignal);
           this.assertHostRendererOperationCurrent();
           assertPageCurrent();
+          if (exportFilePath && !this.hasBrowserNativeDialogCompletionAuthority(tab, nativeDialogPanelGeneration)) {
+            throw new Error('The Browser panel changed while this screenshot export was in progress.');
+          }
           if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
           retainedScreenshot?.persist(png);
           if (exportFilePath) atomicWriteFileSync(exportFilePath, png, { mode: 0o600 });

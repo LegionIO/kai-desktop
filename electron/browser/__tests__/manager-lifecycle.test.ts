@@ -18329,6 +18329,8 @@ describe('browser manager renderer lifecycle', () => {
       assertBrowserPageLease: vi.fn(() => {
         if (pageChanged) throw new Error('The browser page changed while this context-menu action was in progress.');
       }),
+      hasBrowserNativeDialogAuthority: vi.fn(() => true),
+      hasBrowserNativeDialogCompletionAuthority: vi.fn(() => true),
       getWindow: () => null,
       runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
       emitTabs: vi.fn(),
@@ -18343,6 +18345,52 @@ describe('browser manager renderer lifecycle', () => {
     selected.resolve({ canceled: false, filePath: '/tmp/replacement.html' });
 
     await vi.waitFor(() => expect(tab.shell.error).toMatch(/context-menu action/));
+    expect(savePage).not.toHaveBeenCalled();
+  });
+
+  it('does not save a page after Browser presentation is withdrawn while its native dialog is open', async () => {
+    const selected = deferred<{ canceled: boolean; filePath?: string }>();
+    electronMocks.showSaveDialog.mockReturnValue(selected.promise);
+    const savePage = vi.fn(async () => undefined);
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      getURL: () => 'https://example.com/original',
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+      savePage,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        title: 'Original',
+        error: undefined as string | undefined,
+      },
+      view: { webContents: contents },
+    };
+    let completionAuthorized = true;
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      captureBrowserPageLease: vi.fn(() => ({ tabId: 'tab-1', contents })),
+      assertBrowserPageLease: vi.fn(),
+      hasBrowserNativeDialogAuthority: vi.fn(() => true),
+      hasBrowserNativeDialogCompletionAuthority: vi.fn(() => completionAuthorized),
+      getWindow: () => null,
+      runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
+      emitTabs: vi.fn(),
+    });
+
+    const menu = invokePrivate(manager, 'buildContextMenu', tab, contents, {}) as {
+      items: Array<{ label?: string; click?: () => void }>;
+    };
+    menu.items.find((item) => item.label === 'Save Page As…')?.click?.();
+    await vi.waitFor(() => expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce());
+    completionAuthorized = false;
+    selected.resolve({ canceled: false, filePath: '/tmp/stale.html' });
+
+    await vi.waitFor(() =>
+      expect(Reflect.get(manager, 'hasBrowserNativeDialogCompletionAuthority')).toHaveBeenCalled(),
+    );
     expect(savePage).not.toHaveBeenCalled();
   });
 
@@ -18374,6 +18422,8 @@ describe('browser manager renderer lifecycle', () => {
       captureBrowserPageLease: vi.fn(() => pageLease),
       assertBrowserPageLease: vi.fn(),
       assertTabNotSensitive,
+      hasBrowserNativeDialogAuthority: vi.fn(() => true),
+      hasBrowserNativeDialogCompletionAuthority: vi.fn(() => true),
       getWindow: () => null,
       runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
       emitTabs: vi.fn(),

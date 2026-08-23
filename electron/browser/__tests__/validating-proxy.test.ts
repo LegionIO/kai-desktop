@@ -2,9 +2,9 @@ import { createServer, request as requestHttp } from 'node:http';
 import {
   createConnection,
   createServer as createNetServer,
+  Socket,
   type AddressInfo,
   type Server as NetServer,
-  type Socket,
 } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserValidatingProxy, parseBrowserProxyRoutes } from '../validating-proxy.js';
@@ -131,6 +131,37 @@ describe('Browser validating proxy', () => {
     expect(parseBrowserProxyRoutes('UNSUPPORTED ignored.example:1')).toEqual([]);
     expect(() => parseBrowserProxyRoutes(`PROXY ${'a'.repeat(20_000)}`)).toThrow(/too large/i);
     expect(() => parseBrowserProxyRoutes('PROXY user:secret@proxy.example:8080')).toThrow(/invalid/i);
+  });
+
+  it('uses the combined default and operating-system trust roots for HTTPS upstream proxies', async () => {
+    const upstream = new Socket();
+    const client = new Socket();
+    sockets.push(upstream, client);
+    const connectTls = vi.fn(() => upstream);
+    const trustedCertificateAuthorities = vi.fn(() => ['bundled-root', 'system-enterprise-root']);
+    const proxy = new BrowserValidatingProxy(undefined, {
+      connectTls: connectTls as never,
+      trustedCertificateAuthorities,
+    });
+    proxies.push(proxy);
+
+    const connected = (
+      Reflect.get(proxy, 'openProxySocket') as (
+        route: { kind: 'https'; hostname: string; port: number },
+        targetHostname: string,
+        client: Socket,
+      ) => Promise<Socket>
+    ).call(proxy, { kind: 'https', hostname: 'proxy.enterprise.test', port: 8443 }, 'secure.uhc.com', client);
+    upstream.emit('secureConnect');
+
+    await expect(connected).resolves.toBe(upstream);
+    expect(trustedCertificateAuthorities).toHaveBeenCalledOnce();
+    expect(connectTls).toHaveBeenCalledWith({
+      host: 'proxy.enterprise.test',
+      port: 8443,
+      servername: 'proxy.enterprise.test',
+      ca: ['bundled-root', 'system-enterprise-root'],
+    });
   });
 
   it('configures an authenticated non-bypassing Browser session', async () => {
