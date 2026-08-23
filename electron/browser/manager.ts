@@ -693,6 +693,11 @@ type InternalTab = {
    * corresponding did-fail-load callback. The latter omits request ids, so this
    * bounded bridge disambiguates rapid same-URL navigation generations. */
   networkNavigationFailures?: BrowserNetworkNavigationFailure[];
+  /** Monotonic acknowledgement that wireWebContents consumed the immediately
+   * preceding did-fail-load as belonging to a superseded navigation. Later
+   * listeners on the same WebContents use this to avoid rejecting the live
+   * assistant reload/history attempt for that already-classified callback. */
+  ignoredSupersededNavigationFailureSequence?: number;
   /** Renderers temporarily exempted from Chromium background throttling while
    * this tab has active assistant work. A tab can replace its renderer during
    * sanitization, so retain all live targets until the outermost action ends. */
@@ -6889,6 +6894,7 @@ export class BrowserManager {
     operation: string,
     begin: () => void,
     reachedDestination: (url: string) => boolean,
+    onAttemptStarted?: (generation: number, networkNavigationSequence: number) => void,
   ): Promise<void> {
     const initialTabGeneration = tab.generation;
     const initialNetworkNavigationSequence = tab.networkNavigationSequence ?? 0;
@@ -6897,9 +6903,11 @@ export class BrowserManager {
     const attemptUrls = new Set(expectedComparableUrl ? [expectedComparableUrl] : []);
     let commandIssued = false;
     let started = false;
+    let startedInPlace = false;
     let committed = false;
     let attemptTabGeneration = initialTabGeneration;
     let attemptNetworkNavigationSequence = initialNetworkNavigationSequence;
+    let observedIgnoredSupersededNavigationFailureSequence = tab.ignoredSupersededNavigationFailureSequence ?? 0;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -6947,6 +6955,8 @@ export class BrowserManager {
         attemptNetworkNavigationSequence = initialNetworkNavigationSequence + (isInPlace ? 0 : 1);
         if (failIfAttemptChanged()) return;
         started = true;
+        startedInPlace = isInPlace;
+        onAttemptStarted?.(attemptTabGeneration, attemptNetworkNavigationSequence);
         if (comparableUrl) attemptUrls.add(comparableUrl);
       };
       const onDidRedirectNavigation = (
@@ -6971,6 +6981,10 @@ export class BrowserManager {
       };
       const onDidNavigateInPage = (_event: Electron.Event, url: string, isMainFrame: boolean) => {
         if (!started || !isMainFrame || failIfAttemptChanged()) return;
+        // A cross-document reload/history traversal can overlap a delayed
+        // History API/hash event from the departing document. It is not the
+        // requested navigation's completion signal.
+        if (!startedInPlace) return;
         if (!reachedDestination(url)) {
           finish(changedError());
           return;
@@ -6991,6 +7005,11 @@ export class BrowserManager {
         isMainFrame: boolean,
       ) => {
         if (!started || !isMainFrame || failIfAttemptChanged()) return;
+        const ignoredFailureSequence = tab.ignoredSupersededNavigationFailureSequence ?? 0;
+        if (ignoredFailureSequence > observedIgnoredSupersededNavigationFailureSequence) {
+          observedIgnoredSupersededNavigationFailureSequence = ignoredFailureSequence;
+          return;
+        }
         const comparableUrl = comparablePopupReferrerUrl(validatedUrl);
         if (comparableUrl && !attemptUrls.has(comparableUrl)) return;
         // wireWebContents processes this event first. If the same navigation is
@@ -7041,6 +7060,9 @@ export class BrowserManager {
       throw new Error('The browser history changed while navigation was being authorized.');
     }
 
+    let cancellationGeneration = tab.generation;
+    let cancellationNetworkNavigationSequence = tab.networkNavigationSequence ?? 0;
+    const cancellationUserNavigationLease = tab.trustedUserNavigationLease;
     await this.runRendererOperationWithDeadline(
       tab,
       contents,
@@ -7054,8 +7076,18 @@ export class BrowserManager {
           'Browser history navigation',
           () => navigation.goToIndex(targetIndex),
           (url) => navigation.getActiveIndex() === targetIndex || url === target.url,
+          (generation, networkNavigationSequence) => {
+            cancellationGeneration = generation;
+            cancellationNetworkNavigationSequence = networkNavigationSequence;
+          },
         ),
       abortSignal,
+      undefined,
+      true,
+      () =>
+        tab.generation === cancellationGeneration &&
+        (tab.networkNavigationSequence ?? 0) === cancellationNetworkNavigationSequence &&
+        tab.trustedUserNavigationLease === cancellationUserNavigationLease,
     );
     throwIfBrowserAborted(abortSignal);
     const completedPage = this.captureBrowserPageLease(tab, contents);
@@ -7073,6 +7105,9 @@ export class BrowserManager {
     if (!documentLease) throw new Error('Assistant reload requires a document lease.');
     this.assertAssistantDocumentLease(tab, documentLease);
     const reloadUrl = contents.getURL();
+    let cancellationGeneration = tab.generation;
+    let cancellationNetworkNavigationSequence = tab.networkNavigationSequence ?? 0;
+    const cancellationUserNavigationLease = tab.trustedUserNavigationLease;
     await this.runRendererOperationWithDeadline(
       tab,
       contents,
@@ -7089,8 +7124,18 @@ export class BrowserManager {
             else contents.reload();
           },
           () => true,
+          (generation, networkNavigationSequence) => {
+            cancellationGeneration = generation;
+            cancellationNetworkNavigationSequence = networkNavigationSequence;
+          },
         ),
       abortSignal,
+      undefined,
+      true,
+      () =>
+        tab.generation === cancellationGeneration &&
+        (tab.networkNavigationSequence ?? 0) === cancellationNetworkNavigationSequence &&
+        tab.trustedUserNavigationLease === cancellationUserNavigationLease,
     );
     throwIfBrowserAborted(abortSignal);
     const completedPage = this.captureBrowserPageLease(tab, contents);
@@ -9439,7 +9484,10 @@ export class BrowserManager {
       // Two rapid navigations may target the same URL; in that case the stale
       // ERR_ABORTED must not revoke the newer request's private-network/auth
       // authority.
-      if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL, errorCode)) return;
+      if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL, errorCode)) {
+        tab.ignoredSupersededNavigationFailureSequence = (tab.ignoredSupersededNavigationFailureSequence ?? 0) + 1;
+        return;
+      }
       if (isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, validatedURL)) {
         this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
       }
@@ -13562,6 +13610,7 @@ export class BrowserManager {
     abortSignal?: AbortSignal,
     documentLease?: AssistantDocumentLease,
     reclaimTargetOnCancellation = true,
+    cancellationDocumentIsCurrent?: () => boolean,
   ): Promise<T> {
     if (abortSignal?.aborted) throw new Error(`${operation} was cancelled.`);
     if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
@@ -13571,8 +13620,9 @@ export class BrowserManager {
       this.tabs.get(tab.shell.id) === tab &&
       tab.view?.webContents === contents &&
       !contents.isDestroyed() &&
-      tab.generation === targetGeneration &&
-      tab.trustedUserNavigationLease === targetUserNavigationLease;
+      (cancellationDocumentIsCurrent
+        ? cancellationDocumentIsCurrent()
+        : tab.generation === targetGeneration && tab.trustedUserNavigationLease === targetUserNavigationLease);
     let cancellation: 'timeout' | 'abort' | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortListener: (() => void) | undefined;

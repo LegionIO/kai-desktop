@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   advanceConfirmedConversationSelection,
   adoptBrowserWorkspaceTransitionMarker,
+  clearMissingConfirmedConversationSelection,
   commitLocalConversationSelection,
   createBoundedWorkspaceObservationWait,
   createBrowserWorkspaceTransitionMarker,
@@ -86,6 +87,94 @@ describe('confirmed conversation selection reconciliation', () => {
         missing,
       ),
     ).toBeNull();
+  });
+
+  it('clears a missing confirmed selection in main before advancing the renderer revision', async () => {
+    const missing = {
+      activeConversationId: 'chat-a',
+      activeConversationRevision: 4,
+      intentGeneration: 2,
+    };
+    const setActiveId = vi.fn(async () => ({
+      ok: true,
+      activeConversationId: null,
+      activeConversationRevision: 5,
+    }));
+
+    await expect(
+      clearMissingConfirmedConversationSelection({
+        missing,
+        getCurrent: () => missing,
+        isCurrent: () => true,
+        setActiveId,
+      }),
+    ).resolves.toEqual({
+      activeConversationId: null,
+      activeConversationRevision: 5,
+      intentGeneration: 2,
+    });
+    expect(setActiveId).toHaveBeenCalledWith(null, 'chat-a', 4);
+  });
+
+  it('does not clear renderer state when a missing-selection CAS loses to newer intent', async () => {
+    const missing = {
+      activeConversationId: 'chat-a',
+      activeConversationRevision: 4,
+      intentGeneration: 2,
+    };
+    let current = missing;
+    let resolveCas: (result: {
+      ok: boolean;
+      activeConversationId: string | null;
+      activeConversationRevision: number;
+    }) => void = () => {};
+    const setActiveId = vi.fn(
+      () =>
+        new Promise<{
+          ok: boolean;
+          activeConversationId: string | null;
+          activeConversationRevision: number;
+        }>((resolve) => {
+          resolveCas = resolve;
+        }),
+    );
+    const clearing = clearMissingConfirmedConversationSelection({
+      missing,
+      getCurrent: () => current,
+      isCurrent: () => true,
+      setActiveId,
+    });
+
+    current = {
+      activeConversationId: 'chat-b',
+      activeConversationRevision: 5,
+      intentGeneration: 3,
+    };
+    resolveCas({ ok: true, activeConversationId: null, activeConversationRevision: 6 });
+
+    await expect(clearing).resolves.toBeNull();
+  });
+
+  it('does not clear renderer state when main rejects the missing-selection CAS', async () => {
+    const missing = {
+      activeConversationId: 'chat-a',
+      activeConversationRevision: 4,
+      intentGeneration: 2,
+    };
+
+    await expect(
+      clearMissingConfirmedConversationSelection({
+        missing,
+        getCurrent: () => missing,
+        isCurrent: () => true,
+        setActiveId: async () => ({
+          ok: false,
+          error: 'active-conversation-changed',
+          activeConversationId: 'chat-b',
+          activeConversationRevision: 5,
+        }),
+      }),
+    ).resolves.toBeNull();
   });
 
   it('recovers failed speculative selections to an older local selection that the backend committed', () => {

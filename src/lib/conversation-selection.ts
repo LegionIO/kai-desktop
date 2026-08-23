@@ -303,6 +303,42 @@ export function invalidateMissingConfirmedConversationSelection(
   return { ...current, activeConversationId: null };
 }
 
+/** Clear a confirmed selection whose strict record read returned missing in
+ * both main and the renderer. The backend compare-and-set prevents a late read
+ * from erasing a newer selection, while the second checkpoint comparison keeps
+ * a delayed IPC acknowledgement from replacing newer renderer intent. */
+export async function clearMissingConfirmedConversationSelection(options: {
+  missing: ConfirmedConversationSelection;
+  getCurrent: () => ConfirmedConversationSelection;
+  isCurrent: () => boolean;
+  setActiveId: (
+    conversationId: null,
+    expectedCurrentConversationId: string,
+    expectedCurrentRevision: number,
+  ) => Promise<ActiveConversationCasResult>;
+}): Promise<ConfirmedConversationSelection | null> {
+  const missingId = options.missing.activeConversationId;
+  if (
+    missingId === null ||
+    !options.isCurrent() ||
+    !invalidateMissingConfirmedConversationSelection(options.getCurrent(), options.missing)
+  ) {
+    return null;
+  }
+  const result = await options.setActiveId(null, missingId, options.missing.activeConversationRevision);
+  if (
+    !options.isCurrent() ||
+    !result.ok ||
+    result.activeConversationId !== null ||
+    result.activeConversationRevision === undefined
+  ) {
+    return null;
+  }
+  const invalidated = invalidateMissingConfirmedConversationSelection(options.getCurrent(), options.missing);
+  if (!invalidated) return null;
+  return { ...invalidated, activeConversationRevision: result.activeConversationRevision };
+}
+
 /** Reconcile a failed latest selection against authoritative backend state.
  * The global backend active id can be changed by another window/CLI, so it is
  * safe to adopt only when that id belongs to another still-pending local

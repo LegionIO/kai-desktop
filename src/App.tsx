@@ -87,12 +87,12 @@ import { cn, generateId } from '@/lib/utils';
 import {
   advanceConfirmedConversationSelection,
   adoptBrowserWorkspaceTransitionMarker,
+  clearMissingConfirmedConversationSelection,
   commitLocalConversationSelection,
   createBoundedWorkspaceObservationWait,
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
-  invalidateMissingConfirmedConversationSelection,
   isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
@@ -778,12 +778,20 @@ function AppShell() {
         return;
       }
       if (restoration.status === 'missing') {
-        const invalidated = invalidateMissingConfirmedConversationSelection(
-          confirmedConversationSelectionRef.current,
-          confirmed,
+        const cleared = await clearMissingConfirmedConversationSelection({
+          missing: confirmed,
+          getCurrent: () => confirmedConversationSelectionRef.current,
+          isCurrent,
+          setActiveId: (conversationId, expectedCurrentConversationId, expectedCurrentRevision) =>
+            app.conversations.setActiveId(conversationId, expectedCurrentConversationId, expectedCurrentRevision),
+        });
+        if (!cleared) return;
+        const acknowledged = recordConfirmedConversationSelection(
+          null,
+          cleared.activeConversationRevision,
+          cleared.intentGeneration,
         );
-        if (!invalidated) return;
-        commitConfirmedConversationSelection(invalidated);
+        commitConfirmedConversationSelection(acknowledged);
         setActiveConversationTitle(null);
         setActiveConversationHasMessages(false);
         return;
@@ -794,7 +802,7 @@ function AppShell() {
       );
       setActiveConversationHasMessages((conversation.messageCount ?? 0) > 0);
     },
-    [commitConfirmedConversationSelection, cuSessionsByConversation],
+    [commitConfirmedConversationSelection, cuSessionsByConversation, recordConfirmedConversationSelection],
   );
   // Browser-attention navigation may wait on record and workspace I/O. Claim a
   // unique generation for every navigation intent so an older attention click

@@ -17003,6 +17003,7 @@ describe('browser manager renderer lifecycle', () => {
       partition: 'persist:kai-browser-global',
       generation: 1,
       networkNavigationSequence: 0,
+      ignoredSupersededNavigationFailureSequence: 0,
       trustedUserNavigationLease: 0,
       view: { webContents: contents },
     };
@@ -17041,12 +17042,21 @@ describe('browser manager renderer lifecycle', () => {
     tab.generation = 2;
     tab.networkNavigationSequence = 1;
     listeners.get('did-start-navigation')?.({}, 'https://example.com/reloaded', false, true);
+    listeners.get('did-navigate-in-page')?.({}, 'https://example.com/reloaded#departing-event', true);
+    await Promise.resolve();
+    expect(completed).toBe(false);
     // A delayed stop from the superseded load cannot complete this reload.
     listeners.get('did-stop-loading')?.();
     await Promise.resolve();
     expect(completed).toBe(false);
 
     listeners.get('did-navigate')?.({}, 'https://example.com/reloaded');
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    // wireWebContents classified this same-URL failure as belonging to an
+    // older superseded request before this operation listener received it.
+    tab.ignoredSupersededNavigationFailureSequence = 1;
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', 'https://example.com/reloaded', true);
     await Promise.resolve();
     expect(completed).toBe(false);
     loadingMainFrame = false;
@@ -17060,6 +17070,9 @@ describe('browser manager renderer lifecycle', () => {
       30_000,
       expect.any(Function),
       undefined,
+      undefined,
+      true,
+      expect.any(Function),
     );
     expect(assertAssistantNavigationAllowed).toHaveBeenCalledWith(
       'https://example.com/reloaded',
@@ -17067,6 +17080,57 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
     );
     expect(markAssistantControlledOrigin).toHaveBeenCalledWith('global', 'https://example.com/reloaded');
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('reclaims the exact replacement document when an assistant reload is cancelled', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      debugger: { isAttached: () => false },
+      getURL: () => 'https://example.com',
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => true,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      reload: vi.fn(),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, error: undefined as string | undefined },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 3,
+      networkNavigationSequence: 4,
+      trustedUserNavigationLease: 1,
+      view: { webContents: contents },
+    };
+    const destroyView = vi.fn(() => listeners.get('destroyed')?.());
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      destroyView,
+      emitTabs: vi.fn(),
+    });
+    const abortController = new AbortController();
+    const reloading = invokePrivate(manager, 'reloadAssistantTab', tab, contents, false, abortController.signal, {
+      runGeneration: 1,
+      tabGeneration: 3,
+      userNavigationLease: 1,
+      url: 'https://example.com',
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(contents.reload).toHaveBeenCalledOnce());
+
+    tab.generation = 4;
+    tab.networkNavigationSequence = 5;
+    listeners.get('did-start-navigation')?.({}, 'https://example.com', false, true);
+    abortController.abort();
+
+    await expect(reloading).rejects.toThrow('Browser page reload was cancelled');
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.shell.discarded).toBe(true);
+    expect(tab.shell.error).toBe('Browser page reload was cancelled.');
     expect(listeners).toHaveLength(0);
   });
 
