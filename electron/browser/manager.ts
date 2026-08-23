@@ -3997,18 +3997,32 @@ export class BrowserManager {
       approval.tabRef === undefined || (approval.tabRef === tab && this.tabs.get(approval.tabId) === tab);
     const capturedNavigationLeaseMatches =
       approval.userNavigationLease === undefined || approval.userNavigationLease === tab.trustedUserNavigationLease;
-    const generationMatches =
-      tab.generation === approval.tabGeneration ||
-      (approval.allowInternalRestore === true &&
-        approval.tabRef === tab &&
-        approval.userNavigationLease !== undefined &&
-        tab.generation === approval.tabGeneration + 1);
+    // A renderer-only restore can complete while an ask-policy prompt is open
+    // (for example, because the user opens the Browser sidebar). Permit only
+    // the exact paired generation/document transition from the discarded shell
+    // that was captured by main. A same-URL reload of an already-live page is
+    // not eligible for this exception.
+    const exactDiscardedRestore =
+      approval.allowInternalRestore === true &&
+      approval.tabRef === tab &&
+      this.tabs.get(approval.tabId) === tab &&
+      approval.userNavigationLease !== undefined &&
+      approval.userNavigationLease === tab.trustedUserNavigationLease &&
+      tab.generation === approval.tabGeneration + 1 &&
+      this.currentDocumentEpoch(tab) === approval.documentEpoch + 1 &&
+      tab.view !== null &&
+      !tab.view.webContents.isDestroyed() &&
+      !tab.viewLoadPromise &&
+      tab.shell.discarded === false &&
+      !tab.shell.error;
+    const generationMatches = tab.generation === approval.tabGeneration || exactDiscardedRestore;
+    const documentEpochMatches = this.currentDocumentEpoch(tab) === approval.documentEpoch || exactDiscardedRestore;
     if (
       tab.shell.id !== approval.tabId ||
       !capturedIdentityMatches ||
       !capturedNavigationLeaseMatches ||
       !generationMatches ||
-      this.currentDocumentEpoch(tab) !== approval.documentEpoch ||
+      !documentEpochMatches ||
       normalizedOrigin(tab.shell.url) !== approval.origin ||
       (approval.url !== undefined && tab.shell.url !== approval.url)
     ) {
@@ -13901,6 +13915,7 @@ export class BrowserManager {
     timeoutMs = EVALUATE_TIMEOUT_MS,
     reclaimTargetOnCancellation = true,
     captureDebuggerLease?: (lease: BrowserDebuggerLease) => void,
+    pageLease?: BrowserPageLease,
   ): Promise<unknown> {
     return this.runRendererOperationWithDeadline(
       tab,
@@ -13908,12 +13923,18 @@ export class BrowserManager {
       'Browser script evaluation',
       timeoutMs,
       async () => {
+        const assertEvaluationDocumentCurrent = (): void => {
+          if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+          if (pageLease) this.assertBrowserPageLease(tab, pageLease, 'saved-password autofill');
+        };
+        assertEvaluationDocumentCurrent();
         const debuggerLease = this.acquireBrowserDebuggerLease(contents);
         try {
           captureDebuggerLease?.(debuggerLease);
           const frameTree = (await contents.debugger.sendCommand('Page.getFrameTree')) as {
             frameTree?: { frame?: { id?: string } };
           };
+          assertEvaluationDocumentCurrent();
           const frameId = frameTree.frameTree?.frame?.id;
           if (!frameId) throw new Error('The browser page has no main execution frame.');
           // Run both the caller script and its bounding serializer in a fresh
@@ -13929,6 +13950,11 @@ export class BrowserManager {
           if (!Number.isInteger(isolatedWorld.executionContextId)) {
             throw new Error('The browser page has no isolated execution context.');
           }
+          // If navigation commits before this check, the document lease rejects
+          // it. If it commits after this check, Chromium invalidates the old
+          // executionContextId instead of evaluating the secret in the new
+          // document.
+          assertEvaluationDocumentCurrent();
           const response = (await contents.debugger.sendCommand('Runtime.evaluate', {
             expression: script,
             awaitPromise: true,
@@ -13942,6 +13968,7 @@ export class BrowserManager {
               exception?: { description?: string };
             };
           };
+          assertEvaluationDocumentCurrent();
           if (response.exceptionDetails) {
             throw new Error(
               response.exceptionDetails.exception?.description ??
@@ -16362,6 +16389,7 @@ export class BrowserManager {
     source: 'user' | 'assistant' = 'user',
     assistantRun?: BrowserAssistantRun,
     approvedDocument?: BrowserDocumentApproval,
+    userDocumentToken?: string,
   ): Promise<void> {
     if (source === 'assistant' && !assistantRun) throw new Error('Assistant autofill requires turn ownership.');
     const abortSignal = assistantRun?.abortSignal;
@@ -16381,7 +16409,18 @@ export class BrowserManager {
           ? await this.ensureAssistantView(tab, assistantRun!, documentLease!, undefined, approvedDocument)
           : await this.ensureView(tab)
       ).webContents;
+      const pageLease = source === 'user' ? this.captureBrowserPageLease(tab, contents) : undefined;
+      if (
+        pageLease &&
+        (typeof userDocumentToken !== 'string' || this.browserPageLeaseToken(pageLease) !== userDocumentToken)
+      ) {
+        throw new Error('The browser page changed before saved-password autofill could begin. Try again.');
+      }
+      const assertAutofillPageCurrent = (): void => {
+        if (pageLease) this.assertBrowserPageLease(tab, pageLease, 'saved-password autofill');
+      };
       this.assertBrowserDocumentApproval(tab, approvedDocument);
+      assertAutofillPageCurrent();
       if (reveal && documentLease) await reveal(contents, documentLease);
       throwIfBrowserAborted(abortSignal);
       if (tab.scriptTainted) {
@@ -16390,6 +16429,7 @@ export class BrowserManager {
       const generation = documentLease?.tabGeneration ?? tab.generation;
       const topLevelOrigin = normalizedOrigin(tab.shell.url);
       const { frameOrigins, match } = this.resolveAutofillCredentialTarget(tab, contents, credentialId);
+      assertAutofillPageCurrent();
       const vault = this.vaultForScope(tab.scopeKey);
       if (
         approvedDocument &&
@@ -16408,34 +16448,32 @@ export class BrowserManager {
         .map(([frame]) => frame);
       const autofillPage = async () => {
         throwIfBrowserAborted(abortSignal);
+        assertAutofillPageCurrent();
         if (tab.scriptTainted || generation !== tab.generation || normalizedOrigin(tab.shell.url) !== topLevelOrigin) {
           throw new Error('The page changed before saved-password autofill could begin.');
         }
-        const targetFrames = await this.runRendererOperationWithDeadline(
-          tab,
-          contents,
-          'Browser saved-password target discovery',
-          EVALUATE_TIMEOUT_MS,
-          async () => {
-            const probes = await Promise.all(
-              matchingFrames.map(async (frame) => {
-                try {
-                  if (frame.detached || frame.isDestroyed() || frame.origin !== origin) return null;
-                  return (await frame.executeJavaScript(browserAutofillProbeScript(origin))) === true ? frame : null;
-                } catch {
-                  return null;
-                }
-              }),
-            );
-            return probes.filter((frame): frame is WebFrameMain => frame !== null);
-          },
-          abortSignal,
-          documentLease,
+        const targetFrames = matchingFrames.filter(
+          (frame) => !frame.detached && !frame.isDestroyed() && frame.origin === origin,
         );
         if (targetFrames.length !== 1) {
           throw new Error('Saved-password autofill requires one unambiguous matching login frame.');
         }
         const targetFrame = targetFrames[0];
+        const targetFound = await this.evaluateWithDeadline(
+          tab,
+          contents,
+          browserAutofillProbeScript(origin),
+          abortSignal,
+          documentLease,
+          EVALUATE_TIMEOUT_MS,
+          true,
+          undefined,
+          pageLease,
+        );
+        if (targetFound !== true) {
+          throw new Error('Saved-password autofill requires one unambiguous matching login frame.');
+        }
+        assertAutofillPageCurrent();
         throwIfBrowserAborted(abortSignal);
         if (
           targetFrame.detached ||
@@ -16463,24 +16501,26 @@ export class BrowserManager {
             'The saved credential or destination changed while autofill was waiting. Review it and try again.',
           );
         }
+        assertAutofillPageCurrent();
         const credential = vault.decrypt(match.id);
         try {
+          assertAutofillPageCurrent();
           this.setTabSensitive(tab, true);
-          const filled = await this.runRendererOperationWithDeadline(
+          const filled = await this.evaluateWithDeadline(
             tab,
             contents,
-            'Browser saved-password autofill',
-            EVALUATE_TIMEOUT_MS,
-            () =>
-              targetFrame
-                .executeJavaScript(browserAutofillScript(credential.username, credential.password, origin), false)
-                .catch(() => false),
+            browserAutofillScript(credential.username, credential.password, origin),
             abortSignal,
             documentLease,
-          );
+            EVALUATE_TIMEOUT_MS,
+            true,
+            undefined,
+            pageLease,
+          ).catch(() => false);
           if (filled !== true) {
             throw new Error('Saved-password autofill could not fill the selected login form.');
           }
+          assertAutofillPageCurrent();
           if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
         } finally {
           credential.password = '';

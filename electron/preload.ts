@@ -1154,8 +1154,8 @@ const appAPI = {
       ipcRenderer.invoke('browser:respond-auth', promptId, username, password),
     respondPermissionPrompt: (promptId: string, decision: 'allow-once' | 'allow' | 'deny') =>
       ipcRenderer.invoke('browser:respond-permission', promptId, decision),
-    autofill: (conversationId: string, tabId: string, credentialId?: string) =>
-      ipcRenderer.invoke('browser:autofill', conversationId, tabId, credentialId),
+    autofill: (conversationId: string, tabId: string, credentialId: string | undefined, documentToken: string) =>
+      ipcRenderer.invoke('browser:autofill', conversationId, tabId, credentialId, documentToken),
     dataSummary: (conversationId?: string) => ipcRenderer.invoke('browser:data-summary', conversationId),
     clearData: (options: BrowserDataClearOptions) => ipcRenderer.invoke('browser:clear-data', options),
     onEvent: (callback: (event: BrowserEvent) => void) => {

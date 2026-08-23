@@ -206,9 +206,12 @@ export function registerBrowserHandlers(
   handle('browser:respond-permission', (id: string, decision: unknown) =>
     getBrowserManager().respondPermissionPrompt(id, parseBrowserPermissionDecision(decision)),
   );
-  handle('browser:autofill', (conversationId: string, tabId: string, id?: string) =>
-    getBrowserManager().autofill(conversationId, tabId, id),
-  );
+  handle('browser:autofill', (conversationId: string, tabId: string, id: string | undefined, documentToken: string) => {
+    if (typeof documentToken !== 'string' || documentToken.length === 0 || documentToken.length > 256) {
+      throw new Error('Browser autofill requires the current page document token.');
+    }
+    return getBrowserManager().autofill(conversationId, tabId, id, 'user', undefined, undefined, documentToken);
+  });
   handle('browser:data-summary', (conversationId?: string) => getBrowserManager().dataSummary(conversationId), {
     allowWhenDisabled: true,
   });

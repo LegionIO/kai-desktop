@@ -57,6 +57,7 @@ const manager = vi.hoisted(() => ({
   setChromeFocus: vi.fn(),
   listCredentials: vi.fn(() => []),
   respondPermissionPrompt: vi.fn(),
+  autofill: vi.fn(async () => undefined),
   dataSummary: vi.fn(async () => []),
   clearData: vi.fn(async () => undefined),
 }));
@@ -333,5 +334,36 @@ describe('browser IPC authorization', () => {
       ),
     ).resolves.toMatchObject({ selector: '#target' });
     expect(manager.pickElement).toHaveBeenCalledWith('chat-1', 'tab-1', request.documentToken);
+
+    await expect(
+      harness.invoke(
+        'browser:autofill',
+        { sender: primaryContents, senderFrame: mainFrame },
+        'chat-1',
+        'tab-1',
+        'credential-1',
+      ),
+    ).rejects.toThrow(/document token/i);
+    expect(manager.autofill).not.toHaveBeenCalled();
+
+    await expect(
+      harness.invoke(
+        'browser:autofill',
+        { sender: primaryContents, senderFrame: mainFrame },
+        'chat-1',
+        'tab-1',
+        'credential-1',
+        request.documentToken,
+      ),
+    ).resolves.toBeUndefined();
+    expect(manager.autofill).toHaveBeenCalledWith(
+      'chat-1',
+      'tab-1',
+      'credential-1',
+      'user',
+      undefined,
+      undefined,
+      request.documentToken,
+    );
   });
 });

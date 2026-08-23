@@ -1815,8 +1815,7 @@ describe('BrowserPanel', () => {
           {
             ...tab,
             title: 'Replacement',
-            url: 'https://replacement.example',
-            updatedAt: '2026-01-01T00:00:01.000Z',
+            documentToken: 'replacement-document-token',
           },
         ],
       });
@@ -4106,6 +4105,40 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('heading', { name: 'Passwords' })).toBeInTheDocument();
     expect(screen.getByText('alice')).toBeInTheDocument();
     expect(autofill).not.toHaveBeenCalled();
+  });
+
+  it('binds password-manager autofill to the active renderer document token', async () => {
+    const autofill = vi.fn().mockResolvedValue(undefined);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        listCredentials: async () => [
+          {
+            id: 'credential-1',
+            scopeKey: 'global',
+            origin: 'https://example.com',
+            username: 'alice',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+        autofill,
+      },
+    });
+
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Passwords'));
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Autofill in active tab'));
+
+    await waitFor(() => expect(autofill).toHaveBeenCalledWith('chat-1', tab.id, 'credential-1', tab.documentToken));
   });
 
   it('surfaces a failed native mount and retries the same bounds after resize', async () => {

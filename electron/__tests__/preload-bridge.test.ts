@@ -265,7 +265,11 @@ describe('preload bridge contract', () => {
       ['permission-prompt-1', 'allow-once'],
       ['browser:respond-permission', 'permission-prompt-1', 'allow-once'],
     ],
-    ['autofill', ['chat-1', 'tab-1', 'credential-1'], ['browser:autofill', 'chat-1', 'tab-1', 'credential-1']],
+    [
+      'autofill',
+      ['chat-1', 'tab-1', 'credential-1', 'tab-1:7:2:3:42'],
+      ['browser:autofill', 'chat-1', 'tab-1', 'credential-1', 'tab-1:7:2:3:42'],
+    ],
     [
       'resetSitePermissions',
       ['chat-1', 'https://example.com', 'camera'],

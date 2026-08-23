@@ -879,7 +879,12 @@ export type BrowserBridge = {
   respondCredentialPrompt: (promptId: string, save: boolean) => Promise<void>;
   respondAuthPrompt: (promptId: string, username?: string, password?: string) => Promise<void>;
   respondPermissionPrompt: (promptId: string, decision: 'allow-once' | 'allow' | 'deny') => Promise<void>;
-  autofill: (conversationId: string, tabId: string, credentialId?: string) => Promise<void>;
+  autofill: (
+    conversationId: string,
+    tabId: string,
+    credentialId: string | undefined,
+    documentToken: string,
+  ) => Promise<void>;
   dataSummary: (conversationId?: string) => Promise<BrowserDataSummary[]>;
   clearData: (options: BrowserDataClearOptions) => Promise<void>;
   onEvent: (callback: (event: BrowserEvent) => void) => () => void;

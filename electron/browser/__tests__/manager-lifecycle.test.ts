@@ -6447,6 +6447,59 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.documentEpoch).toBe(3);
   });
 
+  it('does not evaluate a page-bound secret after an isolated world crosses a document commit', async () => {
+    const sendCommand = vi.fn(async (method: string) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+      if (method === 'Page.createIsolatedWorld') {
+        tab.documentEpoch++;
+        return { executionContextId: 7 };
+      }
+      if (method === 'Runtime.evaluate') return { result: { value: true } };
+      throw new Error(`Unexpected command: ${method}`);
+    });
+    const contents = {
+      id: 41,
+      isDestroyed: () => false,
+      debugger: { sendCommand },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/same' },
+      generation: 7,
+      documentEpoch: 2,
+      trustedUserNavigationLease: 3,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebuggerLease: () => ({ release: vi.fn(), cancel: vi.fn() }),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const pageLease = invokePrivate(manager, 'captureBrowserPageLease', tab, contents);
+
+    await expect(
+      invokePrivate(
+        manager,
+        'evaluateWithDeadline',
+        tab,
+        contents,
+        'secret-bearing-script',
+        undefined,
+        undefined,
+        1_000,
+        true,
+        undefined,
+        pageLease,
+      ) as Promise<unknown>,
+    ).rejects.toThrow(/page changed while this saved-password autofill was in progress/i);
+    expect(sendCommand).not.toHaveBeenCalledWith('Runtime.evaluate', expect.anything());
+  });
+
   it('binds tab-list read approval to the exact active tab, order, shells, and documents', () => {
     const first = {
       shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://one.example/account' },
@@ -6485,15 +6538,19 @@ describe('browser manager renderer lifecycle', () => {
   });
 
   it('allows exactly one internal discarded-tab restoration under a bound approval', () => {
+    const contents = { id: 42, isDestroyed: () => false };
     const tab = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
         conversationId: 'chat-1',
         url: 'https://example.com/account',
         discarded: true,
+        error: undefined as string | undefined,
       },
-      view: null,
+      view: null as null | { webContents: typeof contents },
+      viewLoadPromise: null as Promise<unknown> | null,
       generation: 3,
+      documentEpoch: 2,
       trustedUserNavigationLease: 5,
     };
     const manager = managerWithoutConstructor({
@@ -6504,8 +6561,9 @@ describe('browser manager renderer lifecycle', () => {
     const approval = manager.captureDocumentApproval('chat-1', tab.shell.id);
 
     tab.generation++;
+    tab.documentEpoch++;
     tab.shell.discarded = false;
-    tab.view = {} as never;
+    tab.view = { webContents: contents };
     expect(() => invokePrivate(manager, 'assertBrowserDocumentApproval', tab, approval)).not.toThrow();
 
     tab.generation++;
@@ -6514,6 +6572,7 @@ describe('browser manager renderer lifecycle', () => {
     );
 
     tab.generation = approval.tabGeneration + 1;
+    tab.documentEpoch = approval.documentEpoch + 1;
     tab.trustedUserNavigationLease++;
     expect(() => invokePrivate(manager, 'assertBrowserDocumentApproval', tab, approval)).toThrow(
       /page changed while approval was pending/i,
@@ -11165,8 +11224,11 @@ describe('browser manager renderer lifecycle', () => {
       executeJavaScript: vi.fn(async (_source: string, _userGesture?: boolean) => true),
     };
     const contents = {
+      id: 42,
+      isDestroyed: () => false,
       mainFrame: Object.assign(topFrame, { framesInSubtree: [topFrame, loginFrame] }),
     };
+    const view = { webContents: contents };
     const tab = {
       shell: {
         id: 'tab-1',
@@ -11177,7 +11239,9 @@ describe('browser manager renderer lifecycle', () => {
       scopeKey: 'global',
       generation: 4,
       documentEpoch: 7,
+      trustedUserNavigationLease: 2,
       scriptTainted: false,
+      view,
       queue: { run: (task: () => Promise<unknown>) => task() },
     };
     const decrypted = {
@@ -11194,6 +11258,10 @@ describe('browser manager renderer lifecycle', () => {
       updatedAt: '2026-08-16T00:00:00.000Z',
     };
     const listCredentials = vi.fn(() => [credential]);
+    const evaluateWithDeadline = vi.fn(async (_tab: unknown, _contents: unknown, source: string) => {
+      if (source.includes('never-expose-this-password')) throw new Error('never-expose-this-password');
+      return true;
+    });
     const vault = {
       list: listCredentials,
       findForOrigin: vi.fn(
@@ -11206,14 +11274,8 @@ describe('browser manager renderer lifecycle', () => {
       activeTabs: new Map([['chat-1', 'tab-1']]),
       clearingScopes: new Set(),
       disposed: false,
-      ensureView: vi.fn(async () => ({ webContents: contents })),
-      runRendererOperationWithDeadline: (
-        _tab: unknown,
-        _contents: unknown,
-        _operation: string,
-        _timeoutMs: number,
-        task: () => Promise<unknown>,
-      ) => task(),
+      ensureView: vi.fn(async () => view),
+      evaluateWithDeadline,
       scopeActivityCounts: new Map(),
       scopeIdleWaiters: new Map(),
       setTabSensitive: (target: typeof tab, sensitive: boolean) => {
@@ -11235,24 +11297,26 @@ describe('browser manager renderer lifecycle', () => {
       credentialUpdatedAt: credential.updatedAt,
       destinationOrigin: 'https://login.example',
     };
-    await manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval);
+    const documentToken = 'tab-1:4:7:2:42';
+    await manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken);
 
     expect(loginFrame.executeJavaScript).not.toHaveBeenCalled();
-    expect(topFrame.executeJavaScript).toHaveBeenCalledTimes(2);
-    expect(topFrame.executeJavaScript.mock.calls[0][0]).not.toContain('vault-secret');
-    expect(topFrame.executeJavaScript.mock.calls[1][0]).toContain('vault-secret');
-    expect(topFrame.executeJavaScript.mock.calls[1][1]).toBe(false);
+    expect(topFrame.executeJavaScript).not.toHaveBeenCalled();
+    expect(evaluateWithDeadline).toHaveBeenCalledTimes(2);
+    expect(evaluateWithDeadline.mock.calls[0][2]).not.toContain('vault-secret');
+    expect(evaluateWithDeadline.mock.calls[1][2]).toContain('vault-secret');
+    expect((evaluateWithDeadline.mock.calls[1] as unknown[])[8]).toMatchObject({
+      tabGeneration: 4,
+      documentEpoch: 7,
+      contents,
+    });
     expect(vault.decrypt).toHaveBeenCalledWith('credential-1');
     expect(decrypted.password).toBe('');
     expect(tab.shell.sensitive).toBe(true);
 
     decrypted.password = 'never-expose-this-password';
-    topFrame.executeJavaScript.mockImplementation(async (source: string) => {
-      if (source.includes('never-expose-this-password')) throw new Error('never-expose-this-password');
-      return true;
-    });
     const hostileError = await manager
-      .autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval)
+      .autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken)
       .catch((error: unknown) => error);
     expect(hostileError).toBeInstanceOf(Error);
     expect((hostileError as Error).message).toBe('Saved-password autofill could not fill the selected login form.');
@@ -11263,16 +11327,61 @@ describe('browser manager renderer lifecycle', () => {
       ...credential,
       updatedAt: '2026-08-16T00:30:00.000Z',
     });
-    await expect(manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval)).rejects.toThrow(
-      /credential or destination changed while autofill was waiting/i,
-    );
+    await expect(
+      manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
+    ).rejects.toThrow(/credential or destination changed while autofill was waiting/i);
     expect(vault.decrypt).toHaveBeenCalledTimes(2);
 
     listCredentials.mockReturnValue([{ ...credential, updatedAt: '2026-08-16T01:00:00.000Z' }]);
-    await expect(manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval)).rejects.toThrow(
-      /credential or destination changed while approval was pending/i,
-    );
+    await expect(
+      manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
+    ).rejects.toThrow(/credential or destination changed while approval was pending/i);
     expect(vault.decrypt).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects user autofill when the renderer document token is stale', async () => {
+    const frame = {
+      detached: false,
+      isDestroyed: () => false,
+      origin: 'https://login.example',
+    };
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: Object.assign(frame, { framesInSubtree: [frame] }),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://login.example/account',
+        sensitive: false,
+      },
+      scopeKey: 'global',
+      generation: 4,
+      documentEpoch: 8,
+      trustedUserNavigationLease: 2,
+      scriptTainted: false,
+      view: { webContents: contents },
+      queue: { run: (task: () => Promise<unknown>) => task() },
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      clearingScopes: new Set(),
+      disposed: false,
+      ensureView: vi.fn(async () => tab.view),
+      evaluateWithDeadline: vi.fn(),
+      scopeActivityCounts: new Map(),
+      scopeIdleWaiters: new Map(),
+      shuttingDown: false,
+      suspendedScopes: new Set(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      manager.autofill('chat-1', tab.shell.id, 'credential-1', 'user', undefined, undefined, 'tab-1:4:7:2:42'),
+    ).rejects.toThrow(/page changed before saved-password autofill/i);
+    expect(Reflect.get(manager, 'evaluateWithDeadline')).not.toHaveBeenCalled();
   });
 
   it('does not offer a child-frame credential for autofill approval', async () => {

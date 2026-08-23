@@ -657,14 +657,15 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       setMenuOpen(true);
       return;
     }
-    const pageIdentity = `${conversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}`;
+    const pageIdentity = `${conversationId}\u0000${active.id}\u0000${active.documentToken ?? ''}\u0000${active.url}\u0000${active.updatedAt}`;
     const requestIsCurrent = (): boolean => {
       const current = stateRef.current?.tabs.find((tab) => tab.active);
       return (
         browserMenuPreviewRequestRef.current === request &&
         browserMenuPageRef.current === pageIdentity &&
         !!current &&
-        `${conversationId}\u0000${current.id}\u0000${current.url}\u0000${current.updatedAt}` === pageIdentity
+        `${conversationId}\u0000${current.id}\u0000${current.documentToken ?? ''}\u0000${current.url}\u0000${current.updatedAt}` ===
+          pageIdentity
       );
     };
     const revealProtectedMenu = async (preview: string | null): Promise<void> => {
@@ -752,7 +753,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   }, [active, browser, browserMenuPreviewPending, conversationId, dismissBrowserMenu, menuOpen, reportError]);
 
   useLayoutEffect(() => {
-    const nextPage = active ? `${conversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}` : null;
+    const nextPage = active
+      ? `${conversationId}\u0000${active.id}\u0000${active.documentToken ?? ''}\u0000${active.url}\u0000${active.updatedAt}`
+      : null;
     const pageChanged = browserMenuPageRef.current !== nextPage;
     browserMenuPageRef.current = nextPage;
     if ((menuOpen || browserMenuPreviewPending) && pageChanged) dismissBrowserMenu();
@@ -760,6 +763,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     // briefly display pixels from the previous tab beneath Browser chrome.
   }, [
     active?.id,
+    active?.documentToken,
     active?.updatedAt,
     active?.url,
     browserMenuPreviewPending,
@@ -3748,7 +3752,16 @@ const BrowserManagerView: FC<{
                         if (!current.activeTabId) {
                           throw new Error('Open a browser tab before autofilling a saved password.');
                         }
-                        await app.browser.autofill(conversationId, current.activeTabId, item.id);
+                        const currentTab = current.tabs.find((tab) => tab.id === current.activeTabId);
+                        if (!currentTab?.documentToken) {
+                          throw new Error('The active browser page is still loading. Try autofill again.');
+                        }
+                        await app.browser.autofill(
+                          conversationId,
+                          current.activeTabId,
+                          item.id,
+                          currentTab.documentToken,
+                        );
                       });
                       if (filled) onClose();
                     }}
