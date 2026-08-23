@@ -1115,19 +1115,30 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
 export type WorkspaceConfigMutation = {
   activeWorkspaceChanged: boolean;
   lastConversationStateChanged: boolean;
+  /** Exact workspace cursors changed by a trusted in-process mutation. Omitted
+   * for external or otherwise ambiguous reloads, which must invalidate every
+   * cursor token to preserve ABA safety. */
+  lastConversationChangedWorkspaceIds?: string[];
 };
 
 function workspaceConfigState(config: AppConfig): {
   activeWorkspaceId: string | null;
-  lastConversationFingerprint: string;
+  lastConversationByWorkspaceId: Map<string, string | null>;
 } {
-  const workspaces = [...(config.ui?.workspaces ?? [])]
-    .map((workspace) => [workspace.id, workspace.lastActiveConversationId ?? null] as const)
-    .sort(([left], [right]) => left.localeCompare(right));
   return {
     activeWorkspaceId: config.ui?.activeWorkspaceId ?? null,
-    lastConversationFingerprint: JSON.stringify(workspaces),
+    lastConversationByWorkspaceId: new Map(
+      (config.ui?.workspaces ?? []).map((workspace) => [workspace.id, workspace.lastActiveConversationId ?? null]),
+    ),
   };
+}
+
+function changedWorkspaceConversationIds(
+  previous: ReadonlyMap<string, string | null>,
+  next: ReadonlyMap<string, string | null>,
+): string[] {
+  const ids = new Set([...previous.keys(), ...next.keys()]);
+  return [...ids].filter((id) => previous.has(id) !== next.has(id) || previous.get(id) !== next.get(id)).sort();
 }
 
 function desktopConfigFileIdentity(configPath: string): string | null {
@@ -1353,10 +1364,14 @@ export function registerConfigHandlers(
 
   const observeWorkspaceConfig = (nextConfig: AppConfig): void => {
     const next = workspaceConfigState(nextConfig);
+    const lastConversationChangedWorkspaceIds = changedWorkspaceConversationIds(
+      lastObservedWorkspaceState.lastConversationByWorkspaceId,
+      next.lastConversationByWorkspaceId,
+    );
     const mutation = {
       activeWorkspaceChanged: next.activeWorkspaceId !== lastObservedWorkspaceState.activeWorkspaceId,
-      lastConversationStateChanged:
-        next.lastConversationFingerprint !== lastObservedWorkspaceState.lastConversationFingerprint,
+      lastConversationStateChanged: lastConversationChangedWorkspaceIds.length > 0,
+      lastConversationChangedWorkspaceIds,
     };
     lastObservedWorkspaceState = next;
     if (

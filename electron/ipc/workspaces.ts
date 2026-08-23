@@ -88,7 +88,15 @@ export function registerWorkspaceHandlers(
       activeWorkspaceMutationToken = null;
       if (internalActiveWorkspaceMutationDepth === 0) advanceActiveWorkspaceRevision();
     }
-    if (mutation.lastConversationStateChanged) lastConversationMutations.clear();
+    if (mutation.lastConversationStateChanged) {
+      if (mutation.lastConversationChangedWorkspaceIds === undefined) {
+        lastConversationMutations.clear();
+      } else {
+        for (const workspaceId of mutation.lastConversationChangedWorkspaceIds) {
+          lastConversationMutations.delete(workspaceId);
+        }
+      }
+    }
   };
 
   // ── Create ──────────────────────────────────────────────────────────────

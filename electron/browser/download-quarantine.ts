@@ -31,6 +31,8 @@ const EXPORT_JOURNAL_FILENAME =
 const MAX_EXPORT_JOURNAL_BYTES = 16 * 1024;
 const MAX_XATTR_ERROR_BYTES = 8 * 1_024;
 
+class InvalidAssistantDownloadExportJournalError extends Error {}
+
 type AssistantDownloadExportOptions = {
   platform?: NodeJS.Platform;
   now?: number;
@@ -454,6 +456,37 @@ async function assertOpenFileOwnsPath(handle: FileHandle, path: string, label: s
   }
 }
 
+async function readBoundedAssistantDownloadExportJournal(path: string): Promise<unknown> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await fsPromises.open(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+    );
+    const metadata = await handle.stat();
+    if (
+      !metadata.isFile() ||
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size < 0 ||
+      metadata.size > MAX_EXPORT_JOURNAL_BYTES
+    ) {
+      throw new InvalidAssistantDownloadExportJournalError(
+        'The assistant download export journal entry is not a bounded regular file.',
+      );
+    }
+    const contents = Buffer.allocUnsafe(metadata.size);
+    let offset = 0;
+    while (offset < contents.byteLength) {
+      const { bytesRead } = await handle.read(contents, offset, contents.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return JSON.parse(contents.subarray(0, offset).toString('utf8')) as unknown;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 export async function exportAssistantDownloadFile(
   appHome: string,
   source: string,
@@ -571,19 +604,32 @@ export async function reconcileAssistantDownloadExportJournal(appHome: string): 
   let journalDirectoryChanged = false;
   for (const entry of await fsPromises.readdir(journalDirectory, { withFileTypes: true })) {
     const match = EXPORT_JOURNAL_FILENAME.exec(entry.name);
-    if (!match || !entry.isFile()) continue;
+    if (!match) continue;
     const journalPath = join(journalDirectory, entry.name);
-    const journalStats = await fsPromises.lstat(journalPath);
-    if (!journalStats.isFile() || journalStats.size > MAX_EXPORT_JOURNAL_BYTES) {
+    // Matching non-files are never valid recovery records. In particular,
+    // unlink symlinks and FIFOs without opening or following them. A directory
+    // is left alone because unlink cannot remove it and recovery must not
+    // recursively delete a locally planted tree.
+    if (!entry.isFile()) {
+      if (entry.isDirectory()) continue;
       await removeFileIfPresent(journalPath);
       journalDirectoryChanged = true;
       continue;
     }
     let record: unknown;
     try {
-      record = JSON.parse(await fsPromises.readFile(journalPath, 'utf8'));
+      // Open, validate, and read one descriptor. O_NOFOLLOW rejects a path that
+      // becomes a symlink after readdir; O_NONBLOCK prevents a FIFO swap from
+      // hanging startup; positional reads never exceed the fstat-validated cap.
+      record = await readBoundedAssistantDownloadExportJournal(journalPath);
     } catch (error) {
-      if (error instanceof SyntaxError) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') continue;
+      if (
+        error instanceof SyntaxError ||
+        error instanceof InvalidAssistantDownloadExportJournalError ||
+        code === 'ELOOP'
+      ) {
         await removeFileIfPresent(journalPath);
         journalDirectoryChanged = true;
         continue;

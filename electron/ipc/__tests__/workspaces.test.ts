@@ -234,12 +234,20 @@ describe('workspaces:set-active integrity', () => {
 
   it('invalidates last-conversation provenance across an out-of-band ABA change', async () => {
     dirs.add('/work/a');
+    dirs.add('/work/b');
     const workspace = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const unaffectedWorkspace = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
     await expect(
       saveLastConversation(workspace.id, 'chat-browser', undefined, 'browser-request'),
     ).resolves.toMatchObject({
       ok: true,
       lastActiveConversationMutationToken: 'browser-request',
+    });
+    await expect(
+      saveLastConversation(unaffectedWorkspace.id, 'chat-other-browser', undefined, 'other-browser-request'),
+    ).resolves.toMatchObject({
+      ok: true,
+      lastActiveConversationMutationToken: 'other-browser-request',
     });
 
     const stored = config.ui.workspaces.find((candidate) => (candidate as { id?: string }).id === workspace.id) as {
@@ -257,6 +265,51 @@ describe('workspaces:set-active integrity', () => {
       lastActiveConversationId: 'chat-browser',
     });
     expect(stored.lastActiveConversationId).toBe('chat-browser');
+    await expect(
+      saveLastConversation(
+        unaffectedWorkspace.id,
+        'chat-other-old',
+        'chat-other-browser',
+        undefined,
+        'other-browser-request',
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: 'last-conversation-changed',
+      lastActiveConversationId: 'chat-other-browser',
+    });
+  });
+
+  it('preserves a destination cursor token when another workspace cursor changes', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    const departing = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const destination = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+    await saveLastConversation(departing.id, 'chat-departing');
+    await saveLastConversation(destination.id, 'chat-previous');
+    await expect(
+      saveLastConversation(destination.id, 'chat-browser', 'chat-previous', 'browser-request'),
+    ).resolves.toMatchObject({
+      ok: true,
+      lastActiveConversationMutationToken: 'browser-request',
+    });
+
+    // React persists the conversation being left after Browser navigation has
+    // already installed the destination cursor. Only the departing workspace's
+    // provenance changed, so the destination rollback token must survive.
+    invalidateMutationProvenance({
+      activeWorkspaceChanged: false,
+      lastConversationStateChanged: true,
+      lastConversationChangedWorkspaceIds: [departing.id],
+    });
+
+    await expect(
+      saveLastConversation(destination.id, 'chat-previous', 'chat-browser', undefined, 'browser-request'),
+    ).resolves.toEqual({
+      ok: true,
+      previousConversationId: 'chat-browser',
+      lastActiveConversationId: 'chat-previous',
+    });
   });
 
   it('rejects a rollback after another mutation changes the workspace away and back', async () => {

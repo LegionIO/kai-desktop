@@ -12,6 +12,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -368,6 +369,48 @@ describe('assistant download quarantine', () => {
     expect(existsSync(staged)).toBe(false);
     expect(readFileSync(unrelatedFile, 'utf8')).toBe('unrelated');
     expect(readdirSync(journalDirectory)).toEqual([]);
+  });
+
+  it('removes a symlinked export journal without reading or changing its target', async () => {
+    const appHome = createAppHome();
+    const exportId = '11111111-1111-4111-8111-111111111111';
+    const journalDirectory = assistantDownloadExportJournalDirectory(appHome);
+    const external = join(appHome, 'external.json');
+    mkdirSync(journalDirectory, { recursive: true });
+    writeFileSync(external, '{"external":true}');
+    symlinkSync(external, join(journalDirectory, `Kai-${exportId}.json`));
+
+    await expect(reconcileAssistantDownloadExportJournal(appHome)).resolves.toEqual([]);
+
+    expect(readFileSync(external, 'utf8')).toBe('{"external":true}');
+    expect(readdirSync(journalDirectory)).toEqual([]);
+  });
+
+  it.runIf(process.platform !== 'win32')('removes a FIFO export journal without blocking', async () => {
+    const appHome = createAppHome();
+    const exportId = '22222222-2222-4222-8222-222222222222';
+    const journalDirectory = assistantDownloadExportJournalDirectory(appHome);
+    const journalPath = join(journalDirectory, `Kai-${exportId}.json`);
+    mkdirSync(journalDirectory, { recursive: true });
+    execFileSync('/usr/bin/mkfifo', [journalPath]);
+
+    await expect(reconcileAssistantDownloadExportJournal(appHome)).resolves.toEqual([]);
+
+    expect(existsSync(journalPath)).toBe(false);
+  });
+
+  it('removes an oversized export journal without reading beyond its cap', async () => {
+    const appHome = createAppHome();
+    const exportId = '44444444-4444-4444-8444-444444444444';
+    const journalDirectory = assistantDownloadExportJournalDirectory(appHome);
+    const journalPath = join(journalDirectory, `Kai-${exportId}.json`);
+    mkdirSync(journalDirectory, { recursive: true });
+    writeFileSync(journalPath, '');
+    truncateSync(journalPath, 16 * 1024 + 1);
+
+    await expect(reconcileAssistantDownloadExportJournal(appHome)).resolves.toEqual([]);
+
+    expect(existsSync(journalPath)).toBe(false);
   });
 
   it('treats missing persisted quarantine artifacts as unavailable', () => {

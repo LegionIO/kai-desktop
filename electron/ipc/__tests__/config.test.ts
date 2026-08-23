@@ -369,6 +369,52 @@ describe('config IPC: registered channels', () => {
     });
   });
 
+  it('reports the exact workspace cursors changed by an internal config write', async () => {
+    const onWorkspaceConfigMutation = vi.fn();
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(
+          ipc as Parameters<typeof registerConfigHandlers>[0],
+          appHome,
+          undefined,
+          undefined,
+          undefined,
+          onWorkspaceConfigMutation,
+        );
+      },
+    });
+    const workspaceA = {
+      id: 'workspace-a',
+      name: 'A',
+      directory: '/work/a',
+      color: '#123456',
+      lastActiveAt: 1,
+      createdAt: 1,
+      lastActiveConversationId: 'chat-a',
+    };
+    const workspaceB = {
+      ...workspaceA,
+      id: 'workspace-b',
+      name: 'B',
+      directory: '/work/b',
+      lastActiveConversationId: 'chat-b',
+    };
+
+    await harness.invoke('config:set', FAKE_EVENT, 'ui.workspaces', [workspaceA, workspaceB]);
+    onWorkspaceConfigMutation.mockClear();
+    await harness.invoke('config:set', FAKE_EVENT, 'ui.workspaces', [
+      { ...workspaceA, lastActiveConversationId: 'chat-a-next' },
+      workspaceB,
+    ]);
+
+    expect(onWorkspaceConfigMutation).toHaveBeenCalledOnce();
+    expect(onWorkspaceConfigMutation).toHaveBeenCalledWith({
+      activeWorkspaceChanged: false,
+      lastConversationStateChanged: true,
+      lastConversationChangedWorkspaceIds: ['workspace-a'],
+    });
+  });
+
   it('hot-reloads first-time llm.json creation before desktop.json exists', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
