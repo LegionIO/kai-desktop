@@ -11427,7 +11427,9 @@ describe('browser manager renderer lifecycle', () => {
     expect(topFrame.executeJavaScript).not.toHaveBeenCalled();
     expect(evaluateWithDeadline).toHaveBeenCalledTimes(2);
     expect(evaluateWithDeadline.mock.calls[0][2]).not.toContain('vault-secret');
+    expect((evaluateWithDeadline.mock.calls[0] as unknown[])[9]).toBeUndefined();
     expect(evaluateWithDeadline.mock.calls[1][2]).toContain('vault-secret');
+    expect((evaluateWithDeadline.mock.calls[1] as unknown[])[9]).toBe(true);
     expect((evaluateWithDeadline.mock.calls[1] as unknown[])[8]).toMatchObject({
       tabGeneration: 4,
       documentEpoch: 7,
@@ -11436,6 +11438,14 @@ describe('browser manager renderer lifecycle', () => {
     expect(vault.decrypt).toHaveBeenCalledWith('credential-1');
     expect(decrypted.password).toBe('');
     expect(tab.shell.sensitive).toBe(true);
+
+    evaluateWithDeadline.mockRejectedValueOnce(
+      new Error('Saved-password autofill requires one unambiguous visible login field.'),
+    );
+    await expect(
+      manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),
+    ).rejects.toThrow(/unambiguous visible login field/i);
+    expect(vault.decrypt).toHaveBeenCalledTimes(1);
 
     decrypted.password = 'never-expose-this-password';
     const hostileError = await manager

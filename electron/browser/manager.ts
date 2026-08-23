@@ -16488,7 +16488,6 @@ export class BrowserManager {
           true,
           undefined,
           pageLease,
-          true,
         );
         if (targetFound !== true) {
           throw new Error('Saved-password autofill requires one unambiguous matching login frame.');
