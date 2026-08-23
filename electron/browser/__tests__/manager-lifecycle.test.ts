@@ -74,8 +74,12 @@ vi.mock('electron', () => ({
   },
 }));
 
-const { BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS, BrowserManager, popupInitiatorFrameTreeNodeId } =
-  await import('../manager.js');
+const {
+  BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS,
+  BrowserManager,
+  MAX_BROWSER_TARGET_DOM_VISITS,
+  popupInitiatorFrameTreeNodeId,
+} = await import('../manager.js');
 const { browserNativeUiGuardActivationProbe } = await import('../evaluation.js');
 const { MAX_BROWSER_URL_CHARS } = await import('../metadata.js');
 const { MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB, MAX_BROWSER_NETWORK_REQUESTS_PER_TAB } =
@@ -17378,6 +17382,75 @@ describe('browser manager renderer lifecycle', () => {
     expect(listeners).toHaveLength(0);
   });
 
+  it('rejects duplicate-URL history that moves after post-navigation authorization starts', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const postNavigationAuthorization = deferred<void>();
+    let activeIndex = 2;
+    const duplicateUrl = 'https://example.com/app#same';
+    const navigationHistory = {
+      canGoToOffset: () => true,
+      getActiveIndex: () => activeIndex,
+      getEntryAtIndex: () => ({ url: duplicateUrl }),
+      goToIndex: vi.fn(),
+    };
+    const contents = {
+      getURL: () => duplicateUrl,
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => false,
+      navigationHistory,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: duplicateUrl },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 8,
+      networkNavigationSequence: 10,
+      trustedUserNavigationLease: 2,
+      view: { webContents: contents },
+    };
+    const assertAssistantNavigationAllowed = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(() => postNavigationAuthorization.promise);
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      assertAssistantNavigationAllowed,
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeout: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+    });
+
+    const navigating = invokePrivate(manager, 'navigateAssistantHistory', tab, contents, -1, undefined, {
+      runGeneration: 1,
+      tabGeneration: 8,
+      userNavigationLease: 2,
+      url: duplicateUrl,
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(navigationHistory.goToIndex).toHaveBeenCalledWith(1));
+
+    listeners.get('did-start-navigation')?.({}, duplicateUrl, true, true);
+    activeIndex = 1;
+    listeners.get('did-navigate-in-page')?.({}, duplicateUrl, true);
+    await vi.waitFor(() => expect(assertAssistantNavigationAllowed).toHaveBeenCalledTimes(2));
+
+    // Page script moves to another same-URL entry while DNS/network policy is
+    // still being checked, without changing the document-generation lease.
+    activeIndex = 2;
+    postNavigationAuthorization.resolve(undefined);
+
+    await expect(navigating).rejects.toThrow(/history changed while navigation was being authorized/i);
+    expect(listeners).toHaveLength(0);
+  });
+
   it('ignores subframe in-page navigation and records main-frame SPA navigation safely', () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     let currentUrl = 'https://example.com/app';
@@ -18590,6 +18663,66 @@ describe('browser manager renderer lifecycle', () => {
           name: 'Delete',
         }),
       ).rejects.toThrow(/multiple visible elements/i);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it('bounds semantic target traversal before an attacker-controlled page can exhaust the renderer', async () => {
+    const dom = new JSDOM('<div></div>', {
+      url: 'https://example.com',
+      runScripts: 'outside-only',
+    });
+    try {
+      const repeatedNode = dom.window.document.querySelector('div')!;
+      let elementReads = 0;
+      Object.defineProperty(dom.window.document, 'createTreeWalker', {
+        configurable: true,
+        value: () => ({
+          nextNode: () => {
+            elementReads += 1;
+            return repeatedNode;
+          },
+        }),
+      });
+      const sendCommand = vi.fn(async (command: string, params?: { expression?: string }) => {
+        if (command === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+        if (command === 'Page.createIsolatedWorld') return { executionContextId: 73 };
+        if (command === 'Runtime.evaluate') {
+          try {
+            return { result: { value: dom.window.eval(params?.expression ?? '') } };
+          } catch (error) {
+            return { exceptionDetails: { exception: { description: (error as Error).message } } };
+          }
+        }
+        throw new Error(`Unexpected debugger command: ${command}`);
+      });
+      const manager = managerWithoutConstructor({
+        runRendererOperationWithDeadline: async (
+          _tab: unknown,
+          _contents: unknown,
+          _operation: string,
+          _timeoutMs: number,
+          task: () => Promise<unknown>,
+        ) => task(),
+      });
+      const contents = {
+        debugger: {
+          attach: vi.fn(),
+          detach: vi.fn(),
+          isAttached: () => true,
+          sendCommand,
+        },
+        isDestroyed: () => false,
+      };
+
+      await expect(
+        invokePrivate(manager, 'locate', { shell: { id: 'tab-1' } }, contents, {
+          kind: 'click',
+          selector: '#missing',
+        }),
+      ).rejects.toThrow(/safe DOM traversal limit/i);
+      expect(elementReads).toBe(MAX_BROWSER_TARGET_DOM_VISITS);
     } finally {
       dom.window.close();
     }

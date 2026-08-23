@@ -2,7 +2,11 @@ import vm from 'node:vm';
 // @ts-expect-error jsdom is installed for Vitest's DOM environment without its optional declaration package.
 import { JSDOM } from 'jsdom';
 import { describe, expect, it } from 'vitest';
-import { browserInspectionExpression } from '../inspection.js';
+import {
+  browserInspectionExpression,
+  MAX_BROWSER_INSPECTION_CANDIDATES,
+  MAX_BROWSER_INSPECTION_DOM_VISITS,
+} from '../inspection.js';
 import { MAX_BROWSER_ROLE_CHARS, MAX_BROWSER_SELECTOR_CHARS } from '../input-validation.js';
 
 describe('browser inspection expression', () => {
@@ -109,7 +113,11 @@ describe('browser inspection expression', () => {
             detach: () => undefined,
           };
         },
-        createTreeWalker: (root: unknown) => {
+        createTreeWalker: (root: unknown, whatToShow: number) => {
+          if (whatToShow === 1) {
+            let elementIndex = 0;
+            return { nextNode: () => [button][elementIndex++] ?? null };
+          }
           const nodes = textNodes.get(root) ?? [];
           let index = 0;
           return { nextNode: () => nodes[index++] ?? null };
@@ -120,7 +128,7 @@ describe('browser inspection expression', () => {
       getComputedStyle: () => ({ display: 'block', opacity: '1', visibility: 'visible' }),
       innerHeight: 800,
       innerWidth: 1_200,
-      NodeFilter: { SHOW_TEXT: 4 },
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
       scrollX: 0,
       scrollY: 0,
     }) as {
@@ -165,14 +173,17 @@ describe('browser inspection expression', () => {
       CSS: { escape: (value: string) => value },
       document: {
         body,
-        createTreeWalker: () => ({ nextNode: () => null }),
+        createTreeWalker: (_root: unknown, whatToShow: number) => {
+          let index = 0;
+          return { nextNode: () => (whatToShow === 1 ? (all[index++] ?? null) : null) };
+        },
         elementsFromPoint: (x: number) => (x < 30 ? [first, body] : [second, body]),
         querySelectorAll,
       },
       getComputedStyle: () => ({ display: 'block', opacity: '1', visibility: 'visible' }),
       innerHeight: 600,
       innerWidth: 800,
-      NodeFilter: { SHOW_TEXT: 4 },
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
       scrollX: 0,
       scrollY: 0,
     }) as { elements: Array<{ selector: string }> };
@@ -254,7 +265,12 @@ describe('browser inspection expression', () => {
             detach: () => undefined,
           };
         },
-        createTreeWalker: (root: unknown) => {
+        createTreeWalker: (root: unknown, whatToShow: number) => {
+          if (whatToShow === 1) {
+            const nodes = [visible, hiddenAncestor, hiddenChild, transparent, offscreen];
+            let elementIndex = 0;
+            return { nextNode: () => nodes[elementIndex++] ?? null };
+          }
           const nodes = root === body ? allTextNodes : allTextNodes.filter((node) => node.parentElement === root);
           let index = 0;
           return { nextNode: () => nodes[index++] ?? null };
@@ -275,7 +291,7 @@ describe('browser inspection expression', () => {
       }),
       innerHeight: 600,
       innerWidth: 800,
-      NodeFilter: { SHOW_TEXT: 4 },
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
       scrollX: 0,
       scrollY: 0,
     }) as { visibleText: string; elements: Array<{ text: string }> };
@@ -334,7 +350,12 @@ describe('browser inspection expression', () => {
             detach: () => undefined,
           };
         },
-        createTreeWalker: (root: unknown) => {
+        createTreeWalker: (root: unknown, whatToShow: number) => {
+          if (whatToShow === 1) {
+            const nodes = [occluded, clipped, overlay];
+            let elementIndex = 0;
+            return { nextNode: () => nodes[elementIndex++] ?? null };
+          }
           const nodes = root === body ? textNodes : textNodes.filter((node) => node.parentElement === root);
           let index = 0;
           return { nextNode: () => nodes[index++] ?? null };
@@ -345,7 +366,7 @@ describe('browser inspection expression', () => {
       getComputedStyle: () => ({ display: 'block', opacity: '1', visibility: 'visible' }),
       innerHeight: 600,
       innerWidth: 800,
-      NodeFilter: { SHOW_TEXT: 4 },
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
       scrollX: 0,
       scrollY: 0,
     }) as { visibleText: string; elements: unknown[] };
@@ -353,5 +374,109 @@ describe('browser inspection expression', () => {
     expect(result.visibleText).toBe('');
     expect(result.elements).toEqual([]);
     expect(JSON.stringify(result)).not.toMatch(/OCCLUDED|CLIPPED/);
+  });
+
+  it.each([
+    { label: 'DOM visits', limit: MAX_BROWSER_INSPECTION_DOM_VISITS, tagName: 'DIV', occluded: false },
+    { label: 'visible candidates', limit: MAX_BROWSER_INSPECTION_CANDIDATES, tagName: 'BUTTON', occluded: true },
+  ])('bounds $label before traversing an attacker-controlled page', ({ limit, tagName, occluded }) => {
+    const body = {
+      children: [] as unknown[],
+      getAttribute: () => null,
+      hidden: false,
+      nodeType: 1,
+      parentElement: null,
+      tagName: 'BODY',
+    };
+    const node = {
+      children: [] as unknown[],
+      disabled: false,
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ left: 0, top: 0, right: 10, bottom: 10, width: 10, height: 10 }),
+      hidden: false,
+      id: '',
+      nodeType: 1,
+      parentElement: body,
+      tagName,
+    };
+    let elementReads = 0;
+    const result = vm.runInNewContext(browserInspectionExpression(), {
+      CSS: { escape: (value: string) => value },
+      document: {
+        body,
+        createTreeWalker: (_root: unknown, whatToShow: number) => ({
+          nextNode: () => {
+            if (whatToShow !== 1) return null;
+            elementReads += 1;
+            return elementReads <= limit + 10 ? node : null;
+          },
+        }),
+        elementsFromPoint: () => (occluded ? [] : [node, body]),
+        querySelectorAll: () => [],
+      },
+      getComputedStyle: () => ({ display: 'block', opacity: '1', visibility: 'visible' }),
+      innerHeight: 600,
+      innerWidth: 800,
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
+      scrollX: 0,
+      scrollY: 0,
+    }) as { elements: unknown[]; truncated: boolean };
+
+    expect(elementReads).toBe(limit);
+    expect(result.elements).toEqual([]);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('does not let hidden controls consume the candidate budget before a visible control', () => {
+    const body = {
+      children: [] as unknown[],
+      getAttribute: () => null,
+      hidden: false,
+      nodeType: 1,
+      parentElement: null,
+      tagName: 'BODY',
+    };
+    const hidden = {
+      children: [] as unknown[],
+      disabled: false,
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ left: 0, top: 0, right: 10, bottom: 10, width: 10, height: 10 }),
+      hidden: true,
+      id: '',
+      nodeType: 1,
+      parentElement: body,
+      tagName: 'BUTTON',
+    };
+    const visible = {
+      ...hidden,
+      hidden: false,
+      id: 'visible-control',
+    };
+    let elementReads = 0;
+    const result = vm.runInNewContext(browserInspectionExpression(), {
+      CSS: { escape: (value: string) => value },
+      document: {
+        body,
+        createTreeWalker: (_root: unknown, whatToShow: number) => ({
+          nextNode: () => {
+            if (whatToShow !== 1) return null;
+            elementReads += 1;
+            if (elementReads <= MAX_BROWSER_INSPECTION_CANDIDATES + 1) return hidden;
+            return elementReads === MAX_BROWSER_INSPECTION_CANDIDATES + 2 ? visible : null;
+          },
+        }),
+        elementsFromPoint: () => [visible, body],
+        querySelectorAll: () => [visible],
+      },
+      getComputedStyle: () => ({ display: 'block', opacity: '1', visibility: 'visible' }),
+      innerHeight: 600,
+      innerWidth: 800,
+      NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
+      scrollX: 0,
+      scrollY: 0,
+    }) as { elements: Array<{ selector: string }>; truncated: boolean };
+
+    expect(result.elements).toEqual([expect.objectContaining({ selector: '#visible-control' })]);
+    expect(result.truncated).toBe(false);
   });
 });

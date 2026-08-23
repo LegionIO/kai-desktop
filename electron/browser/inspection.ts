@@ -6,6 +6,8 @@ export const MAX_BROWSER_INSPECTION_VISIBLE_TEXT_CHARS = 50_000;
 export const MAX_BROWSER_INSPECTION_NAME_CHARS = 200;
 export const MAX_BROWSER_INSPECTION_TEXT_CHARS = 500;
 export const MAX_BROWSER_INSPECTION_OCCLUSION_POINTS = 512;
+export const MAX_BROWSER_INSPECTION_DOM_VISITS = 10_000;
+export const MAX_BROWSER_INSPECTION_CANDIDATES = 2_000;
 
 /** Build the expression evaluated in Chromium's isolated world. Every
  * page-controlled string is bounded before CDP clones the result into main. */
@@ -147,11 +149,16 @@ export function browserInspectionExpression(): string {
       }
       return false;
     };
+    const visibleElementRect = (el) => {
+      if (!el || el.nodeType !== 1 || !styleAllowsVisibility(el)) return null;
+      let raw;
+      try { raw = el.getBoundingClientRect(); } catch { return null; }
+      const clipped = viewportRect(raw);
+      return clipped ? { raw, clipped } : null;
+    };
     const isVisible = (el) => {
-      if (!el || el.nodeType !== 1 || !styleAllowsVisibility(el)) return false;
-      let rect;
-      try { rect = viewportRect(el.getBoundingClientRect()); } catch { return false; }
-      return !!rect && hasUnoccludedPoint(el, rect, true);
+      const rect = visibleElementRect(el);
+      return !!rect && hasUnoccludedPoint(el, rect.clipped, true);
     };
     const isTextVisible = (textNode, parent) => {
       if (!styleAllowsVisibility(parent) || typeof document.createRange !== 'function') return false;
@@ -193,12 +200,48 @@ export function browserInspectionExpression(): string {
       }
       return bounded(parts.join(' '), limit);
     };
-    const nodes = Array.from(document.querySelectorAll('a,button,input:not([type="password"]),select,textarea,[role],[tabindex]'));
+    const isInteractiveCandidate = (el) => {
+      const tag = bounded(el?.tagName, 32).toUpperCase();
+      if (tag === 'A' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+      if (tag === 'INPUT') {
+        const type = bounded(el.getAttribute?.('type') ?? el.type, 64).toLowerCase();
+        return type !== 'password';
+      }
+      if (typeof el?.getAttribute !== 'function') return false;
+      return el.getAttribute('role') !== null || el.getAttribute('tabindex') !== null;
+    };
     const elements = [];
-    for (const el of nodes) {
-      if (elements.length >= ${MAX_BROWSER_INSPECTION_ELEMENTS}) break;
-      const rect = el.getBoundingClientRect();
-      if (!isVisible(el)) continue;
+    let visitedElements = 0;
+    let visitedCandidates = 0;
+    let truncated = false;
+    let elementWalker = null;
+    const inspectionRoot = document.documentElement ?? document.body;
+    try {
+      if (inspectionRoot) elementWalker = document.createTreeWalker(inspectionRoot, NodeFilter.SHOW_ELEMENT);
+      else truncated = true;
+    } catch { truncated = true; }
+    while (elementWalker) {
+      if (
+        elements.length >= ${MAX_BROWSER_INSPECTION_ELEMENTS} ||
+        visitedElements >= ${MAX_BROWSER_INSPECTION_DOM_VISITS} ||
+        visitedCandidates >= ${MAX_BROWSER_INSPECTION_CANDIDATES}
+      ) {
+        truncated = true;
+        break;
+      }
+      let el;
+      try { el = elementWalker.nextNode(); } catch { truncated = true; break; }
+      if (!el) break;
+      visitedElements += 1;
+      if (!isInteractiveCandidate(el)) continue;
+      // CSS-hidden and off-viewport controls must not consume the separate
+      // hit-testing budget and starve later visible controls. Occluded controls
+      // still count because proving occlusion is the expensive operation.
+      const candidateRect = visibleElementRect(el);
+      if (!candidateRect) continue;
+      visitedCandidates += 1;
+      if (!hasUnoccludedPoint(el, candidateRect.clipped, true)) continue;
+      const rect = candidateRect.raw;
       elements.push({
         id: 'el-' + elements.length,
         selector: selectorFor(el),
@@ -218,6 +261,7 @@ export function browserInspectionExpression(): string {
       scrollY: Number.isFinite(globalThis.scrollY) ? globalThis.scrollY : 0,
       viewportWidth,
       viewportHeight,
+      truncated,
       elements,
       __kaiOcclusionPoints: occlusionPoints,
     };

@@ -460,6 +460,8 @@ export type BrowserInspection = {
   scrollY: number;
   viewportWidth: number;
   viewportHeight: number;
+  /** True when the page exceeded a bounded control-traversal budget. */
+  truncated: boolean;
   elements: BrowserInteractiveElement[];
 };
 

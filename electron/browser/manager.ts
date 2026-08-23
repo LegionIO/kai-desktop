@@ -229,6 +229,7 @@ const CONTEXT_MENU_DOWNLOAD_AUTHORITY_MS = 30_000;
 const EVALUATE_TIMEOUT_MS = 15_000;
 const INSPECT_TIMEOUT_MS = 15_000;
 const TARGET_LOCATION_TIMEOUT_MS = 15_000;
+export const MAX_BROWSER_TARGET_DOM_VISITS = 10_000;
 const BROWSER_INPUT_TIMEOUT_MS = 15_000;
 const AUTOMATION_OVERLAY_TIMEOUT_MS = 5_000;
 const ASSISTANT_DIALOG_CDP_TIMEOUT_MS = 5_000;
@@ -7102,6 +7103,12 @@ export class BrowserManager {
     const completedPage = this.captureBrowserPageLease(tab, contents);
     await this.assertAssistantNavigationAllowed(contents.getURL(), tab.partition, abortSignal);
     this.assertBrowserPageLease(tab, completedPage, 'assistant history navigation');
+    // Same-document history can move between duplicate-URL entries without
+    // changing the page lease. Network authorization is asynchronous, so
+    // revalidate the exact cursor after it resolves before reporting success.
+    if (navigation.getActiveIndex() !== targetIndex) {
+      throw new Error('The browser history changed while navigation was being authorized.');
+    }
   }
 
   private async reloadAssistantTab(
@@ -12351,20 +12358,54 @@ export class BrowserManager {
         }
         return true;
       };
-      let matches = [];
-      if (selector) { try { matches = Array.from(document.querySelectorAll(selector)); } catch { throw new Error('Invalid CSS selector'); } }
-      else {
-        matches = Array.from(document.querySelectorAll('a,button,input,select,textarea,[role],[tabindex]'));
-        if (role) matches = matches.filter(el => roleFor(el) === normalizeSemanticText(role).toLowerCase());
-        if (name) matches = matches.filter(el => accessibleNameFor(el).toLowerCase().includes(normalizeSemanticText(name).toLowerCase()));
-        if (text) matches = matches.filter(el => ((el.innerText || el.textContent || '')).trim().toLowerCase().includes(text.toLowerCase()));
+      const normalizedRole = normalizeSemanticText(role).toLowerCase();
+      const normalizedName = normalizeSemanticText(name).toLowerCase();
+      const normalizedText = normalizeSemanticText(text).toLowerCase();
+      const isInteractiveCandidate = (el) => {
+        const tag = normalizeSemanticText(el?.tagName).toUpperCase();
+        return (
+          tag === 'A' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' ||
+          (typeof el?.getAttribute === 'function' &&
+            (el.getAttribute('role') !== null || el.getAttribute('tabindex') !== null))
+        );
+      };
+      const matchesTarget = (el) => {
+        if (selector) {
+          try { return el.matches(selector); } catch { throw new Error('Invalid CSS selector'); }
+        }
+        if (!isInteractiveCandidate(el)) return false;
+        if (normalizedRole && roleFor(el) !== normalizedRole) return false;
+        if (normalizedName && !accessibleNameFor(el).toLowerCase().includes(normalizedName)) return false;
+        if (normalizedText && !semanticTextWithin(el).toLowerCase().includes(normalizedText)) return false;
+        return true;
+      };
+      const root = document.documentElement ?? document.body;
+      let walker = null;
+      if (root) {
+        try { walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT); }
+        catch { throw new Error('Browser target traversal could not start.'); }
       }
-      const visibleMatches = matches.filter(visible);
-      if (visibleMatches.length > 1) {
+      let el = null;
+      let current = root;
+      let visited = 0;
+      let traversalComplete = !root;
+      while (current && visited < ${MAX_BROWSER_TARGET_DOM_VISITS}) {
+        visited += 1;
+        if (matchesTarget(current) && visible(current)) {
+          if (el) {
+            delete globalThis[globalKey];
+            throw new Error('Target matched multiple visible elements; provide a more specific selector, role, name, or text.');
+          }
+          el = current;
+        }
+        try { current = walker?.nextNode() ?? null; }
+        catch { throw new Error('Browser target traversal failed.'); }
+        if (!current) traversalComplete = true;
+      }
+      if (!traversalComplete) {
         delete globalThis[globalKey];
-        throw new Error('Target matched multiple visible elements; provide a more specific selector, role, name, or text.');
+        throw new Error('Target lookup exceeded its safe DOM traversal limit; use viewport coordinates instead.');
       }
-      const el = visibleMatches[0];
       if (!el) { delete globalThis[globalKey]; return null; }
       el.scrollIntoView({ block:'center', inline:'center', behavior:'instant' });
       const r = el.getBoundingClientRect();
