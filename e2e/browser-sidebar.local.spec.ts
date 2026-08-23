@@ -426,8 +426,12 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
     )
     .toBe('complete');
 
+  const screenshotDocumentToken = (await browserState(conversationId)).tabs.find(
+    (entry) => entry.id === tab.id,
+  )?.documentToken;
+  if (!screenshotDocumentToken) throw new Error('Browser tab did not expose a current document token.');
   const screenshots = await handle.page.evaluate(
-    async ({ conversationId: id, tabId }) => {
+    async ({ conversationId: id, tabId, documentToken }) => {
       const browser = (
         window as unknown as {
           app: {
@@ -441,11 +445,11 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
         }
       ).app.browser;
       return Promise.all([
-        browser.screenshot(id, { tabId, mode: 'full-page' }),
-        browser.screenshot(id, { tabId, mode: 'element', selector: '#capture' }),
+        browser.screenshot(id, { tabId, documentToken, mode: 'full-page' }),
+        browser.screenshot(id, { tabId, documentToken, mode: 'element', selector: '#capture' }),
       ]);
     },
-    { conversationId, tabId: tab.id },
+    { conversationId, tabId: tab.id, documentToken: screenshotDocumentToken },
   );
   expect(screenshots[0].height).toBeGreaterThan(8_000);
   expect(screenshots[0].dataUrl).toMatch(/^data:image\/png;base64,/);
