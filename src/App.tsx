@@ -85,6 +85,7 @@ import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app, type ConversationChange } from '@/lib/ipc-client';
 import { cn, generateId } from '@/lib/utils';
 import {
+  advanceConfirmedConversationSelection,
   adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
   createBoundedWorkspaceObservationWait,
@@ -94,6 +95,7 @@ import {
   isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
+  reconcileFailedConversationSelection,
   resolveConversationActivationDisposition,
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
@@ -105,6 +107,8 @@ import {
   shouldClearSelectionForNullActiveBroadcast,
   shouldRetryWorkspaceConversationRestoration,
   type BrowserWorkspaceTransitionMarker,
+  type ConfirmedConversationSelection,
+  type PendingConversationSelection,
   type WorkspaceObservationWait,
 } from '@/lib/conversation-selection';
 import { surfaceConversationCleanupWarnings } from '@/lib/conversation-delete-warnings';
@@ -719,6 +723,66 @@ function AppShell() {
   // Monotonic token guarding async active-conversation reads (onChanged fetch +
   // switch title load) so out-of-order resolutions can't apply stale state.
   const activeSyncSeqRef = useRef(0);
+  // `activeConversationIdRef` publishes an in-flight selection intent before
+  // its backend CAS resolves. Keep the last locally confirmed checkpoint
+  // separately so a failed C/D chain can recover to committed B instead of a
+  // speculative `previousId` (which may itself be C).
+  const confirmedConversationSelectionRef = useRef<ConfirmedConversationSelection>({
+    activeConversationId: null,
+    activeConversationRevision: 0,
+    intentGeneration: 0,
+  });
+  const pendingConversationSelectionsRef = useRef<Map<number, PendingConversationSelection>>(new Map());
+  const failedConversationSelectionRecoveryRef = useRef<{
+    sequence: number;
+    intentGeneration: number;
+  } | null>(null);
+  const activeConversationHydrationSeqRef = useRef(0);
+  const recordConfirmedConversationSelection = useCallback(
+    (activeConversationId: string | null, activeConversationRevision: number, intentGeneration: number) => {
+      const confirmed = advanceConfirmedConversationSelection(confirmedConversationSelectionRef.current, {
+        activeConversationId,
+        activeConversationRevision,
+        intentGeneration,
+      });
+      confirmedConversationSelectionRef.current = confirmed;
+      return confirmed;
+    },
+    [],
+  );
+  const commitConfirmedConversationSelection = useCallback((confirmed: ConfirmedConversationSelection): number => {
+    confirmedConversationSelectionRef.current = confirmed;
+    activeConversationIdRef.current = confirmed.activeConversationId;
+    setActiveConversationId(confirmed.activeConversationId);
+    return ++activeConversationHydrationSeqRef.current;
+  }, []);
+  const hydrateConfirmedConversationSelection = useCallback(
+    async (confirmed: ConfirmedConversationSelection, hydrationSequence: number): Promise<void> => {
+      if (confirmed.activeConversationId === null) {
+        if (hydrationSequence !== activeConversationHydrationSeqRef.current) return;
+        setActiveConversationTitle(null);
+        setActiveConversationHasMessages(false);
+        return;
+      }
+      let conversation: ConversationRecord | null;
+      try {
+        conversation = (await app.conversations.get(confirmed.activeConversationId)) as ConversationRecord | null;
+      } catch {
+        return;
+      }
+      if (
+        hydrationSequence !== activeConversationHydrationSeqRef.current ||
+        activeConversationIdRef.current !== confirmed.activeConversationId
+      ) {
+        return;
+      }
+      setActiveConversationTitle(
+        getConversationDisplayTitle(conversation, cuSessionsByConversation.get(confirmed.activeConversationId)),
+      );
+      setActiveConversationHasMessages((conversation?.messageCount ?? 0) > 0);
+    },
+    [cuSessionsByConversation],
+  );
   // Browser-attention navigation may wait on record and workspace I/O. Claim a
   // unique generation for every navigation intent so an older attention click
   // cannot reopen Chat or replace a newer conversation/workspace choice.
@@ -1488,28 +1552,95 @@ function AppShell() {
       setPlanPanel(null);
       const seq = ++activeSyncSeqRef.current;
       const previousId = activeConversationIdRef.current;
+      const previousWasSpeculative = [...pendingConversationSelectionsRef.current.values()].some(
+        (pending) => pending.conversationId === previousId,
+      );
+      if (!previousWasSpeculative && confirmedConversationSelectionRef.current.activeConversationId !== previousId) {
+        // Local paths such as new-chat and delete fallback can commit outside
+        // this switch helper. Snapshot their visible selection before publishing
+        // the next speculative intent so it remains a valid recovery point.
+        confirmedConversationSelectionRef.current = {
+          ...confirmedConversationSelectionRef.current,
+          activeConversationId: previousId,
+          intentGeneration: Math.max(
+            confirmedConversationSelectionRef.current.intentGeneration,
+            conversationSelectionGeneration - 1,
+          ),
+        };
+      }
+      const pendingSelection: PendingConversationSelection = {
+        sequence: seq,
+        conversationId: id,
+        intentGeneration: conversationSelectionGeneration,
+      };
+      pendingConversationSelectionsRef.current.set(seq, pendingSelection);
       // Publish the user's selection intent synchronously so an async Browser
       // cleanup/delete cannot apply a stale fallback while backend selection is
       // still in flight. The main-process compare-and-set covers cross-window
       // ordering; this ref covers this renderer's intent ordering.
       activeConversationIdRef.current = id;
+      const isLatestSelection = () =>
+        seq === activeSyncSeqRef.current &&
+        activeConversationIdRef.current === id &&
+        conversationSelectionGeneration === conversationSelectionIntentGenerationRef.current;
+      const recoverLatestSelection = (authoritative?: {
+        activeConversationId: string | null;
+        activeConversationRevision: number;
+      }) => {
+        if (!isLatestSelection()) return;
+        const confirmed = reconcileFailedConversationSelection({
+          confirmed: confirmedConversationSelectionRef.current,
+          failedSequence: seq,
+          pending: pendingConversationSelectionsRef.current.values(),
+          authoritative,
+        });
+        confirmedConversationSelectionRef.current = confirmed;
+        failedConversationSelectionRecoveryRef.current = {
+          sequence: seq,
+          intentGeneration: conversationSelectionGeneration,
+        };
+        const hydrationSequence = commitConfirmedConversationSelection(confirmed);
+        void hydrateConfirmedConversationSelection(confirmed, hydrationSequence);
+      };
       try {
         const result = await app.conversations.setActiveId(id, expectedCurrentId, expectedCurrentRevision);
         if (!result.ok) {
           const targetAlreadyActive =
             result.error === 'active-conversation-changed' && result.activeConversationId === id;
           if (!targetAlreadyActive) {
-            if (seq === activeSyncSeqRef.current && activeConversationIdRef.current === id) {
-              activeConversationIdRef.current = previousId;
-            }
+            recoverLatestSelection(
+              result.activeConversationId !== undefined && result.activeConversationRevision !== undefined
+                ? {
+                    activeConversationId: result.activeConversationId,
+                    activeConversationRevision: result.activeConversationRevision,
+                  }
+                : undefined,
+            );
             return false;
           }
         }
-      } catch (error) {
-        if (seq === activeSyncSeqRef.current && activeConversationIdRef.current === id) {
-          activeConversationIdRef.current = previousId;
+        const confirmed = recordConfirmedConversationSelection(
+          id,
+          result.activeConversationRevision ?? confirmedConversationSelectionRef.current.activeConversationRevision,
+          conversationSelectionGeneration,
+        );
+        const failedRecovery = failedConversationSelectionRecoveryRef.current;
+        if (
+          failedRecovery &&
+          failedRecovery.sequence === activeSyncSeqRef.current &&
+          failedRecovery.intentGeneration === conversationSelectionIntentGenerationRef.current
+        ) {
+          // A response for the actual B commit may arrive after latest C/D has
+          // already failed and recovered to A. Reconcile that still-current
+          // recovery as soon as the older success becomes known.
+          const hydrationSequence = commitConfirmedConversationSelection(confirmed);
+          void hydrateConfirmedConversationSelection(confirmed, hydrationSequence);
         }
+      } catch (error) {
+        recoverLatestSelection();
         throw error;
+      } finally {
+        pendingConversationSelectionsRef.current.delete(seq);
       }
       const activationDisposition = resolveConversationActivationDisposition({
         sequence: seq,
@@ -1522,8 +1653,10 @@ function AppShell() {
         currentNavigationGeneration: navigationIntentGenerationRef.current,
       });
       if (activationDisposition === 'superseded') return false;
+      failedConversationSelectionRecoveryRef.current = null;
       if (activationDisposition === 'foreground') setActiveViewState(CHAT_VIEW);
-      setActiveConversationId(id);
+      const confirmed = confirmedConversationSelectionRef.current;
+      const hydrationSequence = commitConfirmedConversationSelection(confirmed);
       // Load the title for the switched-to conversation. Guard the async title
       // write so a rapid re-switch (A→B→A) doesn't let B's late-resolving title
       // overwrite the now-active A.
@@ -1538,11 +1671,21 @@ function AppShell() {
         navigationGeneration,
         currentNavigationGeneration: navigationIntentGenerationRef.current,
       });
-      if (finalDisposition === 'superseded') return false;
+      if (finalDisposition === 'superseded' || hydrationSequence !== activeConversationHydrationSeqRef.current) {
+        return false;
+      }
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
+      setActiveConversationHasMessages((conv?.messageCount ?? 0) > 0);
       return true;
     },
-    [cancelWorkspaceObservationWaits, cuSessionsByConversation, isMobile],
+    [
+      cancelWorkspaceObservationWaits,
+      commitConfirmedConversationSelection,
+      cuSessionsByConversation,
+      hydrateConfirmedConversationSelection,
+      isMobile,
+      recordConfirmedConversationSelection,
+    ],
   );
 
   const handleOpenBrowserConversation = useCallback(
@@ -1562,6 +1705,7 @@ function AppShell() {
           app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
         getActiveConversationId: () => activeConversationIdRef.current,
         getBackendActiveConversationState: () => app.conversations.getActiveState(),
+        getBackendActiveWorkspaceState: () => app.workspaces.getActiveState(),
         getSelectionGeneration: () => navigationIntentGenerationRef.current,
         getConversationSelectionGeneration: () => conversationSelectionIntentGenerationRef.current,
         getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
@@ -1576,12 +1720,14 @@ function AppShell() {
           expectedCurrentWorkspaceId,
           operation,
           expectedCurrentMutationToken,
+          expectedCurrentWorkspaceRevision,
         ) => {
           const setActiveWorkspaceOnce = async (
             id: string | null,
             expectedCurrentId: string | null,
             departingConversationId = activeConversationIdRef.current,
             expectedMutationToken?: string,
+            expectedWorkspaceRevision?: number,
           ) => {
             const transitionKey = id ?? '';
             const transition = createBrowserWorkspaceTransitionMarker({
@@ -1598,6 +1744,9 @@ function AppShell() {
               const result = await app.workspaces.setActive({
                 id,
                 expectedCurrentId,
+                ...(expectedWorkspaceRevision !== undefined
+                  ? { expectedCurrentRevision: expectedWorkspaceRevision }
+                  : {}),
                 ...(expectedMutationToken !== undefined ? { expectedCurrentMutationToken: expectedMutationToken } : {}),
                 mutationToken: workspaceMutationToken,
               });
@@ -1649,12 +1798,14 @@ function AppShell() {
               expectedCurrentWorkspaceId,
               activeConversationIdRef.current,
               expectedCurrentMutationToken,
+              expectedCurrentWorkspaceRevision,
             );
           }
           if (workspaceId === null) return false;
           return setActiveBrowserWorkspaceWithRebase({
             workspaceId,
             expectedCurrentWorkspaceId,
+            expectedCurrentWorkspaceRevision,
             departingConversationId: activeConversationIdRef.current,
             setActiveWorkspace: setActiveWorkspaceOnce,
             isCurrent: () =>

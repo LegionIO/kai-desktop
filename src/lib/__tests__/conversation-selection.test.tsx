@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
+  advanceConfirmedConversationSelection,
   adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
   createBoundedWorkspaceObservationWait,
@@ -18,6 +19,7 @@ import {
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
+  reconcileFailedConversationSelection,
   resolveConversationActivationDisposition,
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
@@ -61,6 +63,86 @@ describe('resolveConversationActivationDisposition', () => {
     expect(resolveConversationActivationDisposition({ ...current, currentConversationSelectionGeneration: 4 })).toBe(
       'superseded',
     );
+  });
+});
+
+describe('confirmed conversation selection reconciliation', () => {
+  it('recovers failed speculative selections to an older local selection that the backend committed', () => {
+    const pending = [
+      { sequence: 1, conversationId: 'chat-b', intentGeneration: 1 },
+      { sequence: 2, conversationId: 'chat-c', intentGeneration: 2 },
+      { sequence: 3, conversationId: 'chat-d', intentGeneration: 3 },
+    ];
+    const initial = {
+      activeConversationId: 'chat-a',
+      activeConversationRevision: 4,
+      intentGeneration: 0,
+    };
+
+    const afterLatestFailure = reconcileFailedConversationSelection({
+      confirmed: initial,
+      failedSequence: 3,
+      pending,
+      authoritative: activeConversationState('chat-b', 5),
+    });
+
+    expect(afterLatestFailure).toEqual({
+      activeConversationId: 'chat-b',
+      activeConversationRevision: 5,
+      intentGeneration: 1,
+    });
+  });
+
+  it('keeps the last successful checkpoint across multiple newer failures', () => {
+    const committedB = advanceConfirmedConversationSelection(
+      {
+        activeConversationId: 'chat-a',
+        activeConversationRevision: 4,
+        intentGeneration: 0,
+      },
+      {
+        activeConversationId: 'chat-b',
+        activeConversationRevision: 5,
+        intentGeneration: 1,
+      },
+    );
+    const afterC = reconcileFailedConversationSelection({
+      confirmed: committedB,
+      failedSequence: 2,
+      pending: [{ sequence: 2, conversationId: 'chat-c', intentGeneration: 2 }],
+      authoritative: activeConversationState('chat-b', 5),
+    });
+    const afterD = reconcileFailedConversationSelection({
+      confirmed: afterC,
+      failedSequence: 3,
+      pending: [{ sequence: 3, conversationId: 'chat-d', intentGeneration: 3 }],
+      authoritative: activeConversationState('chat-b', 5),
+    });
+
+    expect(afterD).toBe(committedB);
+  });
+
+  it('does not adopt an unrelated global selection or regress to a late older success', () => {
+    const confirmed = {
+      activeConversationId: 'chat-user',
+      activeConversationRevision: 9,
+      intentGeneration: 4,
+    };
+    expect(
+      reconcileFailedConversationSelection({
+        confirmed,
+        failedSequence: 6,
+        pending: [{ sequence: 6, conversationId: 'chat-failed', intentGeneration: 6 }],
+        authoritative: activeConversationState('chat-cli', 10),
+      }),
+    ).toBe(confirmed);
+    expect(
+      advanceConfirmedConversationSelection(confirmed, {
+        activeConversationId: 'chat-late',
+        activeConversationRevision: 11,
+        intentGeneration: 3,
+      }),
+    ).toBe(confirmed);
   });
 });
 
@@ -749,28 +831,42 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         error: 'active-workspace-changed',
         activeWorkspaceId: 'workspace-authoritative',
         activeWorkspaceLastConversationId: 'chat-authoritative',
+        activeWorkspaceRevision: 8,
         activeWorkspaceMutationToken: 'local-browser_request-1',
       })
-      .mockResolvedValueOnce({ ok: true });
+      .mockResolvedValueOnce({ ok: true, activeWorkspaceRevision: 9 });
 
     await expect(
       setActiveBrowserWorkspaceWithRebase({
         workspaceId: 'workspace-browser',
         expectedCurrentWorkspaceId: 'workspace-stale',
+        expectedCurrentWorkspaceRevision: 7,
         departingConversationId: 'chat-stale',
         setActiveWorkspace,
         isCurrent: () => true,
         canRebase: () => true,
       }),
-    ).resolves.toEqual({ ok: true, previousWorkspaceId: 'workspace-authoritative' });
+    ).resolves.toEqual({
+      ok: true,
+      previousWorkspaceId: 'workspace-authoritative',
+      activeWorkspaceRevision: 9,
+    });
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-browser', 'workspace-stale', 'chat-stale');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      1,
+      'workspace-browser',
+      'workspace-stale',
+      'chat-stale',
+      undefined,
+      7,
+    );
     expect(setActiveWorkspace).toHaveBeenNthCalledWith(
       2,
       'workspace-browser',
       'workspace-authoritative',
       'chat-authoritative',
       'local-browser_request-1',
+      8,
     );
   });
 
@@ -821,7 +917,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
 });
 
 describe('prepareConversationWorkspaceSwitch', () => {
-  it('uses workspace state observed after the conversation lookup resolves', async () => {
+  it('uses the authoritative workspace revision captured before the conversation lookup resolves', async () => {
     let activeWorkspaceId = 'workspace-a';
     const activeConversationId = 'chat-a';
     const selectionGeneration = 1;
@@ -833,7 +929,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         }),
     );
     const saveLastConversation = vi.fn(async () => undefined);
-    const setActiveWorkspace = vi.fn(async () => true);
+    const setActiveWorkspace = vi.fn(async () => false);
     const switchConversation = vi.fn(async () => true);
     const cancelObservation = vi.fn();
 
@@ -845,6 +941,12 @@ describe('prepareConversationWorkspaceSwitch', () => {
       getConversation,
       getActiveConversationId: () => activeConversationId,
       getBackendActiveConversationState: async () => activeConversationState(activeConversationId),
+      getBackendActiveWorkspaceState: async () => ({
+        activeWorkspaceId: 'workspace-a',
+        activeWorkspaceRevision: 7,
+        activeWorkspaceLastConversationId: 'chat-a',
+        activeWorkspaceMutationToken: 'other-client-before-open',
+      }),
       getSelectionGeneration: () => selectionGeneration,
       getConversationSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
@@ -862,17 +964,20 @@ describe('prepareConversationWorkspaceSwitch', () => {
       switchConversation,
     });
 
-    activeWorkspaceId = 'workspace-b';
+    // Another client changes A -> C -> A while the Browser lookup is pending.
+    // The id alone is unchanged, but main's revision has advanced past 7.
+    activeWorkspaceId = 'workspace-c';
+    activeWorkspaceId = 'workspace-a';
     resolveConversation({ workspaceId: 'workspace-b' });
 
-    await expect(opening).resolves.toBe(true);
+    await expect(opening).resolves.toBe(false);
     expect(saveLastConversation).toHaveBeenCalledWith({
       workspaceId: 'workspace-b',
       conversationId: 'chat-b',
       mutationToken: 'browser_request-test',
     });
-    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
-    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration, 1, selectionGeneration);
+    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate', undefined, 7);
+    expect(switchConversation).not.toHaveBeenCalled();
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
 

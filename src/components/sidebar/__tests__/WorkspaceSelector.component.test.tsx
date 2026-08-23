@@ -6,6 +6,22 @@ import { WorkspaceSelector } from '../WorkspaceSelector';
 
 afterEach(() => uninstallAppBridgeStub());
 
+const workspaceState = (
+  activeWorkspaceId: string | null = 'workspace-a',
+  activeWorkspaceRevision = 0,
+  activeWorkspaceMutationToken: string | null = null,
+) => ({
+  activeWorkspaceId,
+  activeWorkspaceRevision,
+  activeWorkspaceLastConversationId: null,
+  activeWorkspaceMutationToken,
+});
+
+const installWorkspaceBridge = (
+  setActive: unknown,
+  getActiveState: () => Promise<ReturnType<typeof workspaceState>> = async () => workspaceState(),
+) => installAppBridgeStub({ workspaces: { setActive, getActiveState } });
+
 describe('WorkspaceSelector', () => {
   it('lets the empty-workspace title-bar control shrink and truncate cleanly', () => {
     render(
@@ -29,7 +45,7 @@ describe('WorkspaceSelector', () => {
   it('does not cancel restoration when the active workspace is selected again', async () => {
     const user = userEvent.setup();
     const setActive = vi.fn(async () => ({ ok: true, activeWorkspaceId: 'workspace-a' }));
-    installAppBridgeStub({ workspaces: { setActive } });
+    installWorkspaceBridge(setActive);
     const onWorkspaceNavigationIntent = vi.fn(() => 7);
     const workspace = {
       id: 'workspace-a',
@@ -67,8 +83,9 @@ describe('WorkspaceSelector', () => {
       ok: false,
       error: 'active-workspace-changed' as const,
       activeWorkspaceId: 'workspace-a',
+      activeWorkspaceRevision: 1,
     }));
-    installAppBridgeStub({ workspaces: { setActive } });
+    installWorkspaceBridge(setActive);
     const onWorkspaceNavigationIntent = vi.fn(() => 11);
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
@@ -108,6 +125,7 @@ describe('WorkspaceSelector', () => {
     expect(setActive).toHaveBeenCalledWith({
       id: 'workspace-b',
       expectedCurrentId: 'workspace-a',
+      expectedCurrentRevision: 0,
       mutationToken: 'local-user_request-failed',
     });
     expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith('workspace-a', 11);
@@ -121,10 +139,11 @@ describe('WorkspaceSelector', () => {
         ok: false,
         error: 'active-workspace-changed' as const,
         activeWorkspaceId: 'workspace-browser',
+        activeWorkspaceRevision: 1,
         activeWorkspaceMutationToken: 'local-browser_request-1',
       })
-      .mockResolvedValueOnce({ ok: true, activeWorkspaceId: 'workspace-b' });
-    installAppBridgeStub({ workspaces: { setActive } });
+      .mockResolvedValueOnce({ ok: true, activeWorkspaceId: 'workspace-b', activeWorkspaceRevision: 2 });
+    installWorkspaceBridge(setActive);
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
       id: 'workspace-a',
@@ -162,30 +181,47 @@ describe('WorkspaceSelector', () => {
     expect(setActive).toHaveBeenNthCalledWith(1, {
       id: 'workspace-b',
       expectedCurrentId: 'workspace-a',
+      expectedCurrentRevision: 0,
       mutationToken: 'local-user_request-rebase',
     });
     expect(setActive).toHaveBeenNthCalledWith(2, {
       id: 'workspace-b',
       expectedCurrentId: 'workspace-browser',
+      expectedCurrentRevision: 1,
       expectedCurrentMutationToken: 'local-browser_request-1',
       mutationToken: 'local-user_request-rebase',
     });
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
   });
 
-  it('rebases a rapid newer click over an older local user selection with one stable token', async () => {
+  it('protects a rapid newer click from an older selection rollback with workspace revisions', async () => {
     const user = userEvent.setup();
     let navigationGeneration = 0;
     let backendWorkspaceId = 'workspace-a';
+    let backendWorkspaceRevision = 0;
     let backendMutationToken: string | null = null;
-    let resolveFirstSelection: (result: { ok: true; activeWorkspaceId: string }) => void = () => {};
+    let resolveFirstSelection: (result: {
+      ok: true;
+      activeWorkspaceId: string;
+      activeWorkspaceRevision: number;
+    }) => void = () => {};
     const setActive = vi.fn(
       async (args: {
         id: string;
         expectedCurrentId: string | null;
+        expectedCurrentRevision?: number;
         expectedCurrentMutationToken?: string | null;
         mutationToken?: string;
       }) => {
+        if (args.expectedCurrentRevision !== backendWorkspaceRevision) {
+          return {
+            ok: false,
+            error: 'active-workspace-changed' as const,
+            activeWorkspaceId: backendWorkspaceId,
+            activeWorkspaceRevision: backendWorkspaceRevision,
+            activeWorkspaceMutationToken: backendMutationToken,
+          };
+        }
         if (
           args.expectedCurrentMutationToken !== undefined &&
           args.expectedCurrentMutationToken !== backendMutationToken
@@ -194,13 +230,15 @@ describe('WorkspaceSelector', () => {
             ok: false,
             error: 'active-workspace-changed' as const,
             activeWorkspaceId: backendWorkspaceId,
+            activeWorkspaceRevision: backendWorkspaceRevision,
             activeWorkspaceMutationToken: backendMutationToken,
           };
         }
         if (args.id === 'workspace-b') {
           backendWorkspaceId = args.id;
+          backendWorkspaceRevision += 1;
           backendMutationToken = args.mutationToken ?? null;
-          return new Promise<{ ok: true; activeWorkspaceId: string }>((resolve) => {
+          return new Promise<{ ok: true; activeWorkspaceId: string; activeWorkspaceRevision: number }>((resolve) => {
             resolveFirstSelection = resolve;
           });
         }
@@ -209,15 +247,19 @@ describe('WorkspaceSelector', () => {
             ok: false,
             error: 'active-workspace-changed' as const,
             activeWorkspaceId: backendWorkspaceId,
+            activeWorkspaceRevision: backendWorkspaceRevision,
             activeWorkspaceMutationToken: backendMutationToken,
           };
         }
         backendWorkspaceId = args.id;
+        backendWorkspaceRevision += 1;
         backendMutationToken = args.mutationToken ?? null;
-        return { ok: true, activeWorkspaceId: backendWorkspaceId };
+        return { ok: true, activeWorkspaceId: backendWorkspaceId, activeWorkspaceRevision: backendWorkspaceRevision };
       },
     );
-    installAppBridgeStub({ workspaces: { setActive } });
+    installWorkspaceBridge(setActive, async () =>
+      workspaceState(backendWorkspaceId, backendWorkspaceRevision, backendMutationToken),
+    );
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
       id: 'workspace-a',
@@ -262,24 +304,28 @@ describe('WorkspaceSelector', () => {
 
     await user.click(screen.getByRole('button', { name: /workspace a/i }));
     await user.click(await screen.findByRole('menuitem', { name: /workspace c/i }));
+    await vi.waitFor(() => expect(setActive).toHaveBeenCalledTimes(2));
+    resolveFirstSelection({ ok: true, activeWorkspaceId: 'workspace-b', activeWorkspaceRevision: 1 });
     await vi.waitFor(() => expect(setActive).toHaveBeenCalledTimes(3));
-    resolveFirstSelection({ ok: true, activeWorkspaceId: 'workspace-b' });
 
     expect(setActive).toHaveBeenNthCalledWith(1, {
       id: 'workspace-b',
       expectedCurrentId: 'workspace-a',
+      expectedCurrentRevision: 0,
       mutationToken: 'local-user_request-1',
     });
     expect(setActive).toHaveBeenNthCalledWith(2, {
       id: 'workspace-c',
-      expectedCurrentId: 'workspace-a',
+      expectedCurrentId: 'workspace-b',
+      expectedCurrentRevision: 1,
       mutationToken: 'local-user_request-2',
     });
     expect(setActive).toHaveBeenNthCalledWith(3, {
-      id: 'workspace-c',
+      id: 'workspace-a',
       expectedCurrentId: 'workspace-b',
+      expectedCurrentRevision: 1,
       expectedCurrentMutationToken: 'local-user_request-1',
-      mutationToken: 'local-user_request-2',
+      mutationToken: 'local-user_request-1',
     });
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
   });
@@ -290,9 +336,10 @@ describe('WorkspaceSelector', () => {
       ok: false,
       error: 'active-workspace-changed' as const,
       activeWorkspaceId: 'workspace-browser',
+      activeWorkspaceRevision: 1,
       activeWorkspaceMutationToken: 'local-browser_request-1',
     }));
-    installAppBridgeStub({ workspaces: { setActive } });
+    installWorkspaceBridge(setActive);
     const isWorkspaceNavigationIntentCurrent = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
     const workspaceA = {
       id: 'workspace-a',
@@ -336,9 +383,10 @@ describe('WorkspaceSelector', () => {
       ok: false,
       error: 'active-workspace-changed' as const,
       activeWorkspaceId: 'workspace-c',
+      activeWorkspaceRevision: 1,
       activeWorkspaceMutationToken: 'foreign-renderer_request-1',
     }));
-    installAppBridgeStub({ workspaces: { setActive } });
+    installWorkspaceBridge(setActive);
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
       id: 'workspace-a',

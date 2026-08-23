@@ -664,6 +664,7 @@ export function getBridgeScript(): string {
       create: function(args) { return invoke('workspaces:create', args); },
       rename: function(args) { return invoke('workspaces:rename', args); },
       delete: function(args) { return invoke('workspaces:delete', args); },
+      getActiveState: function() { return invoke('workspaces:get-active-state'); },
       setActive: function(args) { return invoke('workspaces:set-active', args); },
       saveLastConversation: function(args) { return invoke('workspaces:save-last-conversation', args); },
       browseDirectory: function() { return invoke('workspaces:browse-directory'); }

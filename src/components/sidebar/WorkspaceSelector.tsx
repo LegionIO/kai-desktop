@@ -104,14 +104,25 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     // local click that committed while this renderer still showed stale state.
     const mutationToken = createLocalWorkspaceMutationToken();
     try {
+      const authoritativeWorkspace = await app.workspaces.getActiveState();
       const result = await setActiveUserWorkspaceWithRebase({
         workspaceId,
-        expectedCurrentWorkspaceId: activeWorkspaceId,
+        expectedCurrentWorkspaceId: authoritativeWorkspace.activeWorkspaceId,
+        expectedCurrentWorkspaceRevision: authoritativeWorkspace.activeWorkspaceRevision,
         mutationToken,
-        setActiveWorkspace: (id, expectedCurrentId, token, expectedCurrentMutationToken) =>
+        setActiveWorkspace: (
+          id,
+          expectedCurrentId,
+          token,
+          expectedCurrentMutationToken,
+          expectedCurrentWorkspaceRevision,
+        ) =>
           app.workspaces.setActive({
             id,
             expectedCurrentId,
+            ...(expectedCurrentWorkspaceRevision !== undefined
+              ? { expectedCurrentRevision: expectedCurrentWorkspaceRevision }
+              : {}),
             mutationToken: token,
             ...(expectedCurrentMutationToken !== undefined ? { expectedCurrentMutationToken } : {}),
           }),

@@ -255,6 +255,68 @@ export type ActiveConversationState = {
   activeConversationRevision: number;
 };
 
+/** The latest conversation selection that this renderer knows one of its own
+ * intents committed. `intentGeneration` orders user/Browser intents while the
+ * backend revision orders multiple acknowledgements for the same intent. */
+export type ConfirmedConversationSelection = ActiveConversationState & {
+  intentGeneration: number;
+};
+
+export type PendingConversationSelection = {
+  sequence: number;
+  conversationId: string;
+  intentGeneration: number;
+};
+
+/** Advance a renderer's confirmed checkpoint without allowing a late response
+ * from an older intent (or an older backend revision of the same intent) to
+ * replace a newer successful local selection. */
+export function advanceConfirmedConversationSelection(
+  current: ConfirmedConversationSelection,
+  candidate: ConfirmedConversationSelection,
+): ConfirmedConversationSelection {
+  if (candidate.intentGeneration < current.intentGeneration) return current;
+  if (
+    candidate.intentGeneration === current.intentGeneration &&
+    candidate.activeConversationRevision < current.activeConversationRevision
+  ) {
+    return current;
+  }
+  return candidate;
+}
+
+/** Reconcile a failed latest selection against authoritative backend state.
+ * The global backend active id can be changed by another window/CLI, so it is
+ * safe to adopt only when that id belongs to another still-pending local
+ * selection. This is the A -> B(success), C/D(fail) case: C and D must recover
+ * to B, never to their speculative `previousId` values. */
+export function reconcileFailedConversationSelection(options: {
+  confirmed: ConfirmedConversationSelection;
+  failedSequence: number;
+  pending: Iterable<PendingConversationSelection>;
+  authoritative?: ActiveConversationState;
+}): ConfirmedConversationSelection {
+  const authoritative = options.authoritative;
+  if (!authoritative) return options.confirmed;
+
+  let matchingPending: PendingConversationSelection | undefined;
+  for (const pending of options.pending) {
+    if (
+      pending.sequence !== options.failedSequence &&
+      pending.conversationId === authoritative.activeConversationId &&
+      (!matchingPending || pending.intentGeneration > matchingPending.intentGeneration)
+    ) {
+      matchingPending = pending;
+    }
+  }
+  if (!matchingPending) return options.confirmed;
+
+  return advanceConfirmedConversationSelection(options.confirmed, {
+    ...authoritative,
+    intentGeneration: matchingPending.intentGeneration,
+  });
+}
+
 export type ConversationActivationDisposition = 'foreground' | 'background' | 'superseded';
 
 /** A Browser attention request owns two related decisions: which conversation
@@ -457,8 +519,17 @@ export type ActiveWorkspaceCasResult = {
   error?: 'active-workspace-changed';
   activeWorkspaceId?: string | null;
   activeWorkspaceLastConversationId?: string | null;
+  /** Main-process monotonic revision for the authoritative selection. */
+  activeWorkspaceRevision?: number;
   /** Opaque provenance for the mutation that selected activeWorkspaceId. */
   activeWorkspaceMutationToken?: string | null;
+};
+
+export type ActiveWorkspaceState = {
+  activeWorkspaceId: string | null;
+  activeWorkspaceLastConversationId: string | null;
+  activeWorkspaceRevision: number;
+  activeWorkspaceMutationToken: string | null;
 };
 
 export type BrowserWorkspaceSwitchResult = {
@@ -467,6 +538,8 @@ export type BrowserWorkspaceSwitchResult = {
   previousWorkspaceId?: string | null;
   /** Current authoritative workspace when a compare-and-set is rejected. */
   activeWorkspaceId?: string | null;
+  /** Revision produced by a successful switch or observed on rejection. */
+  activeWorkspaceRevision?: number;
   /** Current authoritative mutation owner when known. */
   activeWorkspaceMutationToken?: string | null;
 };
@@ -514,46 +587,70 @@ function serializeBrowserWorkspaceTransition<T>(operation: () => Promise<T>): Pr
 export async function setActiveUserWorkspaceWithRebase(options: {
   workspaceId: string;
   expectedCurrentWorkspaceId: string | null;
+  expectedCurrentWorkspaceRevision?: number;
   mutationToken: string;
   setActiveWorkspace: (
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     mutationToken: string,
     expectedCurrentMutationToken?: string,
+    expectedCurrentWorkspaceRevision?: number,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
 }): Promise<ActiveWorkspaceCasResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
+  let expectedCurrentWorkspaceRevision = options.expectedCurrentWorkspaceRevision;
   let expectedCurrentMutationToken: string | undefined;
   let lastResult: ActiveWorkspaceCasResult = { ok: false };
+  const setActive = (
+    workspaceId: string | null,
+    currentWorkspaceId: string | null,
+    mutationToken: string,
+    currentMutationToken?: string,
+    currentWorkspaceRevision?: number,
+  ) => {
+    if (currentWorkspaceRevision !== undefined) {
+      return options.setActiveWorkspace(
+        workspaceId,
+        currentWorkspaceId,
+        mutationToken,
+        currentMutationToken,
+        currentWorkspaceRevision,
+      );
+    }
+    if (currentMutationToken !== undefined) {
+      return options.setActiveWorkspace(workspaceId, currentWorkspaceId, mutationToken, currentMutationToken);
+    }
+    return options.setActiveWorkspace(workspaceId, currentWorkspaceId, mutationToken);
+  };
   for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
     if (!options.isCurrent()) return lastResult;
-    const result =
-      expectedCurrentMutationToken === undefined
-        ? await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId, options.mutationToken)
-        : await options.setActiveWorkspace(
-            options.workspaceId,
-            expectedCurrentWorkspaceId,
-            options.mutationToken,
-            expectedCurrentMutationToken,
-          );
+    const result = await setActive(
+      options.workspaceId,
+      expectedCurrentWorkspaceId,
+      options.mutationToken,
+      expectedCurrentMutationToken,
+      expectedCurrentWorkspaceRevision,
+    );
     if (result.ok) {
       if (options.isCurrent()) return result;
       // The stale request committed while a newer navigation intent was taking
       // ownership. Undo only our exact mutation: both workspace id and token
       // participate in the CAS, so a newer same-destination click still wins.
-      const rollback = await options.setActiveWorkspace(
+      const rollback = await setActive(
         expectedCurrentWorkspaceId,
         options.workspaceId,
         options.mutationToken,
         options.mutationToken,
+        result.activeWorkspaceRevision,
       );
       if (!rollback.ok) return rollback;
       return {
         ok: false,
         error: 'active-workspace-changed',
         activeWorkspaceId: expectedCurrentWorkspaceId,
+        activeWorkspaceRevision: rollback.activeWorkspaceRevision,
         activeWorkspaceMutationToken: options.mutationToken,
       };
     }
@@ -562,10 +659,12 @@ export async function setActiveUserWorkspaceWithRebase(options: {
       !options.isCurrent() ||
       !options.canRebase(result) ||
       result.activeWorkspaceId === undefined ||
+      (expectedCurrentWorkspaceRevision !== undefined && result.activeWorkspaceRevision === undefined) ||
       typeof result.activeWorkspaceMutationToken !== 'string'
     )
       return result;
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
+    expectedCurrentWorkspaceRevision = result.activeWorkspaceRevision;
     expectedCurrentMutationToken = result.activeWorkspaceMutationToken;
   }
   return lastResult;
@@ -577,39 +676,74 @@ export async function setActiveUserWorkspaceWithRebase(options: {
 export async function setActiveBrowserWorkspaceWithRebase(options: {
   workspaceId: string;
   expectedCurrentWorkspaceId: string | null;
+  expectedCurrentWorkspaceRevision?: number;
   departingConversationId: string | null;
   setActiveWorkspace: (
     workspaceId: string,
     expectedCurrentWorkspaceId: string | null,
     departingConversationId: string | null,
     expectedCurrentMutationToken?: string,
+    expectedCurrentWorkspaceRevision?: number,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
 }): Promise<BrowserWorkspaceSwitchResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
+  let expectedCurrentWorkspaceRevision = options.expectedCurrentWorkspaceRevision;
   let departingConversationId = options.departingConversationId;
   let expectedCurrentMutationToken: string | undefined;
+  const setActive = (
+    workspaceId: string,
+    currentWorkspaceId: string | null,
+    currentDepartingConversationId: string | null,
+    currentMutationToken?: string,
+    currentWorkspaceRevision?: number,
+  ) => {
+    if (currentWorkspaceRevision !== undefined) {
+      return options.setActiveWorkspace(
+        workspaceId,
+        currentWorkspaceId,
+        currentDepartingConversationId,
+        currentMutationToken,
+        currentWorkspaceRevision,
+      );
+    }
+    if (currentMutationToken !== undefined) {
+      return options.setActiveWorkspace(
+        workspaceId,
+        currentWorkspaceId,
+        currentDepartingConversationId,
+        currentMutationToken,
+      );
+    }
+    return options.setActiveWorkspace(workspaceId, currentWorkspaceId, currentDepartingConversationId);
+  };
   for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
-    const result =
-      expectedCurrentMutationToken === undefined
-        ? await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId, departingConversationId)
-        : await options.setActiveWorkspace(
-            options.workspaceId,
-            expectedCurrentWorkspaceId,
-            departingConversationId,
-            expectedCurrentMutationToken,
-          );
-    if (result.ok) return { ok: true, previousWorkspaceId: expectedCurrentWorkspaceId };
+    const result = await setActive(
+      options.workspaceId,
+      expectedCurrentWorkspaceId,
+      departingConversationId,
+      expectedCurrentMutationToken,
+      expectedCurrentWorkspaceRevision,
+    );
+    if (result.ok) {
+      return {
+        ok: true,
+        previousWorkspaceId: expectedCurrentWorkspaceId,
+        activeWorkspaceRevision: result.activeWorkspaceRevision,
+      };
+    }
     if (
       !options.isCurrent() ||
       !options.canRebase(result) ||
       result.activeWorkspaceId === undefined ||
       result.activeWorkspaceLastConversationId === undefined ||
+      (expectedCurrentWorkspaceRevision !== undefined && result.activeWorkspaceRevision === undefined) ||
       typeof result.activeWorkspaceMutationToken !== 'string'
     )
       return { ok: false };
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
+    expectedCurrentWorkspaceRevision = result.activeWorkspaceRevision;
     departingConversationId = result.activeWorkspaceLastConversationId;
     expectedCurrentMutationToken = result.activeWorkspaceMutationToken;
   }
@@ -624,6 +758,7 @@ export async function openBrowserConversationInWorkspace(options: {
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
   getActiveConversationId: () => string | null;
   getBackendActiveConversationState: () => Promise<ActiveConversationState>;
+  getBackendActiveWorkspaceState?: () => Promise<ActiveWorkspaceState>;
   getSelectionGeneration: () => number;
   getConversationSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
@@ -638,6 +773,7 @@ export async function openBrowserConversationInWorkspace(options: {
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
     expectedCurrentMutationToken?: string,
+    expectedCurrentWorkspaceRevision?: number,
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
@@ -661,9 +797,14 @@ export async function openBrowserConversationInWorkspace(options: {
       options.getActiveConversationId() === options.conversationId);
   const selectionIsCompatibleAfterWorkspaceSwitch = (workspaceId: string): boolean =>
     selectionIntentIsCompatibleAfterWorkspaceSwitch() && options.getActiveWorkspaceId() === workspaceId;
-  const [conversation, backendSelectionWhenStarted] = await Promise.all([
+  // Start the authoritative workspace read before either record lookup. Its
+  // revision is the intent snapshot that detects A -> B -> A while those
+  // asynchronous reads (or an earlier queued Browser transition) are pending.
+  const backendWorkspaceWhenStartedPromise = options.getBackendActiveWorkspaceState?.();
+  const [conversation, backendSelectionWhenStarted, backendWorkspaceWhenStarted] = await Promise.all([
     options.getConversation(options.conversationId),
     options.getBackendActiveConversationState(),
+    backendWorkspaceWhenStartedPromise ?? Promise.resolve(null),
   ]);
   if (!conversation) return false;
 
@@ -685,10 +826,9 @@ export async function openBrowserConversationInWorkspace(options: {
   }
 
   return serializeBrowserWorkspaceTransition(async () => {
-    // Read workspace state only after both the async record lookup and earlier
-    // Browser transitions. A faster successor may enter first; the generation
-    // check then makes this stale request a no-op.
-    const activeWorkspaceAtPreparation = options.getActiveWorkspaceId();
+    const activeWorkspaceAtPreparation =
+      backendWorkspaceWhenStarted?.activeWorkspaceId ?? options.getActiveWorkspaceId();
+    const activeWorkspaceRevisionAtPreparation = backendWorkspaceWhenStarted?.activeWorkspaceRevision;
     if (options.getSelectionGeneration() !== options.selectionGeneration) return false;
     // Adoption is transaction ownership. Perform it under the same queue as
     // rollback so an older request cannot relinquish its marker in the gap
@@ -702,12 +842,13 @@ export async function openBrowserConversationInWorkspace(options: {
       conversationId: options.conversationId,
       conversationWorkspaceId: targetWorkspaceId,
       activeWorkspaceId: activeWorkspaceAtPreparation,
+      activeWorkspaceRevision: activeWorkspaceRevisionAtPreparation,
       workspaceMutationToken: options.workspaceMutationToken,
       knownWorkspaceIds: options.getKnownWorkspaceIds(),
       saveLastConversation: options.saveLastConversation,
       setActiveWorkspace: options.setActiveWorkspace,
       createWorkspaceObservationWait: options.createWorkspaceObservationWait,
-      isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
+      isCurrent: selectionIsCurrent,
       isCurrentAfterSwitchIntent: selectionIntentIsCompatibleAfterWorkspaceSwitch,
       isCurrentAfterSwitch: () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId),
       resolveStaleSwitchDisposition: async () => {
@@ -774,6 +915,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   conversationId: string;
   conversationWorkspaceId?: string | null;
   activeWorkspaceId?: string | null;
+  activeWorkspaceRevision?: number;
   workspaceMutationToken: string;
   knownWorkspaceIds: Iterable<string>;
   saveLastConversation: SaveWorkspaceLastConversation;
@@ -782,6 +924,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
     expectedCurrentMutationToken?: string,
+    expectedCurrentWorkspaceRevision?: number,
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
@@ -803,6 +946,28 @@ export async function prepareConversationWorkspaceSwitch(options: {
   let shouldDiscardTransition = true;
   let shouldRestoreDestination = true;
   let previousWorkspaceId = options.activeWorkspaceId ?? null;
+  let switchedWorkspaceRevision: number | undefined;
+  const setActiveWorkspace = (
+    workspaceId: string | null,
+    expectedWorkspaceId: string | null,
+    operation: 'navigate' | 'rollback',
+    expectedMutationToken?: string,
+    expectedWorkspaceRevision?: number,
+  ) => {
+    if (expectedWorkspaceRevision !== undefined) {
+      return options.setActiveWorkspace(
+        workspaceId,
+        expectedWorkspaceId,
+        operation,
+        expectedMutationToken,
+        expectedWorkspaceRevision,
+      );
+    }
+    if (expectedMutationToken !== undefined) {
+      return options.setActiveWorkspace(workspaceId, expectedWorkspaceId, operation, expectedMutationToken);
+    }
+    return options.setActiveWorkspace(workspaceId, expectedWorkspaceId, operation);
+  };
   const restoreDestination = async (): Promise<void> => {
     if (!destinationUpdate?.ok || destinationUpdate.previousConversationId === undefined) return;
     await options.saveLastConversation({
@@ -824,10 +989,12 @@ export async function prepareConversationWorkspaceSwitch(options: {
     });
     if (destinationUpdate && !destinationUpdate.ok) return false;
     if (options.isCurrent && !options.isCurrent()) return false;
-    const switchResult = await options.setActiveWorkspace(
+    const switchResult = await setActiveWorkspace(
       targetWorkspaceId,
       options.activeWorkspaceId ?? null,
       'navigate',
+      undefined,
+      options.activeWorkspaceRevision,
     );
     const switched = typeof switchResult === 'boolean' ? switchResult : switchResult.ok;
     if (!switched) return false;
@@ -838,6 +1005,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
           ? (options.activeWorkspaceId ?? null)
           : switchResult.previousWorkspaceId;
     switchedWorkspace = previousWorkspaceId !== targetWorkspaceId;
+    switchedWorkspaceRevision = typeof switchResult === 'boolean' ? undefined : switchResult.activeWorkspaceRevision;
     if (options.isCurrentAfterSwitchIntent?.() === false) return false;
     const observed = await observation.promise;
     if (!observed) return false;
@@ -857,11 +1025,12 @@ export async function prepareConversationWorkspaceSwitch(options: {
           try {
             const disposition = (await options.resolveStaleSwitchDisposition?.()) ?? 'superseded';
             if (disposition === 'rollback') {
-              const rollbackResult = await options.setActiveWorkspace(
+              const rollbackResult = await setActiveWorkspace(
                 previousWorkspaceId,
                 targetWorkspaceId,
                 'rollback',
                 options.workspaceMutationToken,
+                switchedWorkspaceRevision,
               );
               const rolledBack = typeof rollbackResult === 'boolean' ? rollbackResult : rollbackResult.ok;
               if (!rolledBack) {

@@ -77,6 +77,20 @@ function buildDefaultStub(): AppLike {
       setActiveId: async () => ({ ok: true, activeConversationRevision: 1 }),
       onChanged: (_cb: (s: unknown) => void): UnsubFn => noopUnsub(),
     },
+    workspaces: {
+      create: async () => ({}),
+      rename: async () => undefined,
+      delete: async () => undefined,
+      getActiveState: async () => ({
+        activeWorkspaceId: null,
+        activeWorkspaceRevision: 0,
+        activeWorkspaceLastConversationId: null,
+        activeWorkspaceMutationToken: null,
+      }),
+      setActive: async () => ({ ok: true, activeWorkspaceRevision: 1 }),
+      saveLastConversation: async () => ({ ok: true }),
+      browseDirectory: async () => null,
+    },
     platform: {
       homedir: async () => '/home/test',
     },

@@ -229,9 +229,16 @@ type AppAPI = {
     create: (args: { name: string; directory: string; mutationToken?: string }) => Promise<unknown>;
     rename: (args: { id: string; name: string }) => Promise<void>;
     delete: (args: { id: string; mutationToken?: string }) => Promise<void>;
+    getActiveState: () => Promise<{
+      activeWorkspaceId: string | null;
+      activeWorkspaceRevision: number;
+      activeWorkspaceLastConversationId: string | null;
+      activeWorkspaceMutationToken: string | null;
+    }>;
     setActive: (args: {
       id: string | null;
       expectedCurrentId?: string | null;
+      expectedCurrentRevision?: number;
       expectedCurrentMutationToken?: string | null;
       mutationToken?: string;
     }) => Promise<{
@@ -239,6 +246,7 @@ type AppAPI = {
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
       activeWorkspaceLastConversationId?: string | null;
+      activeWorkspaceRevision: number;
       activeWorkspaceMutationToken?: string | null;
     }>;
     saveLastConversation: (args: {

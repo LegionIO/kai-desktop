@@ -24,9 +24,45 @@ export function registerWorkspaceHandlers(
     typeof mutationToken === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(mutationToken) ? mutationToken : null;
   let activeWorkspaceMutationToken: string | null = null;
   let mutationTokenWorkspaceId = getConfig().ui?.activeWorkspaceId ?? null;
+  // Process-local monotonic selection revision. The workspace id alone cannot
+  // detect A -> B -> A while an asynchronous Browser-attention lookup is in
+  // flight, so every authoritative selection mutation advances this counter.
+  let activeWorkspaceRevision = 0;
+  let internalActiveWorkspaceMutationDepth = 0;
+  const advanceActiveWorkspaceRevision = (): number => {
+    activeWorkspaceRevision += 1;
+    return activeWorkspaceRevision;
+  };
   const recordActiveWorkspaceMutation = (workspaceId: string | null, mutationToken?: string): void => {
     mutationTokenWorkspaceId = workspaceId;
     activeWorkspaceMutationToken = normalizeMutationToken(mutationToken);
+    advanceActiveWorkspaceRevision();
+  };
+  const setActiveWorkspaceConfig = (workspaceId: string | null, mutationToken?: string): void => {
+    internalActiveWorkspaceMutationDepth += 1;
+    try {
+      setConfig('ui.activeWorkspaceId', workspaceId);
+    } finally {
+      internalActiveWorkspaceMutationDepth -= 1;
+    }
+    recordActiveWorkspaceMutation(workspaceId, mutationToken);
+  };
+  const activeWorkspaceState = () => {
+    const config = getConfig();
+    const activeWorkspaceId = config.ui?.activeWorkspaceId ?? null;
+    if (mutationTokenWorkspaceId !== activeWorkspaceId) {
+      mutationTokenWorkspaceId = activeWorkspaceId;
+      activeWorkspaceMutationToken = null;
+      advanceActiveWorkspaceRevision();
+    }
+    return {
+      activeWorkspaceId,
+      activeWorkspaceRevision,
+      activeWorkspaceLastConversationId:
+        config.ui?.workspaces?.find((workspace) => workspace.id === activeWorkspaceId)?.lastActiveConversationId ??
+        null,
+      activeWorkspaceMutationToken,
+    };
   };
   const lastConversationMutations = new Map<string, { conversationId: string | null; mutationToken: string | null }>();
   const getLastConversationMutationToken = (workspaceId: string, conversationId: string | null): string | null => {
@@ -50,6 +86,7 @@ export function registerWorkspaceHandlers(
     if (mutation.activeWorkspaceChanged) {
       mutationTokenWorkspaceId = getConfig().ui?.activeWorkspaceId ?? null;
       activeWorkspaceMutationToken = null;
+      if (internalActiveWorkspaceMutationDepth === 0) advanceActiveWorkspaceRevision();
     }
     if (mutation.lastConversationStateChanged) lastConversationMutations.clear();
   };
@@ -108,8 +145,7 @@ export function registerWorkspaceHandlers(
       };
 
       setConfig('ui.workspaces', [...workspaces, workspace]);
-      setConfig('ui.activeWorkspaceId', workspace.id);
-      recordActiveWorkspaceMutation(workspace.id, args.mutationToken);
+      setActiveWorkspaceConfig(workspace.id, args.mutationToken);
 
       return workspace;
     },
@@ -139,16 +175,16 @@ export function registerWorkspaceHandlers(
     if (config.ui?.activeWorkspaceId === args.id) {
       if (workspaces.length > 0) {
         const sorted = [...workspaces].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
-        setConfig('ui.activeWorkspaceId', sorted[0].id);
-        recordActiveWorkspaceMutation(sorted[0].id, args.mutationToken);
+        setActiveWorkspaceConfig(sorted[0].id, args.mutationToken);
       } else {
-        setConfig('ui.activeWorkspaceId', null);
-        recordActiveWorkspaceMutation(null, args.mutationToken);
+        setActiveWorkspaceConfig(null, args.mutationToken);
       }
     }
   });
 
   // ── Set Active ──────────────────────────────────────────────────────────
+
+  ipcMain.handle('workspaces:get-active-state', async () => activeWorkspaceState());
 
   ipcMain.handle(
     'workspaces:set-active',
@@ -157,6 +193,7 @@ export function registerWorkspaceHandlers(
       args: {
         id: string | null;
         expectedCurrentId?: string | null;
+        expectedCurrentRevision?: number;
         expectedCurrentMutationToken?: string | null;
         mutationToken?: string;
       },
@@ -165,18 +202,17 @@ export function registerWorkspaceHandlers(
       error?: 'active-workspace-changed';
       activeWorkspaceId?: string | null;
       activeWorkspaceLastConversationId?: string | null;
+      activeWorkspaceRevision: number;
       activeWorkspaceMutationToken?: string | null;
     }> => {
       const config = getConfig();
       const workspaces = [...(config.ui?.workspaces ?? [])];
-      const activeWorkspaceId = config.ui?.activeWorkspaceId ?? null;
-      if (mutationTokenWorkspaceId !== activeWorkspaceId) {
-        mutationTokenWorkspaceId = activeWorkspaceId;
-        activeWorkspaceMutationToken = null;
-      }
+      const current = activeWorkspaceState();
+      const { activeWorkspaceId } = current;
 
       if (
         (args.expectedCurrentId !== undefined && args.expectedCurrentId !== activeWorkspaceId) ||
+        (args.expectedCurrentRevision !== undefined && args.expectedCurrentRevision !== activeWorkspaceRevision) ||
         (args.expectedCurrentMutationToken !== undefined &&
           args.expectedCurrentMutationToken !== activeWorkspaceMutationToken)
       ) {
@@ -187,6 +223,7 @@ export function registerWorkspaceHandlers(
           error: 'active-workspace-changed',
           activeWorkspaceId,
           activeWorkspaceLastConversationId,
+          activeWorkspaceRevision,
           ...(args.expectedCurrentMutationToken !== undefined || activeWorkspaceMutationToken
             ? { activeWorkspaceMutationToken }
             : {}),
@@ -203,11 +240,11 @@ export function registerWorkspaceHandlers(
         setConfig('ui.workspaces', workspaces);
       }
 
-      setConfig('ui.activeWorkspaceId', args.id);
-      recordActiveWorkspaceMutation(args.id, args.mutationToken);
+      setActiveWorkspaceConfig(args.id, args.mutationToken);
       return {
         ok: true,
         activeWorkspaceId: args.id,
+        activeWorkspaceRevision,
         ...(activeWorkspaceMutationToken ? { activeWorkspaceMutationToken } : {}),
       };
     },

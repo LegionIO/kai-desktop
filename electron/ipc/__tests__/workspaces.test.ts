@@ -58,8 +58,16 @@ const setActive = (
   expectedCurrentId?: string | null,
   mutationToken?: string,
   expectedCurrentMutationToken?: string | null,
+  expectedCurrentRevision?: number,
 ) =>
-  handlers.get('workspaces:set-active')!(null, { id, expectedCurrentId, mutationToken, expectedCurrentMutationToken });
+  handlers.get('workspaces:set-active')!(null, {
+    id,
+    expectedCurrentId,
+    mutationToken,
+    expectedCurrentMutationToken,
+    expectedCurrentRevision,
+  });
+const getActiveState = () => handlers.get('workspaces:get-active-state')!(null, undefined);
 const saveLastConversation = (
   workspaceId: string,
   conversationId: string | null,
@@ -110,9 +118,9 @@ describe('workspaces:set-active integrity', () => {
   it('accepts null (clear active) and a real id', async () => {
     dirs.add('/work/a');
     const w = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
-    await expect(setActive(null)).resolves.toEqual({ ok: true, activeWorkspaceId: null });
+    await expect(setActive(null)).resolves.toEqual({ ok: true, activeWorkspaceId: null, activeWorkspaceRevision: 2 });
     expect(config.ui.activeWorkspaceId).toBeNull();
-    await expect(setActive(w.id)).resolves.toEqual({ ok: true, activeWorkspaceId: w.id });
+    await expect(setActive(w.id)).resolves.toEqual({ ok: true, activeWorkspaceId: w.id, activeWorkspaceRevision: 3 });
     expect(config.ui.activeWorkspaceId).toBe(w.id);
   });
 
@@ -128,6 +136,7 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: second.id,
       activeWorkspaceLastConversationId: 'chat-b',
+      activeWorkspaceRevision: 2,
     });
     expect(config.ui.activeWorkspaceId).toBe(second.id);
   });
@@ -141,6 +150,7 @@ describe('workspaces:set-active integrity', () => {
     await expect(setActive(first.id, second.id, 'browser_request-1')).resolves.toEqual({
       ok: true,
       activeWorkspaceId: first.id,
+      activeWorkspaceRevision: 3,
       activeWorkspaceMutationToken: 'browser_request-1',
     });
     await expect(setActive(second.id, second.id)).resolves.toEqual({
@@ -148,15 +158,21 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: first.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 3,
       activeWorkspaceMutationToken: 'browser_request-1',
     });
 
-    await expect(setActive(second.id, first.id)).resolves.toEqual({ ok: true, activeWorkspaceId: second.id });
+    await expect(setActive(second.id, first.id)).resolves.toEqual({
+      ok: true,
+      activeWorkspaceId: second.id,
+      activeWorkspaceRevision: 4,
+    });
     await expect(setActive(first.id, first.id)).resolves.toEqual({
       ok: false,
       error: 'active-workspace-changed',
       activeWorkspaceId: second.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 4,
     });
   });
 
@@ -174,6 +190,7 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: first.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 1,
       activeWorkspaceMutationToken: 'local-create-request',
     });
 
@@ -185,6 +202,7 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: first.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 3,
       activeWorkspaceMutationToken: 'local-delete-request',
     });
   });
@@ -208,6 +226,7 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: first.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 4,
       activeWorkspaceMutationToken: null,
     });
     expect(config.ui.activeWorkspaceId).toBe(first.id);
@@ -258,9 +277,37 @@ describe('workspaces:set-active integrity', () => {
       error: 'active-workspace-changed',
       activeWorkspaceId: second.id,
       activeWorkspaceLastConversationId: null,
+      activeWorkspaceRevision: 7,
       activeWorkspaceMutationToken: 'other_second',
     });
     expect(config.ui.activeWorkspaceId).toBe(second.id);
+  });
+
+  it('rejects a stale revision after the active workspace changes away and back', async () => {
+    dirs.add('/work/a');
+    dirs.add('/work/b');
+    dirs.add('/work/c');
+    const first = (await create({ name: 'a', directory: '/work/a' })) as { id: string };
+    const second = (await create({ name: 'b', directory: '/work/b' })) as { id: string };
+    const third = (await create({ name: 'c', directory: '/work/c' })) as { id: string };
+
+    await setActive(first.id, third.id, 'initial');
+    const snapshot = (await getActiveState()) as {
+      activeWorkspaceId: string | null;
+      activeWorkspaceRevision: number;
+    };
+    await setActive(third.id, first.id, 'other-away');
+    await setActive(first.id, third.id, 'other-back');
+
+    await expect(
+      setActive(second.id, snapshot.activeWorkspaceId, 'stale-browser', undefined, snapshot.activeWorkspaceRevision),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: 'active-workspace-changed',
+      activeWorkspaceId: first.id,
+      activeWorkspaceRevision: snapshot.activeWorkspaceRevision + 2,
+    });
+    expect(config.ui.activeWorkspaceId).toBe(first.id);
   });
 });
 
