@@ -6985,10 +6985,11 @@ export class BrowserManager {
         // History API/hash event from the departing document. It is not the
         // requested navigation's completion signal.
         if (!startedInPlace) return;
-        if (!reachedDestination(url)) {
-          finish(changedError());
-          return;
-        }
+        // Same-document history entries can share a URL, and Chromium can emit a
+        // delayed event for the entry being left. Ignore events that have not
+        // moved the navigation cursor to the requested destination; a genuine
+        // competing navigation is rejected by its did-start-navigation event.
+        if (!reachedDestination(url)) return;
         finish();
       };
       const onDidStopLoading = () => {
@@ -7004,12 +7005,17 @@ export class BrowserManager {
         validatedUrl: string,
         isMainFrame: boolean,
       ) => {
-        if (!started || !isMainFrame || failIfAttemptChanged()) return;
+        if (!isMainFrame) return;
         const ignoredFailureSequence = tab.ignoredSupersededNavigationFailureSequence ?? 0;
-        if (ignoredFailureSequence > observedIgnoredSupersededNavigationFailureSequence) {
+        const ignoredSupersededFailure = ignoredFailureSequence > observedIgnoredSupersededNavigationFailureSequence;
+        if (ignoredSupersededFailure) {
           observedIgnoredSupersededNavigationFailureSequence = ignoredFailureSequence;
-          return;
         }
+        // Consume wireWebContents' acknowledgement on the same callback that
+        // produced it, even when that stale failure arrives before this attempt
+        // starts. Otherwise the next genuine failure would consume the old
+        // acknowledgement and wait until the outer deadline.
+        if (!started || failIfAttemptChanged() || ignoredSupersededFailure) return;
         const comparableUrl = comparablePopupReferrerUrl(validatedUrl);
         if (comparableUrl && !attemptUrls.has(comparableUrl)) return;
         // wireWebContents processes this event first. If the same navigation is
@@ -7075,7 +7081,7 @@ export class BrowserManager {
           target.url,
           'Browser history navigation',
           () => navigation.goToIndex(targetIndex),
-          (url) => navigation.getActiveIndex() === targetIndex || url === target.url,
+          () => navigation.getActiveIndex() === targetIndex,
           (generation, networkNavigationSequence) => {
             cancellationGeneration = generation;
             cancellationNetworkNavigationSequence = networkNavigationSequence;
@@ -7090,6 +7096,9 @@ export class BrowserManager {
         tab.trustedUserNavigationLease === cancellationUserNavigationLease,
     );
     throwIfBrowserAborted(abortSignal);
+    if (navigation.getActiveIndex() !== targetIndex) {
+      throw new Error('The browser history changed before navigation completed.');
+    }
     const completedPage = this.captureBrowserPageLease(tab, contents);
     await this.assertAssistantNavigationAllowed(contents.getURL(), tab.partition, abortSignal);
     this.assertBrowserPageLease(tab, completedPage, 'assistant history navigation');

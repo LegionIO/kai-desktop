@@ -304,9 +304,10 @@ export function invalidateMissingConfirmedConversationSelection(
 }
 
 /** Clear a confirmed selection whose strict record read returned missing in
- * both main and the renderer. The backend compare-and-set prevents a late read
- * from erasing a newer selection, while the second checkpoint comparison keeps
- * a delayed IPC acknowledgement from replacing newer renderer intent. */
+ * both main and the renderer. A lost compare-and-set may leave another client's
+ * global selection intact while this renderer clears only its proven-missing
+ * local selection. The second checkpoint comparison keeps either acknowledgement
+ * from replacing newer renderer intent. */
 export async function clearMissingConfirmedConversationSelection(options: {
   missing: ConfirmedConversationSelection;
   getCurrent: () => ConfirmedConversationSelection;
@@ -326,12 +327,12 @@ export async function clearMissingConfirmedConversationSelection(options: {
     return null;
   }
   const result = await options.setActiveId(null, missingId, options.missing.activeConversationRevision);
-  if (
-    !options.isCurrent() ||
-    !result.ok ||
-    result.activeConversationId !== null ||
-    result.activeConversationRevision === undefined
-  ) {
+  const backendNoLongerSelectsMissing = result.ok
+    ? result.activeConversationId === null
+    : result.error === 'active-conversation-changed' &&
+      result.activeConversationId !== undefined &&
+      result.activeConversationId !== missingId;
+  if (!options.isCurrent() || !backendNoLongerSelectsMissing || result.activeConversationRevision === undefined) {
     return null;
   }
   const invalidated = invalidateMissingConfirmedConversationSelection(options.getCurrent(), options.missing);
@@ -864,8 +865,17 @@ export async function openBrowserConversationInWorkspace(options: {
 
   const targetWorkspaceId = conversation.workspaceId ?? null;
   const selectTargetConversation = async (): Promise<boolean> => {
-    if (options.getActiveConversationId() === options.conversationId) return true;
-    if (!selectionIsCurrent()) return false;
+    if (!selectionIntentIsCompatibleAfterWorkspaceSwitch()) return false;
+    // The renderer publishes an in-flight selection before its backend CAS
+    // resolves. Treat a local target match as committed only when the
+    // authoritative snapshot agrees; otherwise join/retry through the normal
+    // switch path so a double-click cannot report success for speculative state.
+    if (
+      options.getActiveConversationId() === options.conversationId &&
+      backendSelectionWhenStarted.activeConversationId === options.conversationId
+    ) {
+      return true;
+    }
     return options.switchConversation(
       options.conversationId,
       backendSelectionWhenStarted.activeConversationId,

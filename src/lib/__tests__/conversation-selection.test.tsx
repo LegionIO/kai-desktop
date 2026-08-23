@@ -155,7 +155,7 @@ describe('confirmed conversation selection reconciliation', () => {
     await expect(clearing).resolves.toBeNull();
   });
 
-  it('does not clear renderer state when main rejects the missing-selection CAS', async () => {
+  it("clears a missing local selection without adopting another client's active conversation", async () => {
     const missing = {
       activeConversationId: 'chat-a',
       activeConversationRevision: 4,
@@ -174,7 +174,11 @@ describe('confirmed conversation selection reconciliation', () => {
           activeConversationRevision: 5,
         }),
       }),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({
+      activeConversationId: null,
+      activeConversationRevision: 5,
+      intentGeneration: 2,
+    });
   });
 
   it('recovers failed speculative selections to an older local selection that the backend committed', () => {
@@ -1121,6 +1125,37 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1, 42, 1);
   });
 
+  it('does not treat a speculative renderer target as an acknowledged Browser selection', async () => {
+    const switchConversation = vi.fn(async () => false);
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-browser',
+        selectionGeneration: 2,
+        conversationSelectionGeneration: 2,
+        workspaceMutationToken: 'browser_request-test',
+        getConversation: async () => ({ workspaceId: null }),
+        // A preceding click publishes this target before its backend CAS settles.
+        getActiveConversationId: () => 'chat-browser',
+        getBackendActiveConversationState: async () => activeConversationState('chat-previous', 42),
+        getSelectionGeneration: () => 2,
+        getConversationSelectionGeneration: () => 2,
+        getActiveWorkspaceId: () => null,
+        getKnownWorkspaceIds: () => [],
+        saveLastConversation: async () => undefined,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 2,
+        browserAttentionGeneration: 2,
+        setActiveWorkspace: async () => true,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        switchConversation,
+      }),
+    ).resolves.toBe(false);
+
+    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-previous', 2, 42, 2);
+  });
+
   it('adopts a pending workspace transition when the target is already selected', async () => {
     const adoptActiveWorkspaceTransition = vi.fn();
     const setActiveWorkspace = vi.fn(async () => true);
@@ -1979,7 +2014,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ]);
   });
 
-  it('accepts the target selected by the requested workspace restoration', async () => {
+  it('reconciles the target selected by the requested workspace restoration', async () => {
     let activeWorkspaceId = 'workspace-a';
     let activeConversationId = 'chat-a';
     const selectionGeneration = 1;
@@ -2023,7 +2058,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveObservation(true);
 
     await expect(opening).resolves.toBe(true);
-    expect(switchConversation).not.toHaveBeenCalled();
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1, 1, 1);
   });
 
   it('waits for a configured workspace whose transition effect is still pending', async () => {

@@ -17083,6 +17083,60 @@ describe('browser manager renderer lifecycle', () => {
     expect(listeners).toHaveLength(0);
   });
 
+  it('does not apply a pre-start stale-failure acknowledgement to the current navigation failure', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      getURL: () => 'https://example.com',
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => true,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      reload: vi.fn(),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 1,
+      networkNavigationSequence: 0,
+      ignoredSupersededNavigationFailureSequence: 0,
+      trustedUserNavigationLease: 0,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeout: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+    });
+
+    const reloading = invokePrivate(manager, 'reloadAssistantTab', tab, contents, false, undefined, {
+      runGeneration: 1,
+      tabGeneration: 1,
+      userNavigationLease: 0,
+      url: 'https://example.com',
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(contents.reload).toHaveBeenCalledOnce());
+
+    tab.ignoredSupersededNavigationFailureSequence = 1;
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', 'https://example.com', true);
+    tab.generation = 2;
+    tab.networkNavigationSequence = 1;
+    listeners.get('did-start-navigation')?.({}, 'https://example.com', false, true);
+    listeners.get('did-fail-load')?.({}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://example.com', true);
+
+    await expect(reloading).rejects.toThrow(/ERR_NAME_NOT_RESOLVED/);
+    expect(listeners).toHaveLength(0);
+  });
+
   it('reclaims the exact replacement document when an assistant reload is cancelled', async () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const contents = {
@@ -17250,6 +17304,75 @@ describe('browser manager renderer lifecycle', () => {
     listeners.get('did-navigate')?.({}, currentUrl);
     loadingMainFrame = false;
     listeners.get('did-stop-loading')?.();
+
+    await expect(navigating).resolves.toBeUndefined();
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('does not complete same-document history on a stale event from a duplicate-URL entry', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    let activeIndex = 2;
+    const duplicateUrl = 'https://example.com/app#same';
+    const navigationHistory = {
+      canGoToOffset: () => true,
+      getActiveIndex: () => activeIndex,
+      getEntryAtIndex: (index: number) => ({
+        title: index === 1 ? 'Target entry' : 'Current entry',
+        url: duplicateUrl,
+      }),
+      goToIndex: vi.fn(),
+    };
+    const contents = {
+      getURL: () => duplicateUrl,
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => false,
+      navigationHistory,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: duplicateUrl },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 8,
+      networkNavigationSequence: 10,
+      trustedUserNavigationLease: 2,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeout: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+    });
+
+    const navigating = invokePrivate(manager, 'navigateAssistantHistory', tab, contents, -1, undefined, {
+      runGeneration: 1,
+      tabGeneration: 8,
+      userNavigationLease: 2,
+      url: duplicateUrl,
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(navigationHistory.goToIndex).toHaveBeenCalledWith(1));
+
+    listeners.get('did-start-navigation')?.({}, duplicateUrl, true, true);
+    listeners.get('did-navigate-in-page')?.({}, duplicateUrl, true);
+    let completed = false;
+    void navigating.then(() => {
+      completed = true;
+    });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+
+    activeIndex = 1;
+    listeners.get('did-navigate-in-page')?.({}, duplicateUrl, true);
 
     await expect(navigating).resolves.toBeUndefined();
     expect(listeners).toHaveLength(0);
