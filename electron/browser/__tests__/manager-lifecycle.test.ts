@@ -6500,6 +6500,129 @@ describe('browser manager renderer lifecycle', () => {
     expect(sendCommand).not.toHaveBeenCalledWith('Runtime.evaluate', expect.anything());
   });
 
+  it.each(['user', 'assistant'] as const)(
+    'preserves renderer-loss identity for %s password evaluation',
+    async (source) => {
+      let destroyed = false;
+      const sendCommand = vi.fn(async (method: string) => {
+        if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+        if (method === 'Page.createIsolatedWorld') return { executionContextId: 7 };
+        if (method === 'Runtime.evaluate') {
+          tab.view = null;
+          destroyed = true;
+          throw new Error('Target closed with secret-bearing source.');
+        }
+        throw new Error(`Unexpected command: ${method}`);
+      });
+      const contents = {
+        id: 41,
+        isDestroyed: () => destroyed,
+        debugger: { sendCommand },
+      };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/login' },
+        generation: 7,
+        documentEpoch: 2,
+        trustedUserNavigationLease: 3,
+        aiControlOwnerId: source === 'assistant' ? 'run-1' : null,
+        aiControlGeneration: source === 'assistant' ? 9 : null,
+        view: { webContents: contents } as null | { webContents: typeof contents },
+      };
+      const manager = managerWithoutConstructor({
+        acquireBrowserDebuggerLease: () => ({ release: vi.fn(), cancel: vi.fn() }),
+        isHostRendererAuthorityCurrent: () => true,
+        runRendererOperationWithDeadline: (
+          _tab: unknown,
+          _contents: unknown,
+          _operation: string,
+          _timeoutMs: number,
+          task: () => Promise<unknown>,
+        ) => task(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const pageLease = invokePrivate(manager, 'captureBrowserPageLease', tab, contents);
+      const documentLease = {
+        runId: 'run-1',
+        runGeneration: 9,
+        hostRendererAuthorityGeneration: 1,
+        tabGeneration: 7,
+        documentEpoch: 2,
+        userNavigationLease: 3,
+        url: tab.shell.url,
+      };
+
+      const result = invokePrivate(
+        manager,
+        'evaluateWithDeadline',
+        tab,
+        contents,
+        'secret-bearing-script',
+        undefined,
+        source === 'assistant' ? documentLease : undefined,
+        1_000,
+        true,
+        undefined,
+        source === 'user' ? pageLease : undefined,
+        true,
+      ) as Promise<unknown>;
+
+      await expect(result).rejects.toThrow('The browser page closed during Browser script evaluation.');
+      await expect(result).rejects.not.toThrow(/secret-bearing source/i);
+    },
+  );
+
+  it('masks only a current page runtime exception for password evaluation', async () => {
+    const sendCommand = vi.fn(async (method: string) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 7 };
+      if (method === 'Runtime.evaluate') {
+        return { exceptionDetails: { exception: { description: 'secret-bearing page exception' } } };
+      }
+      throw new Error(`Unexpected command: ${method}`);
+    });
+    const contents = {
+      id: 41,
+      isDestroyed: () => false,
+      debugger: { sendCommand },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/login' },
+      generation: 7,
+      documentEpoch: 2,
+      trustedUserNavigationLease: 3,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebuggerLease: () => ({ release: vi.fn(), cancel: vi.fn() }),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const pageLease = invokePrivate(manager, 'captureBrowserPageLease', tab, contents);
+
+    await expect(
+      invokePrivate(
+        manager,
+        'evaluateWithDeadline',
+        tab,
+        contents,
+        'secret-bearing-script',
+        undefined,
+        undefined,
+        1_000,
+        true,
+        undefined,
+        pageLease,
+        true,
+      ) as Promise<unknown>,
+    ).resolves.toBe(false);
+  });
+
   it('binds tab-list read approval to the exact active tab, order, shells, and documents', () => {
     const first = {
       shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://one.example/account' },
@@ -11259,7 +11382,7 @@ describe('browser manager renderer lifecycle', () => {
     };
     const listCredentials = vi.fn(() => [credential]);
     const evaluateWithDeadline = vi.fn(async (_tab: unknown, _contents: unknown, source: string) => {
-      if (source.includes('never-expose-this-password')) throw new Error('never-expose-this-password');
+      if (source.includes('never-expose-this-password')) return false;
       return true;
     });
     const vault = {
@@ -11327,7 +11450,7 @@ describe('browser manager renderer lifecycle', () => {
     evaluateWithDeadline.mockReset();
     evaluateWithDeadline.mockResolvedValueOnce(true).mockImplementationOnce(async () => {
       tab.documentEpoch++;
-      throw new Error('Execution context was destroyed.');
+      throw new Error('The browser page changed while this saved-password autofill was in progress.');
     });
     await expect(
       manager.autofill('chat-1', 'tab-1', 'credential-1', 'user', undefined, approval, documentToken),

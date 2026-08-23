@@ -13916,6 +13916,7 @@ export class BrowserManager {
     reclaimTargetOnCancellation = true,
     captureDebuggerLease?: (lease: BrowserDebuggerLease) => void,
     pageLease?: BrowserPageLease,
+    maskRuntimeEvaluationErrors = false,
   ): Promise<unknown> {
     return this.runRendererOperationWithDeadline(
       tab,
@@ -13924,6 +13925,12 @@ export class BrowserManager {
       timeoutMs,
       async () => {
         const assertEvaluationDocumentCurrent = (): void => {
+          // Renderer loss invalidates both lease types. Report that native
+          // lifecycle event before the more general navigation identity so
+          // callers can distinguish a crash/close from a document commit.
+          if ((documentLease || pageLease) && (tab.view?.webContents !== contents || contents.isDestroyed())) {
+            throw new Error('The browser page closed during Browser script evaluation.');
+          }
           if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
           if (pageLease) this.assertBrowserPageLease(tab, pageLease, 'saved-password autofill');
         };
@@ -13955,21 +13962,33 @@ export class BrowserManager {
           // executionContextId instead of evaluating the secret in the new
           // document.
           assertEvaluationDocumentCurrent();
-          const response = (await contents.debugger.sendCommand('Runtime.evaluate', {
-            expression: script,
-            awaitPromise: true,
-            returnByValue: true,
-            userGesture: false,
-            contextId: isolatedWorld.executionContextId,
-          })) as {
+          let response: {
             result?: { value?: unknown; description?: string };
             exceptionDetails?: {
               text?: string;
               exception?: { description?: string };
             };
           };
+          try {
+            response = (await contents.debugger.sendCommand('Runtime.evaluate', {
+              expression: script,
+              awaitPromise: true,
+              returnByValue: true,
+              userGesture: false,
+              contextId: isolatedWorld.executionContextId,
+            })) as typeof response;
+          } catch (error) {
+            // A transport rejection may be a navigation/renderer-loss signal;
+            // check those first. If the target is still current, its error may
+            // quote the evaluated source, so password-bearing callers request
+            // a value-only failure instead of exposing that message.
+            assertEvaluationDocumentCurrent();
+            if (maskRuntimeEvaluationErrors) return false;
+            throw error;
+          }
           assertEvaluationDocumentCurrent();
           if (response.exceptionDetails) {
+            if (maskRuntimeEvaluationErrors) return false;
             throw new Error(
               response.exceptionDetails.exception?.description ??
                 response.exceptionDetails.text ??
@@ -16469,6 +16488,7 @@ export class BrowserManager {
           true,
           undefined,
           pageLease,
+          true,
         );
         if (targetFound !== true) {
           throw new Error('Saved-password autofill requires one unambiguous matching login frame.');
@@ -16516,20 +16536,8 @@ export class BrowserManager {
             true,
             undefined,
             pageLease,
-          ).catch((error: unknown) => {
-            // Page exceptions may include the evaluated source (and therefore
-            // the password), so collapse only a still-current page failure.
-            // Deadline, cancellation, renderer loss, and navigation errors are
-            // lifecycle signals callers must be able to distinguish.
-            if (error instanceof BrowserRendererDeadlineError) throw error;
-            throwIfBrowserAborted(abortSignal);
-            if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
-            assertAutofillPageCurrent();
-            if (tab.view?.webContents !== contents || contents.isDestroyed()) {
-              throw new Error('The browser page changed during saved-password autofill.');
-            }
-            return false;
-          });
+            true,
+          );
           if (filled !== true) {
             throw new Error('Saved-password autofill could not fill the selected login form.');
           }
