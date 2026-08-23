@@ -2400,6 +2400,88 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('status')).not.toHaveTextContent('clicked');
   });
 
+  it('reconciles same-kind prompt additions and dismissals over a hydration snapshot', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const snapshot = deferred<{
+      conversationId: string;
+      tabs: BrowserTab[];
+      activeTabId: string | null;
+      permissionPrompts: BrowserPermissionPrompt[];
+    }>();
+    const retainedPrompt: BrowserPermissionPrompt = {
+      id: 'retained-permission',
+      tabId: tab.id,
+      origin: 'https://camera.example',
+      permission: 'camera',
+      assistantTriggered: true,
+    };
+    const dismissedPrompt: BrowserPermissionPrompt = {
+      id: 'dismissed-permission',
+      tabId: tab.id,
+      origin: 'https://location.example',
+      permission: 'geolocation',
+      assistantTriggered: true,
+    };
+    const livePrompt: BrowserPermissionPrompt = {
+      id: 'live-permission',
+      tabId: tab.id,
+      origin: 'https://microphone.example',
+      permission: 'microphone',
+      assistantTriggered: true,
+    };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => snapshot.promise,
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await waitFor(() => expect(emit).toBeDefined());
+
+    act(() => {
+      emit?.({ type: 'permission-prompt', conversationId: 'chat-1', prompt: livePrompt });
+      emit?.({
+        type: 'prompt-dismissed',
+        conversationId: 'chat-1',
+        promptId: dismissedPrompt.id,
+        promptKind: 'permission',
+      });
+    });
+    snapshot.resolve({
+      conversationId: 'chat-1',
+      tabs: [tab],
+      activeTabId: tab.id,
+      permissionPrompts: [retainedPrompt, dismissedPrompt],
+    });
+    await act(async () => {
+      await snapshot.promise;
+    });
+
+    expect(screen.getByRole('alertdialog', { name: 'Browser permission request for camera' })).toHaveTextContent(
+      'https://camera.example',
+    );
+    expect(screen.queryByText('https://location.example')).not.toBeInTheDocument();
+
+    act(() =>
+      emit?.({
+        type: 'prompt-dismissed',
+        conversationId: 'chat-1',
+        promptId: retainedPrompt.id,
+        promptKind: 'permission',
+      }),
+    );
+    expect(screen.getByRole('alertdialog', { name: 'Browser permission request for microphone' })).toHaveTextContent(
+      'https://microphone.example',
+    );
+  });
+
   it('hydrates unrelated retained prompt domains when live prompt and action events race the snapshot', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const snapshot = deferred<{

@@ -6,6 +6,7 @@ vi.mock('electron', () => ({
 }));
 
 const { clearPluginBrowserPartitions } = await import('../plugin-partitions.js');
+const { MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES } = await import('../session.js');
 const { BROWSER_SESSION_OPERATION_TIMEOUT_MS, waitForBrowserSessionOperations } =
   await import('../session-operations.js');
 const { beginPluginBrowserPartitionOperation, trackPluginBrowserWindow } =
@@ -21,6 +22,23 @@ function pluginSession() {
 }
 
 describe('plugin browser partition clearing', () => {
+  it('rejects an oversized deduplicated target set before constructing sessions or lifecycle fences', async () => {
+    const getSession = vi.fn(() => pluginSession() as unknown as Session);
+    const names = Array.from({ length: MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES + 1 }, (_, index) => `plugin-${index}`);
+
+    await expect(clearPluginBrowserPartitions(names, { getSession })).rejects.toThrow(
+      /Too many plugin browser partition names/,
+    );
+    expect(getSession).not.toHaveBeenCalled();
+
+    await expect(
+      clearPluginBrowserPartitions(Array(MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES + 1).fill('plugin-duplicate'), {
+        getSession,
+        stopServiceWorkers: async () => undefined,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it('waits for an admitted plugin session operation before constructing clear sessions', async () => {
     const partitionName = 'plugin-active-operation';
     const releaseOperation = beginPluginBrowserPartitionOperation(`persist:${partitionName}`);

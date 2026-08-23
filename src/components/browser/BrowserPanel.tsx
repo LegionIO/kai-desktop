@@ -93,6 +93,29 @@ function appendPromptOnce<T extends { id: string }>(current: T[], prompt: T): T[
   return next;
 }
 
+type BrowserPromptSnapshotDelta<T extends { id: string }> = {
+  revision: number;
+  prompt: T | null;
+};
+
+function reconcileBrowserPromptSnapshot<T extends { id: string }>(
+  snapshot: T[] | undefined,
+  snapshotRevision: number,
+  appliedRevision: number,
+  deltas: Map<string, BrowserPromptSnapshotDelta<T>>,
+): T[] {
+  const reconciled = new Map((snapshot ?? []).map((prompt) => [prompt.id, prompt]));
+  for (const [promptId, delta] of deltas) {
+    if (delta.revision <= snapshotRevision) continue;
+    if (delta.prompt) reconciled.set(promptId, delta.prompt);
+    else reconciled.delete(promptId);
+  }
+  for (const [promptId, delta] of deltas) {
+    if (delta.revision <= appliedRevision && deltas.get(promptId) === delta) deltas.delete(promptId);
+  }
+  return [...reconciled.values()];
+}
+
 function browserPermissionOrigin(url: string): string | null {
   try {
     const parsed = new URL(url);
@@ -469,6 +492,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   });
   const actionEventRevisionRef = useRef(0);
   const actionSnapshotDeltasRef = useRef(new Map<string, { revision: number; action: BrowserActionEvent }>());
+  const credentialPromptSnapshotDeltasRef = useRef(
+    new Map<string, BrowserPromptSnapshotDelta<BrowserCredentialPrompt>>(),
+  );
+  const permissionPromptSnapshotDeltasRef = useRef(
+    new Map<string, BrowserPromptSnapshotDelta<BrowserPermissionPrompt>>(),
+  );
+  const authPromptSnapshotDeltasRef = useRef(new Map<string, BrowserPromptSnapshotDelta<BrowserAuthPrompt>>());
   const stateRef = useRef<BrowserManagerState | null>(null);
   const pendingFaviconsRef = useRef(new Map<string, string | null>());
   const bookmarkRequestRef = useRef(0);
@@ -736,15 +766,30 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       // Prompt/action events are independent live deltas. Reconcile each
       // snapshot domain separately so an action event cannot suppress retained
       // prompts, and one prompt kind cannot suppress another.
-      if (auxiliaryRevision.credentialPrompts === auxiliarySnapshotRevisionRef.current.credentialPrompts) {
-        setCredentialPrompts(reconciled.credentialPrompts ?? []);
-      }
-      if (auxiliaryRevision.permissionPrompts === auxiliarySnapshotRevisionRef.current.permissionPrompts) {
-        setPermissionPrompts(reconciled.permissionPrompts ?? []);
-      }
-      if (auxiliaryRevision.authPrompts === auxiliarySnapshotRevisionRef.current.authPrompts) {
-        setAuthPrompts(reconciled.authPrompts ?? []);
-      }
+      setCredentialPrompts(
+        reconcileBrowserPromptSnapshot(
+          reconciled.credentialPrompts,
+          auxiliaryRevision.credentialPrompts,
+          auxiliarySnapshotRevisionRef.current.credentialPrompts,
+          credentialPromptSnapshotDeltasRef.current,
+        ),
+      );
+      setPermissionPrompts(
+        reconcileBrowserPromptSnapshot(
+          reconciled.permissionPrompts,
+          auxiliaryRevision.permissionPrompts,
+          auxiliarySnapshotRevisionRef.current.permissionPrompts,
+          permissionPromptSnapshotDeltasRef.current,
+        ),
+      );
+      setAuthPrompts(
+        reconcileBrowserPromptSnapshot(
+          reconciled.authPrompts,
+          auxiliaryRevision.authPrompts,
+          auxiliarySnapshotRevisionRef.current.authPrompts,
+          authPromptSnapshotDeltasRef.current,
+        ),
+      );
       // A snapshot and live action events are two halves of one state stream.
       // Replaying per-id deltas over the snapshot preserves unrelated running
       // actions when (for example) action B completes while the snapshot still
@@ -863,6 +908,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     }
     actionEventRevisionRef.current++;
     actionSnapshotDeltasRef.current.clear();
+    credentialPromptSnapshotDeltasRef.current.clear();
+    permissionPromptSnapshotDeltasRef.current.clear();
+    authPromptSnapshotDeltasRef.current.clear();
     bookmarkRequestRef.current++;
     sitePermissionRequestRef.current++;
     suggestionRequestRef.current++;
@@ -917,6 +965,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         }
         actionEventRevisionRef.current++;
         actionSnapshotDeltasRef.current.clear();
+        credentialPromptSnapshotDeltasRef.current.clear();
+        permissionPromptSnapshotDeltasRef.current.clear();
+        authPromptSnapshotDeltasRef.current.clear();
         bookmarkRequestRef.current++;
         sitePermissionRequestRef.current++;
         suggestionRequestRef.current++;
@@ -1034,25 +1085,31 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         setManagerRevision((revision) => revision + 1);
         void refreshBookmarks();
       } else if (event.type === 'credential-prompt') {
-        auxiliarySnapshotRevisionRef.current.credentialPrompts++;
+        const revision = ++auxiliarySnapshotRevisionRef.current.credentialPrompts;
+        credentialPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
         setCredentialPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'permission-prompt') {
-        auxiliarySnapshotRevisionRef.current.permissionPrompts++;
+        const revision = ++auxiliarySnapshotRevisionRef.current.permissionPrompts;
+        permissionPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
         setPermissionPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'auth-prompt') {
-        auxiliarySnapshotRevisionRef.current.authPrompts++;
+        const revision = ++auxiliarySnapshotRevisionRef.current.authPrompts;
+        authPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
         setAuthPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'prompt-dismissed') {
         const remove = <T extends { id: string }>(current: T[]) =>
           current.filter((prompt) => prompt.id !== event.promptId);
         if (event.promptKind === 'credential') {
-          auxiliarySnapshotRevisionRef.current.credentialPrompts++;
+          const revision = ++auxiliarySnapshotRevisionRef.current.credentialPrompts;
+          credentialPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
           setCredentialPrompts(remove);
         } else if (event.promptKind === 'permission') {
-          auxiliarySnapshotRevisionRef.current.permissionPrompts++;
+          const revision = ++auxiliarySnapshotRevisionRef.current.permissionPrompts;
+          permissionPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
           setPermissionPrompts(remove);
         } else {
-          auxiliarySnapshotRevisionRef.current.authPrompts++;
+          const revision = ++auxiliarySnapshotRevisionRef.current.authPrompts;
+          authPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
           setAuthPrompts(remove);
         }
       } else if (event.type === 'download') {

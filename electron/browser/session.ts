@@ -10,6 +10,8 @@ import type {
 import { MAX_BROWSER_URL_CHARS } from './metadata.js';
 
 const MAX_VIEW_DIMENSION = 16_384;
+export const MAX_BROWSER_DATA_CLEAR_SCOPE_KEYS = 1_000;
+export const MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES = 1_000;
 
 function brandSlug(): string {
   return typeof __BRAND_APP_SLUG === 'string' && __BRAND_APP_SLUG ? __BRAND_APP_SLUG : 'kai';
@@ -64,17 +66,23 @@ export function resolveBrowserDataScopeKeys(options: BrowserDataClearOptions, cu
   for (const scopeKey of options.scopeKeys ?? []) {
     if (!isBrowserScopeKey(scopeKey)) throw new Error('Invalid browser profile key.');
     keys.add(scopeKey);
+    if (keys.size > MAX_BROWSER_DATA_CLEAR_SCOPE_KEYS) {
+      throw new Error('Too many browser profile keys provided.');
+    }
   }
   if (options.includeGlobal) keys.add('global');
   if (options.includeConversation && options.conversationId) {
     keys.add(browserScopeKey('conversation', options.conversationId));
   }
   if (keys.size === 0 && currentScopeKey) keys.add(currentScopeKey);
+  if (keys.size > MAX_BROWSER_DATA_CLEAR_SCOPE_KEYS) {
+    throw new Error('Too many browser profile keys provided.');
+  }
   return [...keys];
 }
 
 export function validatePluginPartitionClearNames(values: string[] | undefined): string[] {
-  const result: string[] = [];
+  const result = new Set<string>();
   for (const partitionName of values ?? []) {
     // Keep this aligned with partitions:delete: plugin partition directories
     // may contain spaces or Unicode, but must remain a single direct child of
@@ -94,9 +102,12 @@ export function validatePluginPartitionClearNames(values: string[] | undefined):
     if (isInAppBrowserPartition(partitionName)) {
       throw new Error('In-app Browser profiles cannot be cleared through plugin partition management.');
     }
-    result.push(partitionName);
+    result.add(partitionName);
+    if (result.size > MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES) {
+      throw new Error('Too many plugin browser partition names provided.');
+    }
   }
-  return result;
+  return [...result];
 }
 
 export const BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT = '--kai-browser-private-network-guard';

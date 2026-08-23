@@ -19,6 +19,8 @@ import {
   isInAppBrowserPartition,
   isInAppBrowserPartitionName,
   isPrivateNetworkUrl,
+  MAX_BROWSER_DATA_CLEAR_SCOPE_KEYS,
+  MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES,
   normalizeOmniboxInput,
   registerBrowserFramePreload,
   resolveBrowserDataScopeKeys,
@@ -239,15 +241,28 @@ describe('browser session helpers', () => {
     ]);
     expect(resolveBrowserDataScopeKeys({ conversationId: 'chat-1' }, 'global')).toEqual(['global']);
     expect(() => resolveBrowserDataScopeKeys({ scopeKeys: ['../unsafe'] })).toThrow(/Invalid browser profile/);
+    const excessiveScopeKeys = Array.from(
+      { length: MAX_BROWSER_DATA_CLEAR_SCOPE_KEYS + 1 },
+      (_, index) => `conversation-${index.toString(16).padStart(24, '0')}`,
+    );
+    expect(() => resolveBrowserDataScopeKeys({ scopeKeys: excessiveScopeKeys })).toThrow(
+      /Too many browser profile keys/,
+    );
   });
 
   it('rejects reserved in-app Browser profiles from plugin partition clearing', () => {
     expect(validatePluginPartitionClearNames(['plugin-auth'])).toEqual(['plugin-auth']);
+    expect(validatePluginPartitionClearNames(['plugin-auth', 'plugin-auth'])).toEqual(['plugin-auth']);
     expect(validatePluginPartitionClearNames(['plugin auth', 'plugin-认证'])).toEqual(['plugin auth', 'plugin-认证']);
     expect(() => validatePluginPartitionClearNames(['kai-browser-global'])).toThrow(/In-app Browser profiles/);
     expect(() => validatePluginPartitionClearNames(['KAI-BROWSER-GLOBAL'])).toThrow(/In-app Browser profiles/);
     expect(() => validatePluginPartitionClearNames(['persist:kai-browser-global'])).toThrow(/In-app Browser profiles/);
     expect(() => validatePluginPartitionClearNames(['../unsafe'])).toThrow(/Invalid plugin browser partition/);
+    expect(() =>
+      validatePluginPartitionClearNames(
+        Array.from({ length: MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES + 1 }, (_, index) => `plugin-${index}`),
+      ),
+    ).toThrow(/Too many plugin browser partition names/);
   });
 
   it('validates and rounds sidebar bounds', () => {

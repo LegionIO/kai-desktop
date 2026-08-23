@@ -8,6 +8,7 @@ import {
 import { runBrowserDataClearOperations } from './data-clear.js';
 import { runBrowserSessionOperation, waitForBrowserSessionOperations } from './session-operations.js';
 import { stopRunningBrowserServiceWorkers } from './service-workers.js';
+import { MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES } from './session.js';
 
 export type PluginPartitionClearOptions = {
   getSession?: (electronPartition: string) => Session;
@@ -47,6 +48,13 @@ export async function clearPluginBrowserPartitions(
 ): Promise<void> {
   const names = [...new Set(partitionNames)];
   if (names.length === 0) return;
+  // This is the shared sink for Settings, recovery, and plugin-partition IPC.
+  // Bound the deduplicated expansion before installing any lifecycle fences or
+  // constructing Electron Sessions; callers cannot safely enforce this after a
+  // recovery sentinel has expanded to the on-disk inventory.
+  if (names.length > MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES) {
+    throw new Error('Too many plugin browser partition names provided.');
+  }
   const getSession = options.getSession ?? ((electronPartition: string) => session.fromPartition(electronPartition));
   const stopServiceWorkers =
     options.stopServiceWorkers ??

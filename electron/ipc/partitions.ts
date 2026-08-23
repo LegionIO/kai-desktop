@@ -1,7 +1,11 @@
 import { app, type IpcMain } from 'electron';
 import { join, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, rmSync } from 'fs';
-import { isInAppBrowserPartition, isInAppBrowserPartitionName } from '../browser/session.js';
+import {
+  isInAppBrowserPartition,
+  isInAppBrowserPartitionName,
+  MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES,
+} from '../browser/session.js';
 import { clearPluginBrowserPartitions } from '../browser/plugin-partitions.js';
 import {
   clearCorruptPluginBrowserQuarantineMarkers,
@@ -128,8 +132,7 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
     // fabricated names) synchronously creates that many fences / sessions /
     // queue entries even when no such profile exists on disk. A real inventory
     // never approaches this, so cap defensively.
-    const MAX_PARTITION_DELETE_NAMES = 1000;
-    if (names.length > MAX_PARTITION_DELETE_NAMES) {
+    if (names.length > MAX_PLUGIN_BROWSER_PARTITION_CLEAR_NAMES) {
       return { error: 'Too many partition names provided.' };
     }
 
