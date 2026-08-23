@@ -492,6 +492,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const emptyNewTabButtonRef = useRef<HTMLButtonElement>(null);
   const pendingClosedTabFocusRef = useRef<{ closedTabId: string; preferredTabIds: string[] } | null>(null);
   const suggestionRequestRef = useRef(0);
+  const navigationRequestRef = useRef(0);
   const browserMenuPreviewRequestRef = useRef(0);
   const browserMenuPreviewAbortRef = useRef<AbortController | null>(null);
   const browserMenuPageRef = useRef<string | null>(null);
@@ -948,6 +949,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     bookmarkRequestRef.current++;
     sitePermissionRequestRef.current++;
     suggestionRequestRef.current++;
+    navigationRequestRef.current++;
     setState(null);
     stateRef.current = null;
     pendingFaviconsRef.current.clear();
@@ -1591,14 +1593,27 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
 
   const navigate = async (value = urlDraft) => {
     if (!browser || !conversationId) return;
+    const requestedConversationId = conversationId;
+    const requestedTabId = active?.id ?? null;
+    const request = ++navigationRequestRef.current;
     setUrlFocused(false);
     setSuggestions([]);
     setActiveSuggestionIndex(-1);
+    setError(null);
     if (!active) {
       await createTab(value);
       return;
     }
-    await browser.navigate(conversationId, active.id, value).catch((reason) => setError(String(reason)));
+    await browser.navigate(conversationId, active.id, value).catch((reason) => {
+      if (
+        request !== navigationRequestRef.current ||
+        conversationIdRef.current !== requestedConversationId ||
+        activeTabIdRef.current !== requestedTabId
+      ) {
+        return;
+      }
+      setError(String(reason));
+    });
   };
 
   const loadSuggestions = async (query = urlDraft) => {

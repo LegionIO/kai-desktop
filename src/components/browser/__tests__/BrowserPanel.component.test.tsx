@@ -948,6 +948,67 @@ describe('BrowserPanel', () => {
     expect(screen.getByText('0/0')).toBeInTheDocument();
   });
 
+  it('clears an omnibox navigation failure when the user retries', async () => {
+    const retry = deferred<void>();
+    const navigate = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('First navigation failed'))
+      .mockImplementationOnce(() => retry.promise);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        navigate,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.change(omnibox, { target: { value: 'first.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    expect(await screen.findByText(/First navigation failed/)).toBeInTheDocument();
+
+    fireEvent.change(omnibox, { target: { value: 'retry.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    expect(screen.queryByText(/First navigation failed/)).not.toBeInTheDocument();
+
+    await act(async () => retry.resolve());
+  });
+
+  it('ignores a stale omnibox failure after a newer navigation succeeds', async () => {
+    const staleNavigation = deferred<void>();
+    const navigate = vi
+      .fn()
+      .mockImplementationOnce(() => staleNavigation.promise)
+      .mockResolvedValueOnce(undefined);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        navigate,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.change(omnibox, { target: { value: 'slow.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('chat-1', tab.id, 'slow.example'));
+
+    fireEvent.change(omnibox, { target: { value: 'current.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('chat-1', tab.id, 'current.example'));
+
+    await act(async () => staleNavigation.reject(new Error('Stale navigation failed')));
+    expect(screen.queryByText(/Stale navigation failed/)).not.toBeInTheDocument();
+  });
+
   it('detaches a script-evaluated page behind a reload-required interstitial', async () => {
     const mount = vi.fn().mockResolvedValue(undefined);
     const commandTab = vi.fn().mockResolvedValue(undefined);
