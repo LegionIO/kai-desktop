@@ -1,4 +1,15 @@
-import { closeSync, mkdirSync, openSync, opendirSync, readSync, readdirSync, rmSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  opendirSync,
+  readSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { assistantDownloadQuarantineDirectory } from './download-quarantine.js';
@@ -67,17 +78,30 @@ export function isChromiumBrowserScopeCleared(appHome: string, scopeKey: string)
 }
 
 function readBoundedPendingCleanupFile(filePath: string): string {
-  const descriptor = openSync(filePath, 'r');
+  const descriptor = openSync(
+    filePath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+  );
   try {
-    const buffer = Buffer.allocUnsafe(MAX_PENDING_BROWSER_CLEANUP_FILE_BYTES + 1);
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile()) {
+      throw new InvalidPendingBrowserCleanupDataError(
+        'Pending Browser-profile cleanup metadata must be a regular file.',
+      );
+    }
+    if (
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size < 0 ||
+      metadata.size > MAX_PENDING_BROWSER_CLEANUP_FILE_BYTES
+    ) {
+      throw new InvalidPendingBrowserCleanupDataError('Pending Browser-profile cleanup data is too large.');
+    }
+    const buffer = Buffer.allocUnsafe(metadata.size);
     let bytesRead = 0;
     while (bytesRead < buffer.byteLength) {
-      const next = readSync(descriptor, buffer, bytesRead, buffer.byteLength - bytesRead, null);
+      const next = readSync(descriptor, buffer, bytesRead, buffer.byteLength - bytesRead, bytesRead);
       if (next === 0) break;
       bytesRead += next;
-    }
-    if (bytesRead > MAX_PENDING_BROWSER_CLEANUP_FILE_BYTES) {
-      throw new InvalidPendingBrowserCleanupDataError('Pending Browser-profile cleanup data is too large.');
     }
     return buffer.subarray(0, bytesRead).toString('utf8');
   } finally {

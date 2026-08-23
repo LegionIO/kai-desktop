@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -160,6 +161,33 @@ describe('browser profile data detection', () => {
     );
     writeFileSync(markerPath, JSON.stringify({ version: 1, scopeKeys }));
     expect(() => listPendingBrowserCleanupScopeKeys(appHome)).toThrow(/invalid pending/i);
+  });
+
+  it.runIf(process.platform !== 'win32')('refuses symlinked legacy cleanup metadata', () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-profile-'));
+    homes.push(appHome);
+    const browserDirectory = join(appHome, 'browser');
+    const markerPath = join(browserDirectory, 'pending-profile-cleanup.json');
+    const targetPath = join(appHome, 'outside-cleanup.json');
+    mkdirSync(browserDirectory, { recursive: true });
+    writeFileSync(targetPath, JSON.stringify({ version: 1, scopeKeys: ['global'] }));
+    symlinkSync(targetPath, markerPath);
+
+    expect(() => listPendingBrowserCleanupScopeKeys(appHome)).toThrow();
+  });
+
+  it.runIf(process.platform !== 'win32')('rejects cleanup metadata directories and FIFOs without blocking', () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-profile-'));
+    homes.push(appHome);
+    const browserDirectory = join(appHome, 'browser');
+    const markerPath = join(browserDirectory, 'pending-profile-cleanup.json');
+    mkdirSync(markerPath, { recursive: true });
+
+    expect(() => listPendingBrowserCleanupScopeKeys(appHome)).toThrow(/regular file/i);
+
+    rmSync(markerPath, { recursive: true });
+    execFileSync('mkfifo', [markerPath]);
+    expect(() => listPendingBrowserCleanupScopeKeys(appHome)).toThrow(/regular file/i);
   });
 
   it('repairs oversized aggregate cleanup metadata only through explicit full-profile recovery', () => {

@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -5,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
 } from 'node:fs';
@@ -502,6 +504,53 @@ describe('BrowserProfileStore', () => {
       expect(statSync(filePath).size).toBe(maxBytes + 1);
     });
   }
+
+  it.runIf(process.platform !== 'win32')(
+    'refuses symlinked profile metadata in synchronous and asynchronous readers',
+    async () => {
+      const appHome = home();
+      const directory = join(appHome, 'browser', 'profiles');
+      const profilePath = join(directory, 'global.json');
+      const targetPath = join(appHome, 'outside-profile.json');
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        targetPath,
+        JSON.stringify({
+          version: 1,
+          history: [],
+          bookmarks: [],
+          downloads: [],
+          permissions: {},
+          zoomLevel: 0,
+        }),
+      );
+      symlinkSync(targetPath, profilePath);
+
+      const store = new BrowserProfileStore(appHome, 'global');
+      expect(store.isBackgroundNetworkRestricted()).toBe(true);
+      expect(() => store.setZoomLevel(1)).toThrow(/unreadable or corrupted/);
+      expect(() => readStoredBrowserProfileCounts(appHome, 'global')).toThrow();
+      await expect(readStoredBrowserProfileCountsAsync(appHome, 'global')).rejects.toThrow();
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'rejects profile metadata directories and FIFOs without blocking',
+    async () => {
+      const appHome = home();
+      const directory = join(appHome, 'browser', 'profiles');
+      const profilePath = join(directory, 'global.json');
+      mkdirSync(profilePath, { recursive: true });
+
+      expect(() => readStoredBrowserProfileCounts(appHome, 'global')).toThrow(/regular file/i);
+      await expect(readStoredBrowserProfileCountsAsync(appHome, 'global')).rejects.toThrow(/regular file/i);
+
+      rmSync(profilePath, { recursive: true });
+      execFileSync('mkfifo', [profilePath]);
+      expect(() => readStoredBrowserProfileCounts(appHome, 'global')).toThrow(/regular file/i);
+      await expect(readStoredBrowserProfileCountsAsync(appHome, 'global')).rejects.toThrow(/regular file/i);
+    },
+  );
 
   it('rejects oversized permission sets before publishing or persisting them', () => {
     const store = new BrowserProfileStore(home(), 'global');

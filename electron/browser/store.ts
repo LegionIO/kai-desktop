@@ -1,6 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { readFile, rm, stat } from 'node:fs/promises';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  readdirSync,
+} from 'node:fs';
+import { open, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   BrowserBookmark,
@@ -314,23 +323,51 @@ function isUnsafeOrigins(value: unknown): value is string[] {
 }
 
 function readBoundedJson(filePath: string, maxBytes: number): unknown {
-  const fileSize = statSync(filePath).size;
-  if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > maxBytes) {
-    throw new Error('Browser profile file exceeds its size limit.');
+  const descriptor = openSync(
+    filePath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+  );
+  try {
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile()) throw new Error('Browser profile metadata must be a regular file.');
+    if (!Number.isSafeInteger(metadata.size) || metadata.size < 0 || metadata.size > maxBytes) {
+      throw new Error('Browser profile file exceeds its size limit.');
+    }
+    const contents = Buffer.allocUnsafe(metadata.size);
+    let offset = 0;
+    while (offset < contents.byteLength) {
+      const bytesRead = readSync(descriptor, contents, offset, contents.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return JSON.parse(contents.subarray(0, offset).toString('utf8')) as unknown;
+  } finally {
+    closeSync(descriptor);
   }
-  const contents = readFileSync(filePath);
-  if (contents.byteLength > maxBytes) throw new Error('Browser profile file exceeds its size limit.');
-  return JSON.parse(contents.toString('utf8')) as unknown;
 }
 
 async function readBoundedJsonAsync(filePath: string, maxBytes: number): Promise<unknown> {
-  const fileSize = (await stat(filePath)).size;
-  if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > maxBytes) {
-    throw new Error('Browser profile file exceeds its size limit.');
+  const handle = await open(
+    filePath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+  );
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error('Browser profile metadata must be a regular file.');
+    if (!Number.isSafeInteger(metadata.size) || metadata.size < 0 || metadata.size > maxBytes) {
+      throw new Error('Browser profile file exceeds its size limit.');
+    }
+    const contents = Buffer.allocUnsafe(metadata.size);
+    let offset = 0;
+    while (offset < contents.byteLength) {
+      const { bytesRead } = await handle.read(contents, offset, contents.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return JSON.parse(contents.subarray(0, offset).toString('utf8')) as unknown;
+  } finally {
+    await handle.close();
   }
-  const contents = await readFile(filePath);
-  if (contents.byteLength > maxBytes) throw new Error('Browser profile file exceeds its size limit.');
-  return JSON.parse(contents.toString('utf8')) as unknown;
 }
 
 function assertSerializedBytes(serialized: string, maxBytes: number, area: string): void {
