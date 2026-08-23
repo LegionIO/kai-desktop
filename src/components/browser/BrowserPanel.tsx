@@ -1010,10 +1010,22 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         bookmarkRequestRef.current++;
         sitePermissionRequestRef.current++;
         suggestionRequestRef.current++;
+        navigationRequestRef.current++;
+        activeFindRequestRef.current = null;
+        findTabIdRef.current = null;
+        findTextRef.current = '';
+        findRequestRef.current++;
         setAppliedDataScope(event.dataScope);
         setBookmarks([]);
         setSuggestions([]);
         setActiveSuggestionIndex(-1);
+        setUrlDraft('');
+        setUrlFocused(false);
+        urlRef.current?.blur();
+        setFindOpen(false);
+        setFindText('');
+        setFindResult(null);
+        setError(null);
         setLatestDownload(null);
         setSitePermissions([]);
         setCredentialPrompts([]);
@@ -1490,12 +1502,15 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const createTab = useCallback(
     async (url?: string) => {
       if (!browser || !conversationId) return;
+      const requestedConversationId = conversationId;
+      const request = ++navigationRequestRef.current;
       setManagerView(null);
       setError(null);
       try {
         await browser.createTab({ conversationId, url, owner: 'user' });
         if (!url || url === 'about:blank') focusOmnibox();
       } catch (reason) {
+        if (request !== navigationRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
         setError(String(reason));
       }
     },
@@ -1505,6 +1520,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const command = useCallback(
     async (tab: BrowserTab, action: Parameters<NonNullable<typeof browser>['commandTab']>[2]) => {
       if (!browser || !conversationId) return;
+      navigationRequestRef.current++;
       setError(null);
       await browser.commandTab(conversationId, tab.id, action).catch((reason) => setError(String(reason)));
     },

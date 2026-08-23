@@ -1009,6 +1009,37 @@ describe('BrowserPanel', () => {
     expect(screen.queryByText(/Stale navigation failed/)).not.toBeInTheDocument();
   });
 
+  it('ignores a stale empty-state tab creation failure after a newer one succeeds', async () => {
+    const staleCreation = deferred<BrowserTab>();
+    const createTab = vi
+      .fn()
+      .mockImplementationOnce(() => staleCreation.promise)
+      .mockResolvedValueOnce(tab);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [], activeTabId: null }),
+        mount: async () => undefined,
+        createTab,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.change(omnibox, { target: { value: 'slow.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    await waitFor(() => expect(createTab).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(omnibox, { target: { value: 'current.example' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    await waitFor(() => expect(createTab).toHaveBeenCalledTimes(2));
+
+    await act(async () => staleCreation.reject(new Error('Stale tab creation failed')));
+    expect(screen.queryByText(/Stale tab creation failed/)).not.toBeInTheDocument();
+  });
+
   it('detaches a script-evaluated page behind a reload-required interstitial', async () => {
     const mount = vi.fn().mockResolvedValue(undefined);
     const commandTab = vi.fn().mockResolvedValue(undefined);
@@ -2297,6 +2328,55 @@ describe('BrowserPanel', () => {
 
     expect(screen.queryByText('Old global profile tab')).not.toBeInTheDocument();
     expect(screen.getByText('Conversation profile tab')).toBeInTheDocument();
+  });
+
+  it('clears focused omnibox and find state when the browser profile changes', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    let profileChanged = false;
+    const pendingNavigation = deferred<void>();
+    const profileTab = { ...tab, title: 'New Tab', url: 'about:blank', canGoBack: false };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [profileChanged ? profileTab : tab],
+          activeTabId: tab.id,
+        }),
+        mount: async () => undefined,
+        navigate: vi.fn(() => pendingNavigation.promise),
+        find: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText<HTMLInputElement>('Address and search bar');
+
+    fireEvent.change(omnibox, { target: { value: 'https://old-profile.example/private' } });
+    fireEvent.keyDown(omnibox, { key: 'Enter' });
+    fireEvent.focus(omnibox);
+    fireEvent.change(omnibox, { target: { value: 'old-profile draft' } });
+    fireEvent.keyDown(omnibox, { key: 'f', ctrlKey: true });
+    const findInput = await screen.findByPlaceholderText('Find in page');
+    fireEvent.change(findInput, { target: { value: 'old-profile search' } });
+
+    profileChanged = true;
+    act(() => {
+      emit?.({ type: 'tabs-changed', conversationId: 'chat-1', tabs: [profileTab] });
+      emit?.({ type: 'profile-scope-changed', dataScope: 'conversation' });
+    });
+
+    await waitFor(() => expect(omnibox).toHaveValue(''));
+    expect(omnibox).not.toHaveFocus();
+    expect(screen.queryByPlaceholderText('Find in page')).not.toBeInTheDocument();
+
+    await act(async () => pendingNavigation.reject(new Error('Old profile navigation failed')));
+    expect(screen.queryByText(/Old profile navigation failed/)).not.toBeInTheDocument();
   });
 
   it('hydrates retained prompts and actions when a tab event supersedes the snapshot tabs', async () => {
