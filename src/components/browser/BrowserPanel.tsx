@@ -467,6 +467,8 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     permissionPrompts: 0,
     authPrompts: 0,
   });
+  const actionEventRevisionRef = useRef(0);
+  const actionSnapshotDeltasRef = useRef(new Map<string, { revision: number; action: BrowserActionEvent }>());
   const stateRef = useRef<BrowserManagerState | null>(null);
   const pendingFaviconsRef = useRef(new Map<string, string | null>());
   const bookmarkRequestRef = useRef(0);
@@ -707,6 +709,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     const request = ++stateRequestRef.current;
     const tabRevision = tabSnapshotRevisionRef.current;
     const auxiliaryRevision = { ...auxiliarySnapshotRevisionRef.current };
+    const actionRevision = actionEventRevisionRef.current;
     try {
       const next = await browser.getState(conversationId);
       if (request !== stateRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
@@ -742,8 +745,23 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       if (auxiliaryRevision.authPrompts === auxiliarySnapshotRevisionRef.current.authPrompts) {
         setAuthPrompts(reconciled.authPrompts ?? []);
       }
-      if (auxiliaryRevision.actions === auxiliarySnapshotRevisionRef.current.actions) {
-        setRunningActions(new Map((reconciled.runningActions ?? []).map((action) => [action.id, action])));
+      // A snapshot and live action events are two halves of one state stream.
+      // Replaying per-id deltas over the snapshot preserves unrelated running
+      // actions when (for example) action B completes while the snapshot still
+      // contains both A and B. Dropping the whole snapshot on any event would
+      // also drop A from an initially empty panel until its completion event.
+      const reconciledActions = new Map((reconciled.runningActions ?? []).map((action) => [action.id, action]));
+      const appliedActionRevision = actionEventRevisionRef.current;
+      for (const [actionId, delta] of actionSnapshotDeltasRef.current) {
+        if (delta.revision <= actionRevision) continue;
+        if (delta.action.status === 'running') reconciledActions.set(actionId, delta.action);
+        else reconciledActions.delete(actionId);
+      }
+      setRunningActions(reconciledActions);
+      for (const [actionId, delta] of actionSnapshotDeltasRef.current) {
+        if (delta.revision <= appliedActionRevision && actionSnapshotDeltasRef.current.get(actionId) === delta) {
+          actionSnapshotDeltasRef.current.delete(actionId);
+        }
       }
     } catch (reason) {
       if (request !== stateRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
@@ -843,6 +861,8 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     >) {
       auxiliarySnapshotRevisionRef.current[domain]++;
     }
+    actionEventRevisionRef.current++;
+    actionSnapshotDeltasRef.current.clear();
     bookmarkRequestRef.current++;
     sitePermissionRequestRef.current++;
     suggestionRequestRef.current++;
@@ -895,6 +915,8 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         >) {
           auxiliarySnapshotRevisionRef.current[domain]++;
         }
+        actionEventRevisionRef.current++;
+        actionSnapshotDeltasRef.current.clear();
         bookmarkRequestRef.current++;
         sitePermissionRequestRef.current++;
         suggestionRequestRef.current++;
@@ -986,6 +1008,8 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         }
       } else if (event.type === 'action') {
         auxiliarySnapshotRevisionRef.current.actions++;
+        const actionRevision = ++actionEventRevisionRef.current;
+        actionSnapshotDeltasRef.current.set(event.action.id, { revision: actionRevision, action: event.action });
         setRunningActions((current) => {
           const next = new Map(current);
           if (event.action.status === 'running') next.set(event.action.id, event.action);

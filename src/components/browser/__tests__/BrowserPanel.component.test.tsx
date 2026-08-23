@@ -2344,6 +2344,62 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Kai · scrolling');
   });
 
+  it('keeps unrelated snapshotted actions visible when another action completes during hydration', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const snapshot = deferred<{
+      conversationId: string;
+      tabs: BrowserTab[];
+      activeTabId: string | null;
+      runningActions: BrowserActionEvent[];
+    }>();
+    const retainedAction: BrowserActionEvent = {
+      id: 'retained-action',
+      tabId: tab.id,
+      kind: 'scroll',
+      status: 'running',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      summary: 'still scrolling',
+    };
+    const completedAction: BrowserActionEvent = {
+      id: 'completed-action',
+      tabId: tab.id,
+      kind: 'click',
+      status: 'completed',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      completedAt: '2026-01-01T00:00:01.000Z',
+      summary: 'clicked',
+    };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => snapshot.promise,
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await waitFor(() => expect(emit).toBeDefined());
+
+    act(() => emit?.({ type: 'action', conversationId: 'chat-1', action: completedAction }));
+    snapshot.resolve({
+      conversationId: 'chat-1',
+      tabs: [tab],
+      activeTabId: tab.id,
+      runningActions: [retainedAction, { ...completedAction, status: 'running', completedAt: undefined }],
+    });
+    await act(async () => {
+      await snapshot.promise;
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent('Kai · still scrolling');
+    expect(screen.getByRole('status')).not.toHaveTextContent('clicked');
+  });
+
   it('hydrates unrelated retained prompt domains when live prompt and action events race the snapshot', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const snapshot = deferred<{
