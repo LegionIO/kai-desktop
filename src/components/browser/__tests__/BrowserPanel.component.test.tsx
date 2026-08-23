@@ -2091,6 +2091,90 @@ describe('BrowserPanel', () => {
     expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id);
   });
 
+  it('does not surface a stale component-picker failure after the active tab changes', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const pendingPicker = deferred<{ selector: string; documentToken: string }>();
+    const pickElement = vi.fn(() => pendingPicker.promise);
+    const screenshot = vi.fn();
+    const secondTab = {
+      ...tab,
+      id: '00000000-0000-0000-0000-000000000002',
+      title: 'Second',
+      active: false,
+    };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab, secondTab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        pickElement,
+        screenshot,
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Screenshot component'));
+    await waitFor(() => expect(pickElement).toHaveBeenCalledOnce());
+    act(() => {
+      emit?.({
+        type: 'tabs-changed',
+        conversationId: 'chat-1',
+        tabs: [
+          { ...tab, active: false },
+          { ...secondTab, active: true },
+        ],
+      });
+    });
+    await act(async () => pendingPicker.reject(new Error('Stale picker failed')));
+
+    expect(screen.queryByText('Stale picker failed')).not.toBeInTheDocument();
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('does not let an older screenshot failure replace a newer capture result', async () => {
+    const firstCapture = deferred<never>();
+    const screenshot = vi
+      .fn()
+      .mockImplementationOnce(() => firstCapture.promise)
+      .mockResolvedValueOnce({
+        tabId: tab.id,
+        mode: 'viewport' as const,
+        mimeType: 'image/png' as const,
+        width: 10,
+        height: 10,
+      });
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        screenshot,
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Screenshot viewport'));
+    await waitFor(() => expect(screenshot).toHaveBeenCalledTimes(1));
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Screenshot viewport'));
+    await waitFor(() => expect(screenshot).toHaveBeenCalledTimes(2));
+    await act(async () => firstCapture.reject(new Error('Older capture failed')));
+
+    expect(screen.queryByText('Older capture failed')).not.toBeInTheDocument();
+  });
+
   it.each([
     ['Screenshot viewport', 'viewport'],
     ['Screenshot component', 'element'],

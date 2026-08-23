@@ -499,6 +499,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   } | null>(null);
   const suggestionRequestRef = useRef(0);
   const navigationRequestRef = useRef(0);
+  const screenshotRequestRef = useRef(0);
   const browserMenuPreviewRequestRef = useRef(0);
   const browserMenuPreviewAbortRef = useRef<AbortController | null>(null);
   const browserMenuPageRef = useRef<string | null>(null);
@@ -534,6 +535,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     lastNativeMountRef.current = undefined;
   });
   const activeTabIdRef = useRef<string | null>(null);
+  const activeTabSelectionGenerationRef = useRef(0);
   const findTextRef = useRef('');
   const findTabIdRef = useRef<string | null>(null);
   const findRequestRef = useRef(0);
@@ -547,6 +549,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   managerViewRef.current = managerView;
   const reportError = useCallback((reason: unknown) => {
     setError(reason instanceof Error ? reason.message : String(reason));
+  }, []);
+  const recordActiveTabSelection = useCallback((tabId: string | null) => {
+    if (activeTabIdRef.current !== tabId) activeTabSelectionGenerationRef.current++;
+    activeTabIdRef.current = tabId;
   }, []);
   const reportFindError = useCallback(
     (reason: unknown, requestedConversationId: string, tabId: string, requestId: number) => {
@@ -804,7 +810,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       // portion only if no newer tab/favicon event arrived while getState was
       // pending; the auxiliary portion is reconciled independently below.
       if (tabRevision === tabSnapshotRevisionRef.current) {
-        activeTabIdRef.current = reconciled.activeTabId;
+        recordActiveTabSelection(reconciled.activeTabId);
         stateRef.current = reconciled;
         setState(reconciled);
       }
@@ -867,7 +873,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         );
       }
     }
-  }, [browser, conversationId]);
+  }, [browser, conversationId, recordActiveTabSelection]);
 
   const refreshBookmarks = useCallback(async () => {
     if (!browser || !conversationId) return;
@@ -973,11 +979,12 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     sitePermissionRequestRef.current++;
     suggestionRequestRef.current++;
     navigationRequestRef.current++;
+    screenshotRequestRef.current++;
     setState(null);
     stateRef.current = null;
     pendingFaviconsRef.current.clear();
     zoomTargetsRef.current.clear();
-    activeTabIdRef.current = null;
+    recordActiveTabSelection(null);
     setManagerView(null);
     setManagerRevision(0);
     setDownloadRevision(0);
@@ -1034,6 +1041,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         sitePermissionRequestRef.current++;
         suggestionRequestRef.current++;
         navigationRequestRef.current++;
+        screenshotRequestRef.current++;
         activeFindRequestRef.current = null;
         findTabIdRef.current = null;
         findTextRef.current = '';
@@ -1066,7 +1074,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       if (event.type === 'tabs-changed') {
         tabSnapshotRevisionRef.current++;
         const activeTabId = event.tabs.find((tab) => tab.active)?.id ?? null;
-        activeTabIdRef.current = activeTabId;
+        recordActiveTabSelection(activeTabId);
         const current = stateRef.current;
         const next = {
           conversationId,
@@ -1251,9 +1259,20 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       );
       bookmarkRequestRef.current++;
       suggestionRequestRef.current++;
+      screenshotRequestRef.current++;
       unsubscribe();
     };
-  }, [browser, conversationId, focusOmnibox, openFind, refreshBookmarks, refreshState, reportError, reportFindError]);
+  }, [
+    browser,
+    conversationId,
+    focusOmnibox,
+    openFind,
+    recordActiveTabSelection,
+    refreshBookmarks,
+    refreshState,
+    reportError,
+    reportFindError,
+  ]);
 
   useEffect(() => {
     if (active && !urlFocused) setUrlDraft(active.url === 'about:blank' ? '' : active.url);
@@ -1812,6 +1831,15 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
 
   const screenshot = async (mode: 'viewport' | 'full-page' | 'element') => {
     if (!browser || !conversationId || !active) return;
+    const requestedConversationId = conversationId;
+    const requestedTabId = active.id;
+    const request = ++screenshotRequestRef.current;
+    const tabSelectionGeneration = activeTabSelectionGenerationRef.current;
+    const isCurrent = () =>
+      request === screenshotRequestRef.current &&
+      conversationIdRef.current === requestedConversationId &&
+      activeTabIdRef.current === requestedTabId &&
+      activeTabSelectionGenerationRef.current === tabSelectionGeneration;
     dismissBrowserMenu();
     setError(null);
     try {
@@ -1820,22 +1848,27 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       // before capture or element picking so these commands never race the
       // protected menu-preview surface.
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (!isCurrent()) return;
       await refreshNativeMountRef.current();
+      if (!isCurrent()) return;
       let selector: string | undefined;
       let documentToken: string | undefined;
       if (mode === 'element') {
-        const picked = await browser.pickElement(conversationId, active.id);
+        const picked = await browser.pickElement(requestedConversationId, requestedTabId);
+        if (!isCurrent()) return;
         selector = picked.selector;
         documentToken = picked.documentToken;
       }
-      await browser.screenshot(conversationId, {
-        tabId: active.id,
+      if (!isCurrent()) return;
+      await browser.screenshot(requestedConversationId, {
+        tabId: requestedTabId,
         mode,
         selector,
         documentToken,
         exportToFile: true,
       });
     } catch (reason) {
+      if (!isCurrent()) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };

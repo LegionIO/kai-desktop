@@ -742,6 +742,10 @@ type InternalTab = {
    * immutable disableDialogs preference. This closes the interval before CDP's
    * Page domain can subscribe to dialog events without consulting Browser UI. */
   assistantDialogsDisabledRunId: string | null;
+  /** Exact popup renderer created with Electron's inherited opener options.
+   * Recreate it without those options before any later assistant read/control
+   * so an about:blank or same-origin child cannot reach the opener DOM. */
+  openerLinkedContentsId?: number;
   /** Dialog suppression is capability-scoped rather than a permanent
    * WebPreferences flag so an ordinary user-owned tab retains Chromium's native
    * alert/confirm/prompt behavior as soon as assistant control ends. */
@@ -3525,7 +3529,26 @@ export class BrowserManager {
   private prepareAssistantDialogSafeRenderer(tab: InternalTab, runId: string): boolean {
     if (tab.assistantDialogsDisabledRunId === runId) return false;
     const view = tab.view;
-    if (view && !view.webContents.isDestroyed()) return false;
+    if (view && !view.webContents.isDestroyed()) {
+      if (tab.openerLinkedContentsId !== view.webContents.id) return false;
+      // Electron must receive the inherited createWindow options for the popup
+      // to work for the user, but that renderer also retains window.opener.
+      // A child page can therefore expose a sensitive opener DOM through an
+      // otherwise non-sensitive tab. Recreate only the shell/profile/URL under
+      // an ordinary standalone WebContents before assistant authorization.
+      tab.assistantDialogsDisabledRunId = runId;
+      tab.openerLinkedContentsId = undefined;
+      tab.generation++;
+      this.destroyView(tab);
+      tab.shell.discarded = true;
+      tab.shell.loading = false;
+      tab.shell.sensitive = false;
+      this.emitTabs(tab.shell.conversationId);
+      return true;
+    }
+    // A destroyed or discarded popup no longer has a live opener capability;
+    // its eventual standalone restoration is safe to retain.
+    tab.openerLinkedContentsId = undefined;
     tab.assistantDialogsDisabledRunId = runId;
     return false;
   }
@@ -9190,6 +9213,10 @@ export class BrowserManager {
           options.webPreferences = { ...(options.webPreferences ?? {}), disableDialogs: true };
         }
         const view = this.createView(tab, options);
+        // The exact Electron createWindow options deliberately preserve
+        // window.opener for ordinary popup/OAuth behavior. Remember that
+        // capability until this renderer is reclaimed before AI control.
+        tab.openerLinkedContentsId = view.webContents.id;
         if (assistantOwnerId) {
           const dialogGuard = this.ensureAssistantRunDialogGuard(tab, assistantOwnerId);
           tab.assistantDownloadAttribution = {

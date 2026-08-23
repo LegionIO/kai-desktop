@@ -1847,7 +1847,7 @@ describe('browser manager renderer lifecycle', () => {
     const tabs = new Map<string, unknown>([['opener', opener]]);
     const tabOrder = new Map([['chat-1', ['opener']]]);
     const setBackgroundThrottling = vi.fn();
-    const contents = { debugger: browserDebuggerMock(), isDestroyed: () => false, setBackgroundThrottling };
+    const contents = { id: 42, debugger: browserDebuggerMock(), isDestroyed: () => false, setBackgroundThrottling };
     let popupOptions: Record<string, unknown> | undefined;
     let manager!: InstanceType<typeof BrowserManager>;
     manager = managerWithoutConstructor({
@@ -1880,6 +1880,7 @@ describe('browser manager renderer lifecycle', () => {
     ) as (options: Record<string, unknown>) => unknown;
     const popup = tabs.get(tabOrder.get('chat-1')![1]) as {
       aiActionDepth: number;
+      openerLinkedContentsId?: number;
       assistantPopupBootstrapPending?: boolean;
       assistantDialogGuard?: unknown;
       assistantRunDialogGuardLease?: symbol;
@@ -1887,6 +1888,7 @@ describe('browser manager renderer lifecycle', () => {
     createWindow({ webPreferences: { disableDialogs: false } });
 
     expect(popup.aiActionDepth).toBe(1);
+    expect(popup.openerLinkedContentsId).toBe(contents.id);
     expect(popup.assistantPopupBootstrapPending).toBe(true);
     expect(Reflect.get(popup, 'assistantPopupDialogsDisabled')).toBe(true);
     expect(popupOptions).toMatchObject({ webPreferences: { disableDialogs: true } });
@@ -7784,6 +7786,39 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.shell).toMatchObject({ discarded: false, loading: true, sensitive: true });
     expect(destroyView).not.toHaveBeenCalled();
     expect(emitTabs).not.toHaveBeenCalled();
+  });
+
+  it('reclaims an opener-linked popup renderer before assistant authorization', () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      openerLinkedContentsId: contents.id as number | undefined,
+      generation: 4,
+      shell: {
+        id: 'popup-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        loading: true,
+        sensitive: true,
+      },
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+    });
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({ destroyView, emitTabs });
+    Reflect.deleteProperty(manager, 'prepareAssistantDialogSafeRenderer');
+
+    expect(invokePrivate(manager, 'prepareAssistantDialogSafeRenderer', tab, 'run-1')).toBe(true);
+
+    expect(tab.assistantDialogsDisabledRunId).toBe('run-1');
+    expect(tab.openerLinkedContentsId).toBeUndefined();
+    expect(tab.generation).toBe(5);
+    expect(tab.view).toBeNull();
+    expect(tab.shell).toMatchObject({ discarded: true, loading: false, sensitive: false });
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
 
   it('consumes ask-policy approval after the exact discarded-tab restoration advances generation', () => {

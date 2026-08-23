@@ -279,6 +279,32 @@ describe('isConversationWorkspaceRestorationCurrent', () => {
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelectionSequence: 5 })).toBe(false);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelection: 'conv-user-choice' })).toBe(false);
   });
+
+  it('binds Browser-origin restoration to its navigation and attention request', () => {
+    const browserOwned = {
+      ...current,
+      browserNavigationGeneration: 8,
+      currentNavigationGeneration: 8,
+      browserAttentionGeneration: 5,
+      currentBrowserAttentionGeneration: 5,
+    };
+
+    expect(isConversationWorkspaceRestorationCurrent(browserOwned)).toBe(true);
+    expect(isConversationWorkspaceRestorationCurrent({ ...browserOwned, currentNavigationGeneration: 9 })).toBe(false);
+    expect(isConversationWorkspaceRestorationCurrent({ ...browserOwned, currentBrowserAttentionGeneration: 6 })).toBe(
+      false,
+    );
+  });
+
+  it('does not bind ordinary workspace restoration to unrelated view navigation', () => {
+    expect(
+      isConversationWorkspaceRestorationCurrent({
+        ...current,
+        currentNavigationGeneration: 99,
+        currentBrowserAttentionGeneration: 99,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe('resolveConversationWorkspaceTransition', () => {

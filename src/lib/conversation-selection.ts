@@ -205,6 +205,13 @@ export function resolveConversationWorkspaceTransition(options: {
 export function isConversationWorkspaceRestorationCurrent(options: {
   workspaceId: string;
   currentWorkspaceId: string | null | undefined;
+  /** Browser-origin workspace changes also belong to the exact navigation and
+   * attention request that caused them. Ordinary workspace selections omit
+   * these fields so harmless view navigation does not cancel restoration. */
+  browserNavigationGeneration?: number;
+  currentNavigationGeneration?: number;
+  browserAttentionGeneration?: number;
+  currentBrowserAttentionGeneration?: number;
   selectionIntentGeneration: number;
   currentSelectionIntentGeneration: number;
   selectionSequence: number;
@@ -214,6 +221,10 @@ export function isConversationWorkspaceRestorationCurrent(options: {
 }): boolean {
   return (
     options.currentWorkspaceId === options.workspaceId &&
+    (options.browserNavigationGeneration === undefined ||
+      options.currentNavigationGeneration === options.browserNavigationGeneration) &&
+    (options.browserAttentionGeneration === undefined ||
+      options.currentBrowserAttentionGeneration === options.browserAttentionGeneration) &&
     options.currentSelectionIntentGeneration === options.selectionIntentGeneration &&
     options.currentSelectionSequence === options.selectionSequence &&
     options.currentSelection === options.selectionWhenStarted

@@ -978,6 +978,16 @@ function AppShell() {
     // the prior workspace; do not let this transient stale config event launch
     // an arriving-workspace conversation restoration in the meantime.
     if (transition?.staleBrowserTransition) return;
+    const browserRestorationAuthority =
+      browserTransition &&
+      browserTransition.departingWorkspaceId === prevWorkspaceIdRef.current &&
+      browserTransition.destinationWorkspaceId === activeWorkspaceId &&
+      browserTransition.workspaceSelectionGeneration === workspaceSelectionIntentGenerationRef.current
+        ? {
+            navigationGeneration: browserTransition.navigationGeneration,
+            attentionGeneration: browserTransition.browserAttentionGeneration,
+          }
+        : null;
     if (transition) prevWorkspaceIdRef.current = transition.nextPreviousWorkspaceId;
 
     // Save the current conversation to the departing workspace
@@ -1004,6 +1014,10 @@ function AppShell() {
           isConversationWorkspaceRestorationCurrent({
             workspaceId: restoringWorkspaceId,
             currentWorkspaceId: prevWorkspaceIdRef.current,
+            browserNavigationGeneration: browserRestorationAuthority?.navigationGeneration,
+            currentNavigationGeneration: navigationIntentGenerationRef.current,
+            browserAttentionGeneration: browserRestorationAuthority?.attentionGeneration,
+            currentBrowserAttentionGeneration: browserAttentionIntentGenerationRef.current,
             selectionIntentGeneration,
             currentSelectionIntentGeneration: conversationSelectionIntentGenerationRef.current,
             selectionSequence,
