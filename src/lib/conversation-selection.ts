@@ -285,6 +285,24 @@ export function advanceConfirmedConversationSelection(
   return candidate;
 }
 
+/** Clear a recovery checkpoint only when a strict read proves that the exact
+ * checkpoint being hydrated no longer exists. A late missing result must not
+ * erase a newer successful selection, while an unavailable read leaves the
+ * last confirmed selection intact for a later retry. */
+export function invalidateMissingConfirmedConversationSelection(
+  current: ConfirmedConversationSelection,
+  missing: ConfirmedConversationSelection,
+): ConfirmedConversationSelection | null {
+  if (
+    current.activeConversationId !== missing.activeConversationId ||
+    current.activeConversationRevision !== missing.activeConversationRevision ||
+    current.intentGeneration !== missing.intentGeneration
+  ) {
+    return null;
+  }
+  return { ...current, activeConversationId: null };
+}
+
 /** Reconcile a failed latest selection against authoritative backend state.
  * The global backend active id can be changed by another window/CLI, so it is
  * safe to adopt only when that id belongs to another still-pending local

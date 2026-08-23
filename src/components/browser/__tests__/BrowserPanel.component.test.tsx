@@ -15,7 +15,12 @@ import type {
 } from '../../../../shared/browser';
 import { SidePanelHost, SidePanelProvider, useSidePanel } from '@/components/side-panel';
 import { TooltipProvider } from '@/components/ui/Tooltip';
-import { BrowserPanel, BrowserPanelAutoOpen } from '../BrowserPanel';
+import {
+  BrowserPanel,
+  BrowserPanelAutoOpen,
+  clearBrowserSnapshotDeltas,
+  retainBrowserSnapshotDelta,
+} from '../BrowserPanel';
 import { ConfigProvider } from '@/providers/ConfigProvider';
 
 const tab: BrowserTab = {
@@ -59,6 +64,27 @@ afterEach(() => uninstallAppBridgeStub());
 beforeEach(() => vi.clearAllMocks());
 
 describe('BrowserPanel', () => {
+  it('retains live snapshot deltas only for the lifetime of an active hydration', () => {
+    const actions = new Map<string, BrowserActionEvent>();
+    const action: BrowserActionEvent = {
+      id: 'action-1',
+      tabId: tab.id,
+      kind: 'scroll',
+      status: 'running',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      summary: 'scrolling',
+    };
+
+    retainBrowserSnapshotDelta(null, actions, action.id, action);
+    expect(actions.size).toBe(0);
+
+    retainBrowserSnapshotDelta(7, actions, action.id, action);
+    expect(actions.get(action.id)).toBe(action);
+
+    clearBrowserSnapshotDeltas(actions);
+    expect(actions.size).toBe(0);
+  });
+
   it('hydrates retained Browser prompts after a renderer reload without opening the hidden panel', async () => {
     installAppBridgeStub({
       browser: {

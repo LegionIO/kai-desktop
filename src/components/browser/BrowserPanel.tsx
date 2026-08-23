@@ -98,6 +98,19 @@ type BrowserPromptSnapshotDelta<T extends { id: string }> = {
   prompt: T | null;
 };
 
+export function retainBrowserSnapshotDelta<T>(
+  snapshotRequest: number | null,
+  deltas: Map<string, T>,
+  id: string,
+  delta: T,
+): void {
+  if (snapshotRequest !== null) deltas.set(id, delta);
+}
+
+export function clearBrowserSnapshotDeltas(...deltas: Array<{ clear(): void }>): void {
+  for (const delta of deltas) delta.clear();
+}
+
 function reconcileBrowserPromptSnapshot<T extends { id: string }>(
   snapshot: T[] | undefined,
   snapshotRevision: number,
@@ -483,6 +496,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const browserMenuPreviewAbortRef = useRef<AbortController | null>(null);
   const browserMenuPageRef = useRef<string | null>(null);
   const stateRequestRef = useRef(0);
+  const stateSnapshotInFlightRef = useRef<number | null>(null);
   const tabSnapshotRevisionRef = useRef(0);
   const auxiliarySnapshotRevisionRef = useRef({
     actions: 0,
@@ -737,6 +751,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     if (!browser || !conversationId) return;
     const requestedConversationId = conversationId;
     const request = ++stateRequestRef.current;
+    stateSnapshotInFlightRef.current = request;
+    clearBrowserSnapshotDeltas(
+      actionSnapshotDeltasRef.current,
+      credentialPromptSnapshotDeltasRef.current,
+      permissionPromptSnapshotDeltasRef.current,
+      authPromptSnapshotDeltasRef.current,
+    );
     const tabRevision = tabSnapshotRevisionRef.current;
     const auxiliaryRevision = { ...auxiliarySnapshotRevisionRef.current };
     const actionRevision = actionEventRevisionRef.current;
@@ -811,6 +832,16 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     } catch (reason) {
       if (request !== stateRequestRef.current || conversationIdRef.current !== requestedConversationId) return;
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (stateSnapshotInFlightRef.current === request) {
+        stateSnapshotInFlightRef.current = null;
+        clearBrowserSnapshotDeltas(
+          actionSnapshotDeltasRef.current,
+          credentialPromptSnapshotDeltasRef.current,
+          permissionPromptSnapshotDeltasRef.current,
+          authPromptSnapshotDeltasRef.current,
+        );
+      }
     }
   }, [browser, conversationId]);
 
@@ -907,10 +938,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       auxiliarySnapshotRevisionRef.current[domain]++;
     }
     actionEventRevisionRef.current++;
-    actionSnapshotDeltasRef.current.clear();
-    credentialPromptSnapshotDeltasRef.current.clear();
-    permissionPromptSnapshotDeltasRef.current.clear();
-    authPromptSnapshotDeltasRef.current.clear();
+    stateSnapshotInFlightRef.current = null;
+    clearBrowserSnapshotDeltas(
+      actionSnapshotDeltasRef.current,
+      credentialPromptSnapshotDeltasRef.current,
+      permissionPromptSnapshotDeltasRef.current,
+      authPromptSnapshotDeltasRef.current,
+    );
     bookmarkRequestRef.current++;
     sitePermissionRequestRef.current++;
     suggestionRequestRef.current++;
@@ -964,10 +998,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
           auxiliarySnapshotRevisionRef.current[domain]++;
         }
         actionEventRevisionRef.current++;
-        actionSnapshotDeltasRef.current.clear();
-        credentialPromptSnapshotDeltasRef.current.clear();
-        permissionPromptSnapshotDeltasRef.current.clear();
-        authPromptSnapshotDeltasRef.current.clear();
+        stateSnapshotInFlightRef.current = null;
+        clearBrowserSnapshotDeltas(
+          actionSnapshotDeltasRef.current,
+          credentialPromptSnapshotDeltasRef.current,
+          permissionPromptSnapshotDeltasRef.current,
+          authPromptSnapshotDeltasRef.current,
+        );
         bookmarkRequestRef.current++;
         sitePermissionRequestRef.current++;
         suggestionRequestRef.current++;
@@ -1060,7 +1097,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       } else if (event.type === 'action') {
         auxiliarySnapshotRevisionRef.current.actions++;
         const actionRevision = ++actionEventRevisionRef.current;
-        actionSnapshotDeltasRef.current.set(event.action.id, { revision: actionRevision, action: event.action });
+        retainBrowserSnapshotDelta(stateSnapshotInFlightRef.current, actionSnapshotDeltasRef.current, event.action.id, {
+          revision: actionRevision,
+          action: event.action,
+        });
         setRunningActions((current) => {
           const next = new Map(current);
           if (event.action.status === 'running') next.set(event.action.id, event.action);
@@ -1086,30 +1126,60 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         void refreshBookmarks();
       } else if (event.type === 'credential-prompt') {
         const revision = ++auxiliarySnapshotRevisionRef.current.credentialPrompts;
-        credentialPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
+        retainBrowserSnapshotDelta(
+          stateSnapshotInFlightRef.current,
+          credentialPromptSnapshotDeltasRef.current,
+          event.prompt.id,
+          { revision, prompt: event.prompt },
+        );
         setCredentialPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'permission-prompt') {
         const revision = ++auxiliarySnapshotRevisionRef.current.permissionPrompts;
-        permissionPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
+        retainBrowserSnapshotDelta(
+          stateSnapshotInFlightRef.current,
+          permissionPromptSnapshotDeltasRef.current,
+          event.prompt.id,
+          { revision, prompt: event.prompt },
+        );
         setPermissionPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'auth-prompt') {
         const revision = ++auxiliarySnapshotRevisionRef.current.authPrompts;
-        authPromptSnapshotDeltasRef.current.set(event.prompt.id, { revision, prompt: event.prompt });
+        retainBrowserSnapshotDelta(
+          stateSnapshotInFlightRef.current,
+          authPromptSnapshotDeltasRef.current,
+          event.prompt.id,
+          { revision, prompt: event.prompt },
+        );
         setAuthPrompts((current) => appendPromptOnce(current, event.prompt));
       } else if (event.type === 'prompt-dismissed') {
         const remove = <T extends { id: string }>(current: T[]) =>
           current.filter((prompt) => prompt.id !== event.promptId);
         if (event.promptKind === 'credential') {
           const revision = ++auxiliarySnapshotRevisionRef.current.credentialPrompts;
-          credentialPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
+          retainBrowserSnapshotDelta(
+            stateSnapshotInFlightRef.current,
+            credentialPromptSnapshotDeltasRef.current,
+            event.promptId,
+            { revision, prompt: null },
+          );
           setCredentialPrompts(remove);
         } else if (event.promptKind === 'permission') {
           const revision = ++auxiliarySnapshotRevisionRef.current.permissionPrompts;
-          permissionPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
+          retainBrowserSnapshotDelta(
+            stateSnapshotInFlightRef.current,
+            permissionPromptSnapshotDeltasRef.current,
+            event.promptId,
+            { revision, prompt: null },
+          );
           setPermissionPrompts(remove);
         } else {
           const revision = ++auxiliarySnapshotRevisionRef.current.authPrompts;
-          authPromptSnapshotDeltasRef.current.set(event.promptId, { revision, prompt: null });
+          retainBrowserSnapshotDelta(
+            stateSnapshotInFlightRef.current,
+            authPromptSnapshotDeltasRef.current,
+            event.promptId,
+            { revision, prompt: null },
+          );
           setAuthPrompts(remove);
         }
       } else if (event.type === 'download') {
@@ -1133,6 +1203,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     void refreshBookmarks();
     return () => {
       stateRequestRef.current++;
+      stateSnapshotInFlightRef.current = null;
+      clearBrowserSnapshotDeltas(
+        actionSnapshotDeltasRef.current,
+        credentialPromptSnapshotDeltasRef.current,
+        permissionPromptSnapshotDeltasRef.current,
+        authPromptSnapshotDeltasRef.current,
+      );
       bookmarkRequestRef.current++;
       suggestionRequestRef.current++;
       unsubscribe();

@@ -92,6 +92,7 @@ import {
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
+  invalidateMissingConfirmedConversationSelection,
   isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
@@ -764,24 +765,36 @@ function AppShell() {
         setActiveConversationHasMessages(false);
         return;
       }
-      let conversation: ConversationRecord | null;
-      try {
-        conversation = (await app.conversations.get(confirmed.activeConversationId)) as ConversationRecord | null;
-      } catch {
+      const isCurrent = () =>
+        hydrationSequence === activeConversationHydrationSeqRef.current &&
+        activeConversationIdRef.current === confirmed.activeConversationId;
+      const restoration = await getConversationForWorkspaceRestoration({
+        conversationId: confirmed.activeConversationId,
+        isCurrent,
+        getForRestore: (conversationId) => app.conversations.getForRestore(conversationId),
+      });
+      if (!restoration || restoration.status === 'unavailable') return;
+      if (!isCurrent()) {
         return;
       }
-      if (
-        hydrationSequence !== activeConversationHydrationSeqRef.current ||
-        activeConversationIdRef.current !== confirmed.activeConversationId
-      ) {
+      if (restoration.status === 'missing') {
+        const invalidated = invalidateMissingConfirmedConversationSelection(
+          confirmedConversationSelectionRef.current,
+          confirmed,
+        );
+        if (!invalidated) return;
+        commitConfirmedConversationSelection(invalidated);
+        setActiveConversationTitle(null);
+        setActiveConversationHasMessages(false);
         return;
       }
+      const conversation = restoration.conversation as ConversationRecord;
       setActiveConversationTitle(
         getConversationDisplayTitle(conversation, cuSessionsByConversation.get(confirmed.activeConversationId)),
       );
-      setActiveConversationHasMessages((conversation?.messageCount ?? 0) > 0);
+      setActiveConversationHasMessages((conversation.messageCount ?? 0) > 0);
     },
-    [cuSessionsByConversation],
+    [commitConfirmedConversationSelection, cuSessionsByConversation],
   );
   // Browser-attention navigation may wait on record and workspace I/O. Claim a
   // unique generation for every navigation intent so an older attention click

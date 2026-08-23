@@ -5722,14 +5722,19 @@ export class BrowserManager {
   private conversationsForScope(scopeKey: string, originatingConversationId?: string): Set<string> {
     const conversations = new Set<string>();
     if (originatingConversationId) conversations.add(originatingConversationId);
+    // Fanout is notification bookkeeping, not a new Browser authorization
+    // boundary. Computing the configured partition is pure; calling scopeKey()
+    // here would re-read every conversation and let one unrelated transient
+    // store failure abort an already-committed global bookmark/download update.
+    const dataScope = this.dataScope ?? this.config().dataScope;
     for (const candidate of this.tabOrder?.keys() ?? []) {
       if (this.removedConversations.has(candidate)) continue;
-      if (this.scopeKey(candidate) === scopeKey) conversations.add(candidate);
+      if (browserScopeKey(dataScope, candidate) === scopeKey) conversations.add(candidate);
     }
     if (
       this.mountedConversationId &&
       !this.removedConversations.has(this.mountedConversationId) &&
-      this.scopeKey(this.mountedConversationId) === scopeKey
+      browserScopeKey(dataScope, this.mountedConversationId) === scopeKey
     ) {
       conversations.add(this.mountedConversationId);
     }
@@ -6877,12 +6882,150 @@ export class BrowserManager {
     }
   }
 
+  private waitForAssistantNavigationAttempt(
+    tab: InternalTab,
+    contents: WebContents,
+    expectedUrl: string,
+    operation: string,
+    begin: () => void,
+    reachedDestination: (url: string) => boolean,
+  ): Promise<void> {
+    const initialTabGeneration = tab.generation;
+    const initialNetworkNavigationSequence = tab.networkNavigationSequence ?? 0;
+    const initialUserNavigationLease = tab.trustedUserNavigationLease;
+    const expectedComparableUrl = comparablePopupReferrerUrl(expectedUrl);
+    const attemptUrls = new Set(expectedComparableUrl ? [expectedComparableUrl] : []);
+    let commandIssued = false;
+    let started = false;
+    let committed = false;
+    let attemptTabGeneration = initialTabGeneration;
+    let attemptNetworkNavigationSequence = initialNetworkNavigationSequence;
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        contents.removeListener('did-start-navigation', onDidStartNavigation);
+        contents.removeListener('did-redirect-navigation', onDidRedirectNavigation);
+        contents.removeListener('did-navigate', onDidNavigate);
+        contents.removeListener('did-navigate-in-page', onDidNavigateInPage);
+        contents.removeListener('did-stop-loading', onDidStopLoading);
+        contents.removeListener('did-fail-load', onDidFailLoad);
+        contents.removeListener('destroyed', onDestroyed);
+      };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      };
+      const changedError = () => new Error(`The page navigated while ${operation} was waiting.`);
+      const attemptCurrent = (): boolean =>
+        this.tabs.get(tab.shell.id) === tab &&
+        tab.view?.webContents === contents &&
+        !(typeof contents.isDestroyed === 'function' && contents.isDestroyed()) &&
+        tab.trustedUserNavigationLease === initialUserNavigationLease &&
+        tab.generation === attemptTabGeneration &&
+        (tab.networkNavigationSequence ?? 0) === attemptNetworkNavigationSequence;
+      const failIfAttemptChanged = (): boolean => {
+        if (attemptCurrent()) return false;
+        finish(changedError());
+        return true;
+      };
+      const onDidStartNavigation = (_event: Electron.Event, url: string, isInPlace: boolean, isMainFrame: boolean) => {
+        if (!commandIssued || !isMainFrame) return;
+        if (started || tab.trustedUserNavigationLease !== initialUserNavigationLease) {
+          finish(changedError());
+          return;
+        }
+        const comparableUrl = comparablePopupReferrerUrl(url);
+        if (expectedComparableUrl && comparableUrl !== expectedComparableUrl) {
+          finish(changedError());
+          return;
+        }
+        attemptTabGeneration = initialTabGeneration + (isInPlace ? 0 : 1);
+        attemptNetworkNavigationSequence = initialNetworkNavigationSequence + (isInPlace ? 0 : 1);
+        if (failIfAttemptChanged()) return;
+        started = true;
+        if (comparableUrl) attemptUrls.add(comparableUrl);
+      };
+      const onDidRedirectNavigation = (
+        _event: Electron.Event,
+        url: string,
+        isInPlace: boolean,
+        isMainFrame: boolean,
+      ) => {
+        if (!started || !isMainFrame || isInPlace || failIfAttemptChanged()) return;
+        const comparableUrl = comparablePopupReferrerUrl(url);
+        if (comparableUrl) attemptUrls.add(comparableUrl);
+      };
+      const onDidNavigate = (_event: Electron.Event, url: string) => {
+        if (!started || failIfAttemptChanged()) return;
+        const comparableUrl = comparablePopupReferrerUrl(url);
+        if ((comparableUrl && !attemptUrls.has(comparableUrl)) || !reachedDestination(url)) {
+          finish(changedError());
+          return;
+        }
+        committed = true;
+        if (typeof contents.isLoadingMainFrame !== 'function' || !contents.isLoadingMainFrame()) finish();
+      };
+      const onDidNavigateInPage = (_event: Electron.Event, url: string, isMainFrame: boolean) => {
+        if (!started || !isMainFrame || failIfAttemptChanged()) return;
+        if (!reachedDestination(url)) {
+          finish(changedError());
+          return;
+        }
+        finish();
+      };
+      const onDidStopLoading = () => {
+        // A stop from a superseded request can arrive after this command starts.
+        // Accept it only after this exact attempt committed its destination.
+        if (!started || failIfAttemptChanged()) return;
+        if (committed) finish();
+      };
+      const onDidFailLoad = (
+        _event: Electron.Event,
+        errorCode: number,
+        errorDescription: string,
+        validatedUrl: string,
+        isMainFrame: boolean,
+      ) => {
+        if (!started || !isMainFrame || failIfAttemptChanged()) return;
+        const comparableUrl = comparablePopupReferrerUrl(validatedUrl);
+        if (comparableUrl && !attemptUrls.has(comparableUrl)) return;
+        // wireWebContents processes this event first. If the same navigation is
+        // still provisional, it recognized this callback as a stale failure for
+        // an older request and deliberately left the current attempt untouched.
+        if (tab.provisionalNetworkNavigation?.generation === attemptNetworkNavigationSequence) return;
+        finish(new Error(`${operation} failed (${errorCode}): ${errorDescription}`));
+      };
+      const onDestroyed = () => finish(new Error(`The browser page closed during ${operation}.`));
+
+      contents.on('did-start-navigation', onDidStartNavigation);
+      contents.on('did-redirect-navigation', onDidRedirectNavigation);
+      contents.on('did-navigate', onDidNavigate);
+      contents.on('did-navigate-in-page', onDidNavigateInPage);
+      contents.on('did-stop-loading', onDidStopLoading);
+      contents.on('did-fail-load', onDidFailLoad);
+      contents.on('destroyed', onDestroyed);
+      try {
+        commandIssued = true;
+        begin();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
   private async navigateAssistantHistory(
     tab: InternalTab,
     contents: WebContents,
     offset: -1 | 1,
     abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
   ): Promise<void> {
+    if (!documentLease) throw new Error('Assistant history navigation requires a document lease.');
+    this.assertAssistantDocumentLease(tab, documentLease);
     const navigation = contents.navigationHistory;
     if (!navigation.canGoToOffset(offset)) return;
     const initialIndex = navigation.getActiveIndex();
@@ -6892,6 +7035,7 @@ export class BrowserManager {
 
     await this.assertAssistantNavigationAllowed(target.url, tab.partition, abortSignal);
     throwIfBrowserAborted(abortSignal);
+    this.assertAssistantDocumentLease(tab, documentLease);
     const currentTarget = navigation.getEntryAtIndex(targetIndex);
     if (navigation.getActiveIndex() !== initialIndex || currentTarget?.url !== target.url) {
       throw new Error('The browser history changed while navigation was being authorized.');
@@ -6903,58 +7047,20 @@ export class BrowserManager {
       'Browser history navigation',
       ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
       () =>
-        new Promise<void>((resolve, reject) => {
-          let settled = false;
-          const cleanup = () => {
-            contents.removeListener('did-navigate', onDidNavigate);
-            contents.removeListener('did-navigate-in-page', onDidNavigateInPage);
-            contents.removeListener('did-stop-loading', onDidStopLoading);
-            contents.removeListener('did-fail-load', onDidFailLoad);
-            contents.removeListener('destroyed', onDestroyed);
-          };
-          const finish = (error?: Error) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            if (error) reject(error);
-            else resolve();
-          };
-          const reachedTarget = () => navigation.getActiveIndex() === targetIndex || contents.getURL() === target.url;
-          const onDidNavigate = () => {
-            if (reachedTarget() && !contents.isLoadingMainFrame()) finish();
-          };
-          const onDidNavigateInPage = (_event: Electron.Event, _url: string, isMainFrame: boolean) => {
-            if (isMainFrame && reachedTarget()) finish();
-          };
-          const onDidStopLoading = () => {
-            if (reachedTarget()) finish();
-          };
-          const onDidFailLoad = (
-            _event: Electron.Event,
-            errorCode: number,
-            errorDescription: string,
-            _validatedUrl: string,
-            isMainFrame: boolean,
-          ) => {
-            if (isMainFrame) finish(new Error(`Browser history navigation failed (${errorCode}): ${errorDescription}`));
-          };
-          const onDestroyed = () => finish(new Error('The browser page closed during history navigation.'));
-
-          contents.on('did-navigate', onDidNavigate);
-          contents.on('did-navigate-in-page', onDidNavigateInPage);
-          contents.on('did-stop-loading', onDidStopLoading);
-          contents.on('did-fail-load', onDidFailLoad);
-          contents.on('destroyed', onDestroyed);
-          try {
-            navigation.goToIndex(targetIndex);
-          } catch (error) {
-            finish(error instanceof Error ? error : new Error(String(error)));
-          }
-        }),
+        this.waitForAssistantNavigationAttempt(
+          tab,
+          contents,
+          target.url,
+          'Browser history navigation',
+          () => navigation.goToIndex(targetIndex),
+          (url) => navigation.getActiveIndex() === targetIndex || url === target.url,
+        ),
       abortSignal,
     );
     throwIfBrowserAborted(abortSignal);
+    const completedPage = this.captureBrowserPageLease(tab, contents);
     await this.assertAssistantNavigationAllowed(contents.getURL(), tab.partition, abortSignal);
+    this.assertBrowserPageLease(tab, completedPage, 'assistant history navigation');
   }
 
   private async reloadAssistantTab(
@@ -6962,73 +7068,34 @@ export class BrowserManager {
     contents: WebContents,
     ignoreCache: boolean,
     abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
   ): Promise<void> {
+    if (!documentLease) throw new Error('Assistant reload requires a document lease.');
+    this.assertAssistantDocumentLease(tab, documentLease);
+    const reloadUrl = contents.getURL();
     await this.runRendererOperationWithDeadline(
       tab,
       contents,
       'Browser page reload',
       ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
       () =>
-        new Promise<void>((resolve, reject) => {
-          let settled = false;
-          let reloadStarted = false;
-          const cleanup = () => {
-            contents.removeListener('did-start-navigation', onDidStartNavigation);
-            contents.removeListener('did-start-loading', onDidStartLoading);
-            contents.removeListener('did-stop-loading', onDidStopLoading);
-            contents.removeListener('did-fail-load', onDidFailLoad);
-            contents.removeListener('destroyed', onDestroyed);
-          };
-          const finish = (error?: Error) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            if (error) reject(error);
-            else resolve();
-          };
-          const onDidStartNavigation = (
-            _event: Electron.Event,
-            _url: string,
-            _isInPlace: boolean,
-            isMainFrame: boolean,
-          ) => {
-            if (isMainFrame) reloadStarted = true;
-          };
-          const onDidStartLoading = () => {
-            reloadStarted = true;
-          };
-          const onDidStopLoading = () => {
-            if (reloadStarted) finish();
-          };
-          const onDidFailLoad = (
-            _event: Electron.Event,
-            errorCode: number,
-            errorDescription: string,
-            _validatedUrl: string,
-            isMainFrame: boolean,
-          ) => {
-            if (reloadStarted && isMainFrame) {
-              finish(new Error(`Browser page reload failed (${errorCode}): ${errorDescription}`));
-            }
-          };
-          const onDestroyed = () => finish(new Error('The browser page closed during reload.'));
-
-          contents.on('did-start-navigation', onDidStartNavigation);
-          contents.on('did-start-loading', onDidStartLoading);
-          contents.on('did-stop-loading', onDidStopLoading);
-          contents.on('did-fail-load', onDidFailLoad);
-          contents.on('destroyed', onDestroyed);
-          try {
+        this.waitForAssistantNavigationAttempt(
+          tab,
+          contents,
+          reloadUrl,
+          'Browser page reload',
+          () => {
             if (ignoreCache) contents.reloadIgnoringCache();
             else contents.reload();
-          } catch (error) {
-            finish(error instanceof Error ? error : new Error(String(error)));
-          }
-        }),
+          },
+          () => true,
+        ),
       abortSignal,
     );
     throwIfBrowserAborted(abortSignal);
+    const completedPage = this.captureBrowserPageLease(tab, contents);
     await this.assertAssistantNavigationAllowed(contents.getURL(), tab.partition, abortSignal);
+    this.assertBrowserPageLease(tab, completedPage, 'assistant reload');
     this.markAssistantControlledOrigin(tab.scopeKey, contents.getURL());
   }
 
@@ -7131,7 +7198,7 @@ export class BrowserManager {
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
           await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
-            this.reloadAssistantTab(tab, contents, false, abortSignal),
+            this.reloadAssistantTab(tab, contents, false, abortSignal, documentLease),
           );
           break;
         }
@@ -7149,7 +7216,7 @@ export class BrowserManager {
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
           await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
-            this.reloadAssistantTab(tab, contents, true, abortSignal),
+            this.reloadAssistantTab(tab, contents, true, abortSignal, documentLease),
           );
           break;
         }
@@ -7167,6 +7234,10 @@ export class BrowserManager {
         // Awaiting ensureView here would make the control wait for the very
         // navigation it is intended to cancel, and a discarded tab has no live
         // navigation to stop (nor any reason to recreate its renderer).
+        if (source === 'user') {
+          this.clearTrustedUserNavigation(tab);
+          tab.trustedUserNavigationLease++;
+        }
         if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.stop();
         break;
       case 'back': {
@@ -7174,7 +7245,7 @@ export class BrowserManager {
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
           await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
-            this.navigateAssistantHistory(tab, contents, -1, abortSignal),
+            this.navigateAssistantHistory(tab, contents, -1, abortSignal, documentLease),
           );
         } else if (contents.navigationHistory.canGoBack()) {
           const target = contents.navigationHistory.getEntryAtIndex(contents.navigationHistory.getActiveIndex() - 1);
@@ -7194,7 +7265,7 @@ export class BrowserManager {
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
           await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
-            this.navigateAssistantHistory(tab, contents, 1, abortSignal),
+            this.navigateAssistantHistory(tab, contents, 1, abortSignal, documentLease),
           );
         } else if (contents.navigationHistory.canGoForward()) {
           const target = contents.navigationHistory.getEntryAtIndex(contents.navigationHistory.getActiveIndex() + 1);

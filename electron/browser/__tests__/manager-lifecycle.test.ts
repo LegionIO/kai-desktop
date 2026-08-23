@@ -2492,6 +2492,10 @@ describe('browser manager renderer lifecycle', () => {
       clearingScopes: new Set(),
       getConfig: () => ({ browser: { dataScope: 'global' } }),
       mountedConversationId: 'chat-3',
+      conversationExists: vi.fn((conversationId: string) => {
+        if (conversationId === 'chat-2') throw new Error('transient record read failure');
+        return true;
+      }),
       stores: new Map([['global', { addBookmark: vi.fn(() => bookmark) }]]),
       tabOrder: new Map([
         ['chat-1', []],
@@ -16978,8 +16982,11 @@ describe('browser manager renderer lifecycle', () => {
   it('keeps assistant reload serialized until the replacement document stops loading', async () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const reload = vi.fn();
+    let loadingMainFrame = true;
     const contents = {
       getURL: () => 'https://example.com/reloaded',
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => loadingMainFrame,
       on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
       reload,
       removeListener: (event: string, listener: (...args: unknown[]) => void) => {
@@ -16994,6 +17001,10 @@ describe('browser manager renderer lifecycle', () => {
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       scopeKey: 'global',
       partition: 'persist:kai-browser-global',
+      generation: 1,
+      networkNavigationSequence: 0,
+      trustedUserNavigationLease: 0,
+      view: { webContents: contents },
     };
     const assertAssistantNavigationAllowed = vi.fn(async () => undefined);
     const markAssistantControlledOrigin = vi.fn();
@@ -17003,6 +17014,7 @@ describe('browser manager renderer lifecycle', () => {
       ensureAssistantView: vi.fn(async () => ({ webContents: contents })),
       runRendererOperationWithDeadline,
       assertAssistantNavigationAllowed,
+      assertAssistantDocumentLease: vi.fn(),
       markAssistantControlledOrigin,
     });
 
@@ -17026,11 +17038,18 @@ describe('browser manager renderer lifecycle', () => {
     void reloading.then(() => {
       completed = true;
     });
+    tab.generation = 2;
+    tab.networkNavigationSequence = 1;
+    listeners.get('did-start-navigation')?.({}, 'https://example.com/reloaded', false, true);
+    // A delayed stop from the superseded load cannot complete this reload.
     listeners.get('did-stop-loading')?.();
     await Promise.resolve();
     expect(completed).toBe(false);
 
-    listeners.get('did-start-navigation')?.({}, 'https://example.com/reloaded', false, true);
+    listeners.get('did-navigate')?.({}, 'https://example.com/reloaded');
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    loadingMainFrame = false;
     listeners.get('did-stop-loading')?.();
     await expect(reloading).resolves.toBeUndefined();
 
@@ -17048,6 +17067,127 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
     );
     expect(markAssistantControlledOrigin).toHaveBeenCalledWith('global', 'https://example.com/reloaded');
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('rejects assistant reload completion when the user stops the in-flight navigation', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      getURL: () => 'https://example.com',
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => true,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      reload: vi.fn(),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 3,
+      networkNavigationSequence: 4,
+      trustedUserNavigationLease: 1,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeout: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+    });
+    const reloading = invokePrivate(manager, 'reloadAssistantTab', tab, contents, false, undefined, {
+      runGeneration: 1,
+      tabGeneration: 3,
+      userNavigationLease: 1,
+      url: 'https://example.com',
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(contents.reload).toHaveBeenCalledOnce());
+
+    tab.generation = 4;
+    tab.networkNavigationSequence = 5;
+    listeners.get('did-start-navigation')?.({}, 'https://example.com', false, true);
+    tab.trustedUserNavigationLease = 2;
+    listeners.get('did-stop-loading')?.();
+
+    await expect(reloading).rejects.toThrow(/page navigated while Browser page reload was waiting/i);
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('correlates assistant history completion with the requested entry', async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    let activeIndex = 1;
+    let currentUrl = 'https://example.com/current';
+    let loadingMainFrame = true;
+    const navigationHistory = {
+      canGoToOffset: () => true,
+      getActiveIndex: () => activeIndex,
+      getEntryAtIndex: (index: number) => ({ url: index === 0 ? 'https://example.com/previous' : currentUrl }),
+      goToIndex: vi.fn(),
+    };
+    const contents = {
+      getURL: () => currentUrl,
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => loadingMainFrame,
+      navigationHistory,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      removeListener: (event: string, listener: (...args: unknown[]) => void) => {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      scopeKey: 'global',
+      partition: 'persist:kai-browser-global',
+      generation: 8,
+      networkNavigationSequence: 10,
+      trustedUserNavigationLease: 2,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      assertAssistantDocumentLease: vi.fn(),
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeout: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+    });
+    const navigating = invokePrivate(manager, 'navigateAssistantHistory', tab, contents, -1, undefined, {
+      runGeneration: 1,
+      tabGeneration: 8,
+      userNavigationLease: 2,
+      url: currentUrl,
+    }) as Promise<void>;
+    await vi.waitFor(() => expect(navigationHistory.goToIndex).toHaveBeenCalledWith(0));
+
+    tab.generation = 9;
+    tab.networkNavigationSequence = 11;
+    listeners.get('did-start-navigation')?.({}, 'https://example.com/previous', false, true);
+    listeners.get('did-stop-loading')?.();
+    let completed = false;
+    void navigating.then(() => {
+      completed = true;
+    });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+
+    activeIndex = 0;
+    currentUrl = 'https://example.com/previous';
+    listeners.get('did-navigate')?.({}, currentUrl);
+    loadingMainFrame = false;
+    listeners.get('did-stop-loading')?.();
+
+    await expect(navigating).resolves.toBeUndefined();
     expect(listeners).toHaveLength(0);
   });
 

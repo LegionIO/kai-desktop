@@ -15,6 +15,7 @@ import {
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
+  invalidateMissingConfirmedConversationSelection,
   isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
@@ -67,6 +68,26 @@ describe('resolveConversationActivationDisposition', () => {
 });
 
 describe('confirmed conversation selection reconciliation', () => {
+  it('clears only the exact confirmed checkpoint whose strict hydration proves missing', () => {
+    const missing = {
+      activeConversationId: 'chat-a',
+      activeConversationRevision: 4,
+      intentGeneration: 2,
+    };
+
+    expect(invalidateMissingConfirmedConversationSelection(missing, missing)).toEqual({
+      activeConversationId: null,
+      activeConversationRevision: 4,
+      intentGeneration: 2,
+    });
+    expect(
+      invalidateMissingConfirmedConversationSelection(
+        { activeConversationId: 'chat-b', activeConversationRevision: 5, intentGeneration: 3 },
+        missing,
+      ),
+    ).toBeNull();
+  });
+
   it('recovers failed speculative selections to an older local selection that the backend committed', () => {
     const pending = [
       { sequence: 1, conversationId: 'chat-b', intentGeneration: 1 },
