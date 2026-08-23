@@ -4035,10 +4035,17 @@ describe('browser manager renderer lifecycle', () => {
     };
     const view = { webContents: contents };
     const tab = {
-      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false } as {
+      generation: 4,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        updatedAt: '2025-12-31T23:59:59.000Z',
+      } as {
         id: string;
         conversationId: string;
         discarded: boolean;
+        updatedAt: string;
         error?: string;
       },
       view,
@@ -4064,6 +4071,8 @@ describe('browser manager renderer lifecycle', () => {
       discarded: true,
       error: 'Page renderer exited: crashed',
     });
+    expect(tab.generation).toBe(5);
+    expect(tab.shell.updatedAt).toBe('2026-01-01T00:00:00.000Z');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
 
@@ -4115,7 +4124,13 @@ describe('browser manager renderer lifecycle', () => {
       isDestroyed: () => false,
     };
     const tab = {
-      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+      generation: 7,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        updatedAt: '2025-12-31T23:59:59.000Z',
+      },
       view,
       isPopup: false,
     };
@@ -4141,6 +4156,8 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(manager, 'detachedHostViews')).not.toContain(view);
     expect(tab.view).toBeNull();
     expect(tab.shell.discarded).toBe(true);
+    expect(tab.generation).toBe(8);
+    expect(tab.shell.updatedAt).toBe('2026-01-01T00:00:00.000Z');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
 
@@ -7788,10 +7805,10 @@ describe('browser manager renderer lifecycle', () => {
     expect(emitTabs).not.toHaveBeenCalled();
   });
 
-  it('reclaims an opener-linked popup renderer before assistant authorization', () => {
+  it('reclaims a same-run opener-linked popup renderer before assistant authorization', () => {
     const contents = { id: 42, isDestroyed: () => false };
     const tab = {
-      assistantDialogsDisabledRunId: null as string | null,
+      assistantDialogsDisabledRunId: 'run-1' as string | null,
       openerLinkedContentsId: contents.id as number | undefined,
       generation: 4,
       shell: {
@@ -7819,6 +7836,65 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.shell).toMatchObject({ discarded: true, loading: false, sensitive: false });
     expect(destroyView).toHaveBeenCalledWith(tab);
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
+  });
+
+  it('rebinds ask-policy approval across same-run opener-linked popup reclamation', () => {
+    const sourceContents = { id: 41, isDestroyed: () => false };
+    const replacementContents = { id: 42, isDestroyed: () => false };
+    const sourceView = { webContents: sourceContents };
+    const replacementView = { webContents: replacementContents };
+    const tab = {
+      assistantDialogsDisabledRunId: 'run-1' as string | null,
+      openerLinkedContentsId: sourceContents.id as number | undefined,
+      generation: 4,
+      shell: {
+        id: 'popup-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/account',
+        discarded: false,
+        loading: false,
+        sensitive: false,
+      },
+      trustedUserNavigationLease: 2,
+      view: sourceView as typeof sourceView | typeof replacementView | null,
+      viewLoadPromise: null as Promise<unknown> | null,
+    };
+    const approval = {
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      origin: 'https://example.com',
+      url: tab.shell.url,
+      userNavigationLease: tab.trustedUserNavigationLease,
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserDocumentApproval: vi.fn(),
+      destroyView: vi.fn((target: typeof tab) => {
+        target.view = null;
+      }),
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    Reflect.deleteProperty(manager, 'prepareAssistantDialogSafeRenderer');
+
+    const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
+    const reclaimed = invokePrivate(manager, 'prepareAssistantDialogSafeRenderer', tab, 'run-1') as boolean;
+    invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, reclaimed);
+    tab.view = replacementView;
+    tab.shell.discarded = false;
+    tab.generation++;
+    invokePrivate(
+      manager,
+      'advanceBrowserApprovalRendererResetAfterRestore',
+      tab,
+      { id: 'run-1' },
+      approval,
+      replacementView,
+      tab.generation,
+    );
+    invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval, replacementView);
+
+    expect(approval).toMatchObject({ tabGeneration: 6, allowInternalRestore: false });
+    expect(tab.openerLinkedContentsId).toBeUndefined();
   });
 
   it('consumes ask-policy approval after the exact discarded-tab restoration advances generation', () => {

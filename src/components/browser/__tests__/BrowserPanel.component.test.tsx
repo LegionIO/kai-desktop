@@ -2139,6 +2139,70 @@ describe('BrowserPanel', () => {
     expect(screenshot).not.toHaveBeenCalled();
   });
 
+  it('does not capture a replacement document after the selected tab navigates during native remount', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const visibleMount = deferred<void>();
+    let holdVisibleMount = false;
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (holdVisibleMount && bounds !== null) await visibleMount.promise;
+    });
+    const screenshot = vi.fn();
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        captureMenuPreview: async () => ({
+          tabId: tab.id,
+          mode: 'viewport' as const,
+          mimeType: 'image/png' as const,
+          width: 400,
+          height: 300,
+        }),
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        screenshot,
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+    await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', expect.any(Object)));
+
+    await openBrowserMenu();
+    holdVisibleMount = true;
+    fireEvent.click(screen.getByText('Screenshot viewport'));
+    await waitFor(() =>
+      expect(mount.mock.calls.filter(([, bounds]) => bounds !== null).length).toBeGreaterThanOrEqual(2),
+    );
+
+    act(() => {
+      emit?.({
+        type: 'tabs-changed',
+        conversationId: 'chat-1',
+        tabs: [
+          {
+            ...tab,
+            title: 'Replacement',
+            url: 'https://replacement.example',
+            updatedAt: '2026-01-01T00:00:01.000Z',
+          },
+        ],
+      });
+    });
+    await act(async () => {
+      visibleMount.resolve();
+      await visibleMount.promise;
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByRole('tab', { name: 'Replacement' })).toBeInTheDocument();
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
   it('does not let an older screenshot failure replace a newer capture result', async () => {
     const firstCapture = deferred<never>();
     const screenshot = vi

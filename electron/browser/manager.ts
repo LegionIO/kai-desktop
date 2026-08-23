@@ -3527,15 +3527,15 @@ export class BrowserManager {
    * preload-installed native-UI trampoline and CDP dialog/file-picker guard are
    * activated and awaited before assistant authorization continues. */
   private prepareAssistantDialogSafeRenderer(tab: InternalTab, runId: string): boolean {
-    if (tab.assistantDialogsDisabledRunId === runId) return false;
     const view = tab.view;
-    if (view && !view.webContents.isDestroyed()) {
-      if (tab.openerLinkedContentsId !== view.webContents.id) return false;
+    if (view && !view.webContents.isDestroyed() && tab.openerLinkedContentsId === view.webContents.id) {
       // Electron must receive the inherited createWindow options for the popup
       // to work for the user, but that renderer also retains window.opener.
       // A child page can therefore expose a sensitive opener DOM through an
-      // otherwise non-sensitive tab. Recreate only the shell/profile/URL under
-      // an ordinary standalone WebContents before assistant authorization.
+      // otherwise non-sensitive tab. This applies even when the popup was
+      // created by the current assistant run and already carries its dialog
+      // marker. Recreate only the shell/profile/URL under an ordinary standalone
+      // WebContents before assistant authorization.
       tab.assistantDialogsDisabledRunId = runId;
       tab.openerLinkedContentsId = undefined;
       tab.generation++;
@@ -3546,6 +3546,11 @@ export class BrowserManager {
       this.emitTabs(tab.shell.conversationId);
       return true;
     }
+    if (tab.assistantDialogsDisabledRunId === runId) {
+      if (!view || view.webContents.isDestroyed()) tab.openerLinkedContentsId = undefined;
+      return false;
+    }
+    if (view && !view.webContents.isDestroyed()) return false;
     // A destroyed or discarded popup no longer has a live opener capability;
     // its eventual standalone restoration is safe to retain.
     tab.openerLinkedContentsId = undefined;
@@ -4020,7 +4025,9 @@ export class BrowserManager {
     this.assertBrowserDocumentApproval(tab, documentApproval);
     const sourceView = tab.view;
     const sourceContents = sourceView && !sourceView.webContents.isDestroyed() ? sourceView.webContents : null;
-    const needsDialogSafeReplacement = sourceContents === null && tab.assistantDialogsDisabledRunId !== run.id;
+    const needsDialogSafeReplacement =
+      (sourceContents === null && tab.assistantDialogsDisabledRunId !== run.id) ||
+      (sourceContents !== null && tab.openerLinkedContentsId === sourceContents.id);
     const needsDiscardedRestore = sourceContents === null && tab.shell.discarded;
     if (!needsDialogSafeReplacement && !needsDiscardedRestore) return undefined;
     const lease: BrowserApprovalRendererResetLease = {
@@ -9575,6 +9582,10 @@ export class BrowserManager {
       // A gone renderer does not guarantee that Electron destroys the owning
       // WebContentsView. Reclaim it through the normal teardown path before
       // dropping our reference so repeated crashes cannot orphan native state.
+      // The replacement is a different document even when it restores the same
+      // URL, so invalidate pending approvals and page leases synchronously.
+      tab.generation++;
+      tab.shell.updatedAt = now();
       this.destroyView(tab);
       tab.shell.error = `Page renderer exited: ${details.reason}`;
       tab.shell.discarded = true;
@@ -9595,6 +9606,10 @@ export class BrowserManager {
       if (!stillOwnsContents) return;
       // A stale destroyed event from a renderer replaced during navigation or
       // sanitization must not erase diagnostics collected by the replacement.
+      // A direct loss of the owning renderer likewise invalidates every
+      // document-bound approval before a later restore can create a new page.
+      tab.generation++;
+      tab.shell.updatedAt = now();
       this.resetBrowserNetworkDiagnostics(tab);
       const destroyedView = tab.view;
       if (!destroyedView) return;

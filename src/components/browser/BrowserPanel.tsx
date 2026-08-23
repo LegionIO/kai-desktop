@@ -1833,13 +1833,21 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     if (!browser || !conversationId || !active) return;
     const requestedConversationId = conversationId;
     const requestedTabId = active.id;
+    const requestedPageIdentity = `${requestedConversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}`;
     const request = ++screenshotRequestRef.current;
     const tabSelectionGeneration = activeTabSelectionGenerationRef.current;
-    const isCurrent = () =>
-      request === screenshotRequestRef.current &&
-      conversationIdRef.current === requestedConversationId &&
-      activeTabIdRef.current === requestedTabId &&
-      activeTabSelectionGenerationRef.current === tabSelectionGeneration;
+    const isCurrent = () => {
+      const current = stateRef.current?.tabs.find((tab) => tab.active);
+      return (
+        request === screenshotRequestRef.current &&
+        conversationIdRef.current === requestedConversationId &&
+        activeTabIdRef.current === requestedTabId &&
+        activeTabSelectionGenerationRef.current === tabSelectionGeneration &&
+        !!current &&
+        `${requestedConversationId}\u0000${current.id}\u0000${current.url}\u0000${current.updatedAt}` ===
+          requestedPageIdentity
+      );
+    };
     dismissBrowserMenu();
     setError(null);
     try {
