@@ -239,6 +239,7 @@ describe('browser tools', () => {
       url: 'https://example.com',
       favicon: `data:image/png;base64,${'A'.repeat(100_000)}`,
       error: 'Browsing history could not be saved: EACCES /Users/private/.kai/browser/history.json',
+      documentToken: 'renderer-capability-must-not-reach-model',
     };
     manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [visibleTab], activeTabId: visibleTab.id });
     manager.createTab.mockResolvedValue(visibleTab);
@@ -250,6 +251,8 @@ describe('browser tools', () => {
     await expect(tabs.execute({ action: 'list' }, context)).resolves.toMatchObject({
       tabs: [{ favicon: undefined, error: undefined }],
     });
+    const listed = await tabs.execute({ action: 'list' }, context);
+    expect(listed).not.toHaveProperty('tabs.0.documentToken');
     await expect(tabs.execute({ action: 'open', url: visibleTab.url }, context)).resolves.toEqual({
       ok: true,
       action: 'open',

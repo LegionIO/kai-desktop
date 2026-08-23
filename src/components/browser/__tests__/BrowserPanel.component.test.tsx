@@ -41,6 +41,7 @@ const tab: BrowserTab = {
   zoomLevel: 0,
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:00:00.000Z',
+  documentToken: 'picked-document-token',
   security: 'secure',
   sensitive: false,
 };
@@ -2091,6 +2092,33 @@ describe('BrowserPanel', () => {
     expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id);
   });
 
+  it('rejects a component picker result from a replacement document', async () => {
+    const pickElement = vi.fn(async () => ({
+      selector: '#picked',
+      documentToken: 'replacement-document-token',
+    }));
+    const screenshot = vi.fn();
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        pickElement,
+        screenshot,
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Screenshot component'));
+
+    expect(await screen.findByText(/page changed while selecting the screenshot component/i)).toBeInTheDocument();
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
   it('does not surface a stale component-picker failure after the active tab changes', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const pendingPicker = deferred<{ selector: string; documentToken: string }>();
@@ -2139,7 +2167,7 @@ describe('BrowserPanel', () => {
     expect(screenshot).not.toHaveBeenCalled();
   });
 
-  it('does not capture a replacement document after the selected tab navigates during native remount', async () => {
+  it('does not capture a same-URL replacement renderer after the native page remounts', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const visibleMount = deferred<void>();
     let holdVisibleMount = false;
@@ -2187,8 +2215,7 @@ describe('BrowserPanel', () => {
           {
             ...tab,
             title: 'Replacement',
-            url: 'https://replacement.example',
-            updatedAt: '2026-01-01T00:00:01.000Z',
+            documentToken: 'replacement-document-token',
           },
         ],
       });
@@ -2201,6 +2228,44 @@ describe('BrowserPanel', () => {
 
     expect(await screen.findByRole('tab', { name: 'Replacement' })).toBeInTheDocument();
     expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['Screenshot viewport', 'viewport'],
+    ['Screenshot full page', 'full-page'],
+  ] as const)('binds %s to the main-issued document token', async (label, mode) => {
+    const screenshot = vi.fn(async () => ({
+      tabId: tab.id,
+      mode,
+      mimeType: 'image/png' as const,
+      width: 10,
+      height: 10,
+    }));
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        screenshot,
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText(label));
+
+    await waitFor(() =>
+      expect(screenshot).toHaveBeenCalledWith('chat-1', {
+        tabId: tab.id,
+        mode,
+        selector: undefined,
+        documentToken: tab.documentToken,
+        exportToFile: true,
+      }),
+    );
   });
 
   it('does not let an older screenshot failure replace a newer capture result', async () => {

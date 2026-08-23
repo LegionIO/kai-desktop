@@ -6194,10 +6194,24 @@ export class BrowserManager {
    * copies may cross IPC/model boundaries; truncating the internal value lets
    * two long same-document routes share an approval/operation lease. */
   private snapshotTab(tab: InternalTab, active: boolean): BrowserTab {
+    const contents = tab.view?.webContents;
+    let documentToken: string | undefined;
+    if (contents) {
+      try {
+        if (!contents.isDestroyed()) {
+          documentToken = this.browserPageLeaseToken(this.captureBrowserPageLease(tab, contents));
+        }
+      } catch {
+        // Renderer loss can race a tab-state broadcast. An absent token makes
+        // renderer-originated document operations fail closed until the
+        // replacement view is fully represented by a later snapshot.
+      }
+    }
     return {
       ...tab.shell,
       url: boundedBrowserUrl(tab.shell.url),
       active,
+      documentToken,
     };
   }
 
@@ -9584,6 +9598,7 @@ export class BrowserManager {
       // dropping our reference so repeated crashes cannot orphan native state.
       // The replacement is a different document even when it restores the same
       // URL, so invalidate pending approvals and page leases synchronously.
+      this.clearTrustedUserNavigation(tab);
       tab.generation++;
       tab.shell.updatedAt = now();
       this.destroyView(tab);
@@ -9608,6 +9623,7 @@ export class BrowserManager {
       // sanitization must not erase diagnostics collected by the replacement.
       // A direct loss of the owning renderer likewise invalidates every
       // document-bound approval before a later restore can create a new page.
+      this.clearTrustedUserNavigation(tab);
       tab.generation++;
       tab.shell.updatedAt = now();
       this.resetBrowserNetworkDiagnostics(tab);
@@ -17153,6 +17169,7 @@ export class BrowserManager {
     for (const tab of this.tabs.values()) {
       // Renderer teardown is a document-authority boundary even when the page
       // URL itself is retained for a later idle-style restore.
+      this.clearTrustedUserNavigation(tab);
       tab.generation++;
       this.destroyView(tab);
       tab.shell.discarded = true;

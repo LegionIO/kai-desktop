@@ -29,6 +29,10 @@ export type BrowserTab = {
   zoomLevel: number;
   createdAt: string;
   updatedAt: string;
+  /** Opaque main-process identity for the live Chromium document. Renderer UI
+   * operations must echo this token so a replacement renderer at the same URL
+   * cannot receive a stale command. Never expose this capability to models. */
+  documentToken?: string;
   error?: string;
   security: 'secure' | 'insecure' | 'internal' | 'unknown';
   sensitive: boolean;

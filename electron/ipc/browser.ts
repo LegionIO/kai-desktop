@@ -124,9 +124,12 @@ export function registerBrowserHandlers(
     getBrowserManager().captureMenuPreview(conversationId, tabId, requestId),
   );
   handle('browser:cancel-menu-preview', (requestId: string) => getBrowserManager().cancelMenuPreview(requestId));
-  handle('browser:screenshot', (conversationId: string, request: BrowserScreenshotRequest) =>
-    getBrowserManager().screenshot(conversationId, request),
-  );
+  handle('browser:screenshot', (conversationId: string, request: BrowserScreenshotRequest) => {
+    if (!request || typeof request.documentToken !== 'string' || request.documentToken.length === 0) {
+      throw new Error('Browser screenshots require the current page document token.');
+    }
+    return getBrowserManager().screenshot(conversationId, request);
+  });
   handle('browser:pick-element', (conversationId: string, tabId: string) =>
     getBrowserManager().pickElement(conversationId, tabId),
   );

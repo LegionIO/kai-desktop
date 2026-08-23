@@ -4049,6 +4049,12 @@ describe('browser manager renderer lifecycle', () => {
         error?: string;
       },
       view,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/private',
+      trustedUserNavigationRequestId: 17,
+      trustedUserNavigationPanelGeneration: 2,
+      trustedUserNavigationLease: 3,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
     };
     const destroyView = vi.fn((target: typeof tab) => {
       target.view = null as never;
@@ -4072,6 +4078,11 @@ describe('browser manager renderer lifecycle', () => {
       error: 'Page renderer exited: crashed',
     });
     expect(tab.generation).toBe(5);
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.trustedUserNavigationTarget).toBeNull();
+    expect(tab.trustedUserNavigationRequestId).toBeNull();
+    expect(tab.trustedUserNavigationPanelGeneration).toBeNull();
+    expect(tab.trustedUserNavigationTimer).toBeNull();
     expect(tab.shell.updatedAt).toBe('2026-01-01T00:00:00.000Z');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
@@ -4133,6 +4144,12 @@ describe('browser manager renderer lifecycle', () => {
       },
       view,
       isPopup: false,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/private',
+      trustedUserNavigationRequestId: 19,
+      trustedUserNavigationPanelGeneration: 5,
+      trustedUserNavigationLease: 6,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
     };
     const emitTabs = vi.fn();
     const manager = managerWithoutConstructor({
@@ -4157,6 +4174,11 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.view).toBeNull();
     expect(tab.shell.discarded).toBe(true);
     expect(tab.generation).toBe(8);
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.trustedUserNavigationTarget).toBeNull();
+    expect(tab.trustedUserNavigationRequestId).toBeNull();
+    expect(tab.trustedUserNavigationPanelGeneration).toBeNull();
+    expect(tab.trustedUserNavigationTimer).toBeNull();
     expect(tab.shell.updatedAt).toBe('2026-01-01T00:00:00.000Z');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
@@ -6259,6 +6281,31 @@ describe('browser manager renderer lifecycle', () => {
     expect(() => invokePrivate(manager, 'assertBrowserDocumentApproval', tab, approval)).toThrow(
       /page changed while approval was pending/i,
     );
+  });
+
+  it('issues a distinct renderer-only document token for same-URL replacement views', () => {
+    const firstContents = { id: 41, isDestroyed: () => false };
+    const replacementContents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/same',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      generation: 7,
+      trustedUserNavigationLease: 3,
+      view: { webContents: firstContents },
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'tab-1']]),
+      tabOrder: new Map([['chat-1', ['tab-1']]]),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:3:41');
+    tab.view = { webContents: replacementContents };
+    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:3:42');
   });
 
   it('binds tab-list read approval to the exact active tab, order, shells, and documents', () => {
@@ -21508,6 +21555,12 @@ describe('browser manager renderer lifecycle', () => {
       view: { webContents: {} },
       generation: 2,
       aiNetworkRestricted: true,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://one.example/private',
+      trustedUserNavigationRequestId: 31,
+      trustedUserNavigationPanelGeneration: 4,
+      trustedUserNavigationLease: 8,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
     };
     const second = {
       shell: {
@@ -21519,6 +21572,12 @@ describe('browser manager renderer lifecycle', () => {
       view: { webContents: {} },
       generation: 8,
       aiNetworkRestricted: false,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://two.example/private',
+      trustedUserNavigationRequestId: 32,
+      trustedUserNavigationPanelGeneration: 4,
+      trustedUserNavigationLease: 9,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
     };
     const destroyView = vi.fn((tab: typeof first | typeof second) => {
       tab.view = null as unknown as typeof tab.view;
@@ -21585,6 +21644,10 @@ describe('browser manager renderer lifecycle', () => {
     expect(second.aiNetworkRestricted).toBe(false);
     expect(first.generation).toBe(3);
     expect(second.generation).toBe(9);
+    expect(first.trustedUserNavigation).toBe(false);
+    expect(first.trustedUserNavigationTimer).toBeNull();
+    expect(second.trustedUserNavigation).toBe(false);
+    expect(second.trustedUserNavigationTimer).toBeNull();
     expect(manager.isHostRendererAuthorityCurrent(4)).toBe(false);
     expect(manager.isHostRendererAuthorityCurrent(5)).toBe(false);
     manager.handleHostRendererReady();
@@ -26392,6 +26455,40 @@ describe('browser manager renderer lifecycle', () => {
         documentToken: 'tab-1:1:4:42',
       }),
     ).rejects.toThrow(/changed after the element was picked/);
+    expect(capturePage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a viewport capture when its renderer document token is stale', async () => {
+    const capturePage = vi.fn();
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      capturePage,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com', sensitive: false },
+      view: { webContents: contents },
+      generation: 2,
+      trustedUserNavigationLease: 4,
+    };
+    const manager = managerWithoutConstructor({
+      requireTab: () => tab,
+      ensureView: vi.fn(async () => tab.view),
+      captureBrowserPageLease: vi.fn(() => ({
+        tabId: 'tab-1',
+        tabGeneration: 2,
+        userNavigationLease: 4,
+        contents,
+      })),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+    });
+
+    await expect(
+      manager.screenshot('chat-1', {
+        mode: 'viewport',
+        documentToken: 'tab-1:2:4:41',
+      }),
+    ).rejects.toThrow(/page changed/i);
     expect(capturePage).not.toHaveBeenCalled();
   });
 

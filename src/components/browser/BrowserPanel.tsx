@@ -1833,7 +1833,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     if (!browser || !conversationId || !active) return;
     const requestedConversationId = conversationId;
     const requestedTabId = active.id;
-    const requestedPageIdentity = `${requestedConversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}`;
+    const requestedDocumentToken = active.documentToken;
     const request = ++screenshotRequestRef.current;
     const tabSelectionGeneration = activeTabSelectionGenerationRef.current;
     const isCurrent = () => {
@@ -1844,12 +1844,16 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         activeTabIdRef.current === requestedTabId &&
         activeTabSelectionGenerationRef.current === tabSelectionGeneration &&
         !!current &&
-        `${requestedConversationId}\u0000${current.id}\u0000${current.url}\u0000${current.updatedAt}` ===
-          requestedPageIdentity
+        !!requestedDocumentToken &&
+        current.documentToken === requestedDocumentToken
       );
     };
     dismissBrowserMenu();
     setError(null);
+    if (!requestedDocumentToken) {
+      setError('The browser page is not ready for a screenshot yet. Try again.');
+      return;
+    }
     try {
       // Menu dismissal is a React commit, while the native Chromium view is
       // mounted by the following layout/animation-frame pass. Join that mount
@@ -1860,10 +1864,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       await refreshNativeMountRef.current();
       if (!isCurrent()) return;
       let selector: string | undefined;
-      let documentToken: string | undefined;
+      let documentToken = requestedDocumentToken;
       if (mode === 'element') {
         const picked = await browser.pickElement(requestedConversationId, requestedTabId);
         if (!isCurrent()) return;
+        if (picked.documentToken !== requestedDocumentToken) {
+          throw new Error('The browser page changed while selecting the screenshot component. Try again.');
+        }
         selector = picked.selector;
         documentToken = picked.documentToken;
       }

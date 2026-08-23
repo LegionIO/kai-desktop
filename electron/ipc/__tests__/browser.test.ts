@@ -45,6 +45,13 @@ const manager = vi.hoisted(() => ({
   })),
   getAttentionState: vi.fn(() => [{ conversationId: 'chat-2', promptIds: ['prompt-1'] }]),
   mount: vi.fn(async (): Promise<void> => undefined),
+  screenshot: vi.fn(async () => ({
+    tabId: 'tab-1',
+    mode: 'viewport' as const,
+    mimeType: 'image/png' as const,
+    width: 10,
+    height: 10,
+  })),
   setZoom: vi.fn(async (_conversationId: string, _tabId: string, level: number) => level),
   setChromeFocus: vi.fn(),
   listCredentials: vi.fn(() => []),
@@ -271,5 +278,43 @@ describe('browser IPC authorization', () => {
     releaseMount();
 
     await expect(invocation).rejects.toThrow(/authority has expired/);
+  });
+
+  it('requires renderer screenshot requests to carry a main-issued document token', async () => {
+    const mainFrame = { url: 'file:///app/index.html' };
+    const primaryContents = { isDestroyed: () => false, getZoomFactor: () => 1, mainFrame };
+    const primaryWindow = {
+      isDestroyed: () => false,
+      webContents: primaryContents,
+    } as unknown as BrowserWindow;
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) =>
+        registerBrowserHandlers(
+          ipc as unknown as IpcMain,
+          () => primaryWindow,
+          (url) => url === 'file:///app/index.html',
+        ),
+    });
+    harness.send('browser:host-renderer-ready', { sender: primaryContents, senderFrame: mainFrame });
+
+    await expect(
+      harness.invoke('browser:screenshot', { sender: primaryContents, senderFrame: mainFrame }, 'chat-1', {
+        tabId: 'tab-1',
+        mode: 'viewport',
+        exportToFile: true,
+      }),
+    ).rejects.toThrow(/document token/i);
+    expect(manager.screenshot).not.toHaveBeenCalled();
+
+    const request = {
+      tabId: 'tab-1',
+      mode: 'viewport' as const,
+      documentToken: 'tab-1:7:3:42',
+      exportToFile: true,
+    };
+    await expect(
+      harness.invoke('browser:screenshot', { sender: primaryContents, senderFrame: mainFrame }, 'chat-1', request),
+    ).resolves.toMatchObject({ tabId: 'tab-1', mode: 'viewport' });
+    expect(manager.screenshot).toHaveBeenCalledWith('chat-1', request);
   });
 });

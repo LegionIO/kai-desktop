@@ -61,8 +61,9 @@ function assistantVisibleTab(tab: BrowserTab): BrowserTab {
   // can provide arbitrarily large data URLs, while persistence errors can carry
   // local filesystem paths, so neither belongs in model-facing tool results.
   const identity = assistantVisiblePageIdentity(tab);
+  const { documentToken: _documentToken, ...visibleTab } = tab;
   return {
-    ...tab,
+    ...visibleTab,
     title: identity.title,
     url: identity.url,
     favicon: undefined,
