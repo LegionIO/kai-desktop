@@ -1340,6 +1340,53 @@ describe('BrowserPanel', () => {
     expect(screen.getByText('1/2')).toBeInTheDocument();
   });
 
+  it('ignores superseded find rejections from typed searches and Browser shortcuts', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const requests: Array<ReturnType<typeof deferred<void>>> = [];
+    const find = vi.fn(() => {
+      const request = deferred<void>();
+      requests.push(request);
+      return request.promise;
+    });
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        find,
+        stopFind: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText('Address and search bar');
+    fireEvent.keyDown(omnibox, { key: 'f', ctrlKey: true });
+    const findInput = await screen.findByPlaceholderText('Find in page');
+
+    fireEvent.change(findInput, { target: { value: 'first' } });
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(1));
+    fireEvent.change(findInput, { target: { value: 'second' } });
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(2));
+    await act(async () => requests[0]!.reject(new Error('Stale typed find failed')));
+    expect(screen.queryByText('Stale typed find failed')).not.toBeInTheDocument();
+    requests[1]!.resolve();
+
+    act(() => emit?.({ type: 'shortcut', conversationId: 'chat-1', action: 'find-next' }));
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(3));
+    act(() => emit?.({ type: 'shortcut', conversationId: 'chat-1', action: 'find-next' }));
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(4));
+    await act(async () => requests[2]!.reject(new Error('Stale shortcut find failed')));
+    expect(screen.queryByText('Stale shortcut find failed')).not.toBeInTheDocument();
+
+    await act(async () => requests[3]!.reject(new Error('Current shortcut find failed')));
+    expect(await screen.findByText('Current shortcut find failed')).toBeInTheDocument();
+  });
+
   it('dismisses browser, site, and tab menus outside the popover or with Escape', async () => {
     installAppBridgeStub({
       browser: {
@@ -1693,6 +1740,39 @@ describe('BrowserPanel', () => {
         visibleMountsBeforeLateDetach,
       ),
     );
+    expect(mount).toHaveBeenLastCalledWith('chat-1', expect.objectContaining({ width: expect.any(Number) }));
+  });
+
+  it('ignores an old same-bounds mount rejection after a replacement mount succeeds', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const firstVisibleMount = deferred<void>();
+    let visibleMounts = 0;
+    const mount = vi.fn((_conversationId: string, bounds: unknown) => {
+      if (bounds !== null && ++visibleMounts === 1) return firstVisibleMount.promise;
+      return Promise.resolve();
+    });
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    await waitFor(() => expect(visibleMounts).toBe(1));
+
+    act(() => emit?.({ type: 'profile-data-cleared', conversationId: 'chat-1', scopeKeys: ['global'] }));
+    await waitFor(() => expect(visibleMounts).toBeGreaterThanOrEqual(2));
+    await act(async () => firstVisibleMount.reject(new Error('Stale native mount failed')));
+
+    expect(screen.queryByText('Stale native mount failed')).not.toBeInTheDocument();
     expect(mount).toHaveBeenLastCalledWith('chat-1', expect.objectContaining({ width: expect.any(Number) }));
   });
 
@@ -2196,6 +2276,69 @@ describe('BrowserPanel', () => {
       emit?.({ type: 'tabs-changed', conversationId: 'chat-1', tabs: [] });
     });
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open a new tab' })).toHaveFocus());
+  });
+
+  it('does not publish or refocus a delayed close failure after newer focused tab work', async () => {
+    const pendingClose = deferred<void>();
+    const second = {
+      ...tab,
+      id: '00000000-0000-0000-0000-000000000002',
+      title: 'Second',
+      active: false,
+    };
+    const commandTab = vi.fn((_conversationId: string, _tabId: string, action: string) =>
+      action === 'close' ? pendingClose.promise : Promise.resolve(),
+    );
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab, second], activeTabId: tab.id }),
+        mount: async () => undefined,
+        commandTab,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const close = await screen.findByRole('button', { name: 'Close Example' });
+    const secondTab = screen.getByRole('tab', { name: 'Second' });
+    close.focus();
+    fireEvent.click(close);
+    secondTab.focus();
+    fireEvent.click(secondTab);
+
+    await act(async () => pendingClose.reject(new Error('Stale close failed')));
+
+    expect(screen.queryByText('Stale close failed')).not.toBeInTheDocument();
+    expect(secondTab).toHaveFocus();
+  });
+
+  it('reports a failed background close without refocusing the tab', async () => {
+    const pendingClose = deferred<void>();
+    const commandTab = vi.fn((_conversationId: string, _tabId: string, action: string) =>
+      action === 'close' ? pendingClose.promise : Promise.resolve(),
+    );
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        commandTab,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    const omnibox = await screen.findByLabelText('Address and search bar');
+    const close = screen.getByRole('button', { name: 'Close Example' });
+    fireEvent.focus(omnibox);
+    fireEvent.click(close);
+    await waitFor(() => expect(commandTab).toHaveBeenCalledWith('chat-1', tab.id, 'close'));
+
+    await act(async () => pendingClose.reject(new Error('Background close failed')));
+
+    expect(await screen.findByText(/Background close failed/)).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Example' })).not.toHaveFocus();
   });
 
   it('preserves cached favicons across lightweight tab updates and applies dedicated favicon events', async () => {

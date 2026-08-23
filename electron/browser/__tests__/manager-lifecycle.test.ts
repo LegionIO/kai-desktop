@@ -2480,6 +2480,60 @@ describe('browser manager renderer lifecycle', () => {
     expect(replaceBookmarks).not.toHaveBeenCalled();
   });
 
+  it.each(['import', 'export'] as const)(
+    'does not complete bookmark %s after its conversation is deleted while the picker is open',
+    async (operation) => {
+      const directory = mkdtempSync(join(tmpdir(), 'kai-deleted-bookmark-picker-'));
+      const importPath = join(directory, 'bookmarks.html');
+      const exportPath = join(directory, 'exported.html');
+      writeFileSync(importPath, '<DL><p><DT><A HREF="https://example.com">Example</A></DL>');
+      const importSelection = deferred<{ canceled: boolean; filePaths: string[] }>();
+      const exportSelection = deferred<{ canceled: boolean; filePath: string }>();
+      electronMocks.showOpenDialog.mockReturnValue(importSelection.promise);
+      electronMocks.showSaveDialog.mockReturnValue(exportSelection.promise);
+      const replaceBookmarks = vi.fn(() => 1);
+      const manager = managerWithoutConstructor({
+        appHome: directory,
+        assistantRuns: { endConversation: vi.fn(async () => undefined) },
+        chromeFocusConversationId: 'chat-1',
+        storeForScope: () => ({
+          listBookmarks: () => [
+            {
+              id: 'bookmark-1',
+              scopeKey: 'global',
+              title: 'Example',
+              url: 'https://example.com',
+              folder: '',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          replaceBookmarks,
+        }),
+        withScopeActivity: (_scopeKey: string, callback: () => Promise<unknown>) => callback(),
+      });
+
+      try {
+        const pending = operation === 'import' ? manager.importBookmarks('chat-1') : manager.exportBookmarks('chat-1');
+        await vi.waitFor(() =>
+          expect(
+            operation === 'import' ? electronMocks.showOpenDialog : electronMocks.showSaveDialog,
+          ).toHaveBeenCalledOnce(),
+        );
+        await manager.removeConversation('chat-1');
+        expect((Reflect.get(manager, 'panelAuthorityGenerations') as Map<string, number>).get('chat-1')).toBe(1);
+        if (operation === 'import') importSelection.resolve({ canceled: false, filePaths: [importPath] });
+        else exportSelection.resolve({ canceled: false, filePath: exportPath });
+
+        await expect(pending).resolves.toMatchObject({ canceled: true });
+        expect(replaceBookmarks).not.toHaveBeenCalled();
+        expect(existsSync(exportPath)).toBe(false);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('broadcasts global bookmark mutations to every known conversation', () => {
     const bookmark = {
       id: 'bookmark-1',
@@ -2824,6 +2878,88 @@ describe('browser manager renderer lifecycle', () => {
 
     await expect(exporting).resolves.toEqual({ canceled: true });
     expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not open a download-export dialog after its Browser panel generation changes', async () => {
+    const appHome = '/tmp/kai-browser-panel-changed-before-export';
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const startupRecovery = deferred<void>();
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([
+        [
+          downloadId,
+          {
+            id: downloadId,
+            tabId: 'tab-1',
+            filename: 'report.pdf',
+            receivedBytes: 15,
+            totalBytes: 15,
+            state: 'completed' as const,
+            quarantined: true,
+            path: source,
+            scopeKey: 'global',
+          },
+        ],
+      ]),
+      startupDownloadReconciliation: startupRecovery.promise,
+    });
+
+    const exporting = manager.exportDownload('chat-1', downloadId);
+    invokePrivate(manager, 'invalidatePanelAuthority', 'chat-1');
+    startupRecovery.resolve();
+
+    await expect(exporting).resolves.toEqual({ canceled: true });
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
+  });
+
+  it('cancels download export when its Browser panel generation changes while the dialog is open', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-panel-changed-during-export-'));
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const directory = assistantDownloadQuarantineDirectory(appHome, 'global');
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const destination = join(appHome, 'must-not-export.pdf');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(source, 'protected contents');
+    const selected = deferred<{ canceled: boolean; filePath?: string }>();
+    electronMocks.showSaveDialog.mockReturnValue(selected.promise);
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([
+        [
+          downloadId,
+          {
+            id: downloadId,
+            tabId: 'tab-1',
+            filename: 'report.pdf',
+            receivedBytes: 15,
+            totalBytes: 15,
+            state: 'completed' as const,
+            quarantined: true,
+            path: source,
+            scopeKey: 'global',
+          },
+        ],
+      ]),
+    });
+
+    try {
+      const exporting = manager.exportDownload('chat-1', downloadId);
+      await vi.waitFor(() => expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce());
+      invokePrivate(manager, 'invalidatePanelAuthority', 'chat-1');
+      selected.resolve({ canceled: false, filePath: destination });
+
+      await expect(exporting).resolves.toEqual({ canceled: true });
+      expect(existsSync(destination)).toBe(false);
+      expect(Reflect.get(manager, 'downloadExportLeases')).toHaveLength(0);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
   });
 
   it('leases a quarantined download before showing the export dialog so quota pruning cannot remove it', async () => {

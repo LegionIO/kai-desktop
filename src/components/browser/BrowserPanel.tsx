@@ -490,7 +490,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const tabButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const emptyNewTabButtonRef = useRef<HTMLButtonElement>(null);
-  const pendingClosedTabFocusRef = useRef<{ closedTabId: string; preferredTabIds: string[] } | null>(null);
+  const pendingClosedTabFocusRef = useRef<{
+    closedTabId: string;
+    preferredTabIds: string[];
+    conversationId: string;
+    requestId: number;
+    focusGeneration: number;
+  } | null>(null);
   const suggestionRequestRef = useRef(0);
   const navigationRequestRef = useRef(0);
   const browserMenuPreviewRequestRef = useRef(0);
@@ -522,7 +528,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const conversationIdRef = useRef(conversationId);
   const lastNativeMountRef = useRef<string | null | undefined>(undefined);
   const nativeMountPromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const nativeMountRequestRef = useRef(0);
   const refreshNativeMountRef = useRef<() => Promise<void>>(async () => {
+    nativeMountRequestRef.current++;
     lastNativeMountRef.current = undefined;
   });
   const activeTabIdRef = useRef<string | null>(null);
@@ -530,6 +538,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const findTabIdRef = useRef<string | null>(null);
   const findRequestRef = useRef(0);
   const activeFindRequestRef = useRef<{ tabId: string; requestId: number } | null>(null);
+  const browserChromeFocusGenerationRef = useRef(0);
   const zoomTargetsRef = useRef(new Map<string, number>());
   const panelDomId = useId();
   const suggestionListId = `${panelDomId}-omnibox-suggestions`;
@@ -539,6 +548,20 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const reportError = useCallback((reason: unknown) => {
     setError(reason instanceof Error ? reason.message : String(reason));
   }, []);
+  const reportFindError = useCallback(
+    (reason: unknown, requestedConversationId: string, tabId: string, requestId: number) => {
+      const activeRequest = activeFindRequestRef.current;
+      if (
+        conversationIdRef.current !== requestedConversationId ||
+        activeRequest?.tabId !== tabId ||
+        activeRequest.requestId !== requestId
+      ) {
+        return;
+      }
+      setError(reason instanceof Error ? reason.message : String(reason));
+    },
+    [],
+  );
   const focusOmnibox = useCallback(() => {
     requestAnimationFrame(() => {
       urlRef.current?.focus();
@@ -1102,11 +1125,12 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
           const selected = activeTabIdRef.current;
           const text = findTextRef.current;
           if (selected && text) {
+            const requestedConversationId = conversationId;
             const requestId = ++findRequestRef.current;
             activeFindRequestRef.current = { tabId: selected, requestId };
             void browser
               .find(conversationId, selected, text, current, true, requestId)
-              .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+              .catch((reason) => reportFindError(reason, requestedConversationId, selected, requestId));
           }
         }
       } else if (event.type === 'action') {
@@ -1229,7 +1253,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       suggestionRequestRef.current++;
       unsubscribe();
     };
-  }, [browser, conversationId, focusOmnibox, openFind, refreshBookmarks, refreshState, reportError]);
+  }, [browser, conversationId, focusOmnibox, openFind, refreshBookmarks, refreshState, reportError, reportFindError]);
 
   useEffect(() => {
     if (active && !urlFocused) setUrlDraft(active.url === 'about:blank' ? '' : active.url);
@@ -1288,13 +1312,20 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         : null;
       if (lastNativeMountRef.current === signature) return;
       lastNativeMountRef.current = signature;
+      const request = ++nativeMountRequestRef.current;
       const mountPromise = browser.mount(conversationId, bounds);
       // Keep the original promise so screenshot and element-picker commands
       // fail closed when the native page could not be remounted. The detached
       // UI error handler is observed separately and must not turn that rejected
       // mount into an apparently successful one.
       void mountPromise.catch((reason) => {
-        if (lastNativeMountRef.current !== signature) return;
+        if (
+          nativeMountRequestRef.current !== request ||
+          nativeMountPromiseRef.current !== mountPromise ||
+          lastNativeMountRef.current !== signature
+        ) {
+          return;
+        }
         // Let a later resize or visibility change retry the same bounds instead
         // of permanently caching a failed native mount.
         lastNativeMountRef.current = undefined;
@@ -1329,6 +1360,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       });
     };
     const refreshNativeMount = async (): Promise<void> => {
+      // Invalidate a pending same-geometry request before forcing its
+      // replacement. A late rejection from the old promise must not poison the
+      // replacement mount's cache or Browser chrome.
+      nativeMountRequestRef.current++;
       lastNativeMountRef.current = undefined;
       report();
       // report() publishes bounds in its animation-frame callback. Wait for that
@@ -1492,9 +1527,11 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       document.fonts?.removeEventListener('loadingdone', refreshCandidatesAndReport);
       if (refreshNativeMountRef.current === refreshNativeMount) {
         refreshNativeMountRef.current = async () => {
+          nativeMountRequestRef.current++;
           lastNativeMountRef.current = undefined;
         };
       }
+      nativeMountRequestRef.current++;
       lastNativeMountRef.current = undefined;
       void browser.mount(conversationId, null).catch(() => undefined);
     };
@@ -1541,6 +1578,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const closeTab = useCallback(
     (tab: BrowserTab, restoreFocus: boolean) => {
       if (!browser || !conversationId) return;
+      const requestedConversationId = conversationId;
+      const request = ++navigationRequestRef.current;
+      const focusGeneration = browserChromeFocusGenerationRef.current;
+      pendingClosedTabFocusRef.current = null;
       if (restoreFocus) {
         const tabs = stateRef.current?.tabs ?? [];
         const index = tabs.findIndex((candidate) => candidate.id === tab.id);
@@ -1549,13 +1590,38 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
           preferredTabIds: [tabs[index + 1]?.id, tabs[index - 1]?.id].filter(
             (tabId): tabId is string => typeof tabId === 'string',
           ),
+          conversationId: requestedConversationId,
+          requestId: request,
+          focusGeneration,
         };
       }
       setError(null);
       void browser.commandTab(conversationId, tab.id, 'close').catch((reason) => {
-        if (pendingClosedTabFocusRef.current?.closedTabId === tab.id) pendingClosedTabFocusRef.current = null;
+        if (
+          request !== navigationRequestRef.current ||
+          conversationIdRef.current !== requestedConversationId ||
+          !stateRef.current?.tabs.some((candidate) => candidate.id === tab.id)
+        ) {
+          return;
+        }
+        if (
+          pendingClosedTabFocusRef.current?.closedTabId === tab.id &&
+          pendingClosedTabFocusRef.current.requestId === request
+        ) {
+          pendingClosedTabFocusRef.current = null;
+        }
+        if (restoreFocus && browserChromeFocusGenerationRef.current !== focusGeneration) return;
         setError(String(reason));
-        requestAnimationFrame(() => tabButtonRefs.current.get(tab.id)?.focus());
+        if (!restoreFocus) return;
+        requestAnimationFrame(() => {
+          if (
+            request === navigationRequestRef.current &&
+            conversationIdRef.current === requestedConversationId &&
+            browserChromeFocusGenerationRef.current === focusGeneration
+          ) {
+            tabButtonRefs.current.get(tab.id)?.focus();
+          }
+        });
       });
     },
     [browser, conversationId],
@@ -1580,6 +1646,13 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     const pending = pendingClosedTabFocusRef.current;
     if (!pending || !state || state.tabs.some((tab) => tab.id === pending.closedTabId)) return;
     pendingClosedTabFocusRef.current = null;
+    if (
+      pending.requestId !== navigationRequestRef.current ||
+      pending.conversationId !== conversationIdRef.current ||
+      pending.focusGeneration !== browserChromeFocusGenerationRef.current
+    ) {
+      return;
+    }
     const adjacent = pending.preferredTabIds
       .map((tabId) => tabButtonRefs.current.get(tabId))
       .find((button): button is HTMLButtonElement => !!button);
@@ -1688,6 +1761,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
 
   const runFind = (forward: boolean, findNext: boolean, text = findText) => {
     if (browser && conversationId && active) {
+      const requestedConversationId = conversationId;
       const previousFindTabId = findTabIdRef.current;
       if (previousFindTabId && previousFindTabId !== active.id) {
         void browser.stopFind(conversationId, previousFindTabId).catch(reportError);
@@ -1697,7 +1771,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       activeFindRequestRef.current = { tabId: active.id, requestId };
       void browser
         .find(conversationId, active.id, text, forward, findNext, requestId)
-        .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+        .catch((reason) => reportFindError(reason, requestedConversationId, active.id, requestId));
     }
   };
 
@@ -1885,10 +1959,14 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       data-kai-browser-panel
       className="relative flex h-full min-h-0 flex-col bg-background text-foreground"
       onClick={() => setTabMenu(null)}
-      onFocusCapture={() => void browser.setChromeFocus(conversationId, true).catch(() => undefined)}
+      onFocusCapture={() => {
+        browserChromeFocusGenerationRef.current++;
+        void browser.setChromeFocus(conversationId, true).catch(() => undefined);
+      }}
       onBlurCapture={(event) => {
         const next = event.relatedTarget;
         if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
+          browserChromeFocusGenerationRef.current++;
           void browser.setChromeFocus(conversationId, false).catch(() => undefined);
         }
       }}

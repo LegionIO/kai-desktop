@@ -5217,6 +5217,7 @@ export class BrowserManager {
 
   private hasBrowserChromeNativeDialogAuthority(conversationId: string, panelAuthorityGeneration: number): boolean {
     return (
+      !this.removedConversations.has(conversationId) &&
       panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId) &&
       this.chromeFocusConversationId === conversationId &&
       this.isHostWindowInteractive()
@@ -5233,7 +5234,10 @@ export class BrowserManager {
     panelAuthorityGeneration: number,
   ): boolean {
     return (
-      !this.disposed && !this.shuttingDown && panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId)
+      !this.disposed &&
+      !this.shuttingDown &&
+      !this.removedConversations.has(conversationId) &&
+      panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId)
     );
   }
 
@@ -15714,6 +15718,7 @@ export class BrowserManager {
 
   async exportDownload(conversationId: string, downloadId: string): Promise<{ canceled?: boolean; filePath?: string }> {
     const scopeKey = this.scopeKey(conversationId);
+    const nativeDialogPanelGeneration = this.panelAuthorityGeneration(conversationId);
     return this.withScopeActivity(scopeKey, async () => {
       // Startup reconciliation owns every crash-left export journal until it
       // completes. Do not let a fresh export race that recovery pass.
@@ -15737,7 +15742,7 @@ export class BrowserManager {
       // manager deliberately detaches the page WebContentsView, so its focused
       // Browser chrome -- not mounted page bounds -- is the authority signal.
       this.assertHostRendererOperationCurrent();
-      if (!this.isHostWindowInteractive() || this.chromeFocusConversationId !== conversationId) {
+      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
         return { canceled: true };
       }
       // The save dialog can remain open while another download completes and
@@ -15754,6 +15759,9 @@ export class BrowserManager {
         const selected =
           win && !win.isDestroyed() ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
         this.assertHostRendererOperationCurrent();
+        if (!this.hasBrowserChromeNativeDialogCompletionAuthority(conversationId, nativeDialogPanelGeneration)) {
+          return { canceled: true };
+        }
         this.assertScopeAvailable(scopeKey);
         if (selected.canceled || !selected.filePath) return { canceled: true };
         await exportAssistantDownloadFile(this.appHome, download.path, selected.filePath);
@@ -17021,7 +17029,10 @@ export class BrowserManager {
     // terminal empty state before the deleted conversation becomes unreachable.
     this.emitTabs(conversationId);
     await Promise.all([runsEnded, continuationCleanup, downloadCleanup]);
-    this.panelAuthorityGenerations.delete(conversationId);
+    // Conversation ids are immutable and their tombstones already live for
+    // this manager lifetime. Retain the final authority generation alongside
+    // that tombstone so a delayed generation-zero native dialog can never pass
+    // an ABA comparison after deletion.
     this.panelLayoutGenerations.delete(conversationId);
     this.panelStateWaiters.delete(conversationId);
     // A chat-scoped profile may exist even if the user later switched the
