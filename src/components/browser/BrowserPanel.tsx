@@ -1866,7 +1866,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       let selector: string | undefined;
       let documentToken = requestedDocumentToken;
       if (mode === 'element') {
-        const picked = await browser.pickElement(requestedConversationId, requestedTabId);
+        const picked = await browser.pickElement(requestedConversationId, requestedTabId, requestedDocumentToken);
         if (!isCurrent()) return;
         if (picked.documentToken !== requestedDocumentToken) {
           throw new Error('The browser page changed while selecting the screenshot component. Try again.');

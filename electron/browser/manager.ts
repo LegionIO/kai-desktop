@@ -577,6 +577,11 @@ type InternalTab = {
   partition: string;
   scopeKey: string;
   generation: number;
+  /** Monotonic identity for committed main-frame documents. Navigation-start
+   * generation changes fence the departing document immediately, while this
+   * epoch also invalidates work admitted during a provisional same-URL load
+   * when its replacement document commits. */
+  documentEpoch: number;
   lastUsedAt: number;
   assistantOwnerId: string | null;
   aiNetworkRestricted: boolean;
@@ -929,6 +934,7 @@ type AssistantDocumentLease = {
   runGeneration: number;
   hostRendererAuthorityGeneration: number;
   tabGeneration: number;
+  documentEpoch: number;
   userNavigationLease: number;
   url: string;
   /** Set only after an operation has proved that its page is mounted in the
@@ -974,6 +980,7 @@ type BrowserLocatedTarget = {
 type BrowserPageLease = {
   tabId: string;
   tabGeneration: number;
+  documentEpoch: number;
   userNavigationLease: number;
   contents: WebContents;
 };
@@ -981,6 +988,7 @@ type BrowserPageLease = {
 type BrowserContextMenuDownloadAuthority = {
   tabId: string;
   tabGeneration: number;
+  documentEpoch: number;
   userNavigationLease: number;
   panelAuthorityGeneration: number;
   contents: WebContents;
@@ -1007,6 +1015,8 @@ type HostRendererOperationLease = {
 export type BrowserDocumentApproval = {
   tabId: string;
   tabGeneration: number;
+  /** Main-process-only committed-document identity. */
+  documentEpoch: number;
   origin: string;
   /** Exact internal URL identity. Kept out of approval events so query tokens
    * are not persisted, but used to invalidate same-document SPA navigation. */
@@ -1032,8 +1042,10 @@ type BrowserApprovalRendererResetLease = {
   url: string;
   userNavigationLease: number;
   sourceGeneration: number;
+  sourceDocumentEpoch: number;
   sourceContents: WebContents | null;
   preparedGeneration?: number;
+  preparedDocumentEpoch?: number;
   replacementContents?: WebContents;
 };
 
@@ -1072,6 +1084,7 @@ export type BrowserTabsApproval = {
   conversationId: string;
   tabId?: string;
   tabGeneration?: number;
+  documentEpoch?: number;
   origin?: string;
   url?: string;
   tabRef?: object;
@@ -1092,6 +1105,7 @@ export type BrowserTabsReadApproval = {
   tabOrder: string[];
   tabRefs: object[];
   tabGenerations: number[];
+  documentEpochs: number[];
   tabUrls: string[];
   userNavigationLeases: number[];
 };
@@ -1159,6 +1173,7 @@ type PendingPermission = {
   conversationId: string;
   scopeKey: string;
   tabGeneration: number;
+  documentEpoch: number;
   origin: string;
   permission: string;
   target?: string;
@@ -1173,6 +1188,7 @@ type PendingAuth = {
   conversationId: string;
   scopeKey: string;
   tabGeneration: number;
+  documentEpoch: number;
   /** Present only when the challenge belongs to the exact main-frame request
    * claimed by an explicit user navigation through an AI-restricted tab. */
   trustedUserNavigationLease?: number;
@@ -3961,6 +3977,7 @@ export class BrowserManager {
     if (
       this.tabs.get(tab.shell.id) !== tab ||
       tab.generation !== lease.tabGeneration ||
+      this.currentDocumentEpoch(tab) !== (lease.documentEpoch ?? 0) ||
       tab.trustedUserNavigationLease !== lease.userNavigationLease ||
       tab.shell.url !== lease.url
     ) {
@@ -3991,6 +4008,7 @@ export class BrowserManager {
       !capturedIdentityMatches ||
       !capturedNavigationLeaseMatches ||
       !generationMatches ||
+      this.currentDocumentEpoch(tab) !== approval.documentEpoch ||
       normalizedOrigin(tab.shell.url) !== approval.origin ||
       (approval.url !== undefined && tab.shell.url !== approval.url)
     ) {
@@ -4005,6 +4023,7 @@ export class BrowserManager {
       !approval ||
       typeof approval.tabId !== 'string' ||
       typeof approval.tabGeneration !== 'number' ||
+      typeof approval.documentEpoch !== 'number' ||
       typeof approval.origin !== 'string'
     ) {
       return undefined;
@@ -4038,6 +4057,7 @@ export class BrowserManager {
       url: documentApproval.url ?? tab.shell.url,
       userNavigationLease: documentApproval.userNavigationLease ?? tab.trustedUserNavigationLease,
       sourceGeneration: tab.generation,
+      sourceDocumentEpoch: this.currentDocumentEpoch(tab),
       sourceContents,
     };
     this.approvalRendererResetLeases ??= new WeakMap<object, BrowserApprovalRendererResetLease>();
@@ -4060,6 +4080,7 @@ export class BrowserManager {
       lease.tab === tab &&
       this.tabs.get(tab.shell.id) === tab &&
       tab.generation === expectedGeneration &&
+      this.currentDocumentEpoch(tab) === lease.sourceDocumentEpoch &&
       tab.trustedUserNavigationLease === lease.userNavigationLease &&
       tab.shell.url === lease.url &&
       normalizedOrigin(tab.shell.url) === lease.origin &&
@@ -4069,8 +4090,10 @@ export class BrowserManager {
       throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
     }
     approval.tabGeneration = tab.generation;
+    approval.documentEpoch = this.currentDocumentEpoch(tab);
     approval.allowInternalRestore = true;
     lease.preparedGeneration = tab.generation;
+    lease.preparedDocumentEpoch = this.currentDocumentEpoch(tab);
   }
 
   /** A discarded tab restore advances generation from did-start-navigation,
@@ -4096,6 +4119,7 @@ export class BrowserManager {
       expectedGeneration !== undefined &&
       expectedGeneration >= lease.preparedGeneration &&
       tab.generation === expectedGeneration &&
+      this.currentDocumentEpoch(tab) >= lease.sourceDocumentEpoch &&
       tab.view === view &&
       !view.webContents.isDestroyed() &&
       view.webContents !== lease.sourceContents &&
@@ -4108,6 +4132,7 @@ export class BrowserManager {
       throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
     }
     lease.preparedGeneration = tab.generation;
+    lease.preparedDocumentEpoch = this.currentDocumentEpoch(tab);
     lease.replacementContents = view.webContents;
   }
 
@@ -4130,6 +4155,8 @@ export class BrowserManager {
       lease.runId === run.id &&
       this.tabs.get(tab.shell.id) === tab &&
       tab.generation === lease.preparedGeneration &&
+      lease.preparedDocumentEpoch !== undefined &&
+      this.currentDocumentEpoch(tab) === lease.preparedDocumentEpoch &&
       tab.view === view &&
       !view.webContents.isDestroyed() &&
       view.webContents !== lease.sourceContents &&
@@ -4143,6 +4170,7 @@ export class BrowserManager {
       throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
     }
     approval.tabGeneration = tab.generation;
+    approval.documentEpoch = this.currentDocumentEpoch(tab);
     approval.allowInternalRestore = false;
   }
 
@@ -4154,6 +4182,7 @@ export class BrowserManager {
     return {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: this.currentDocumentEpoch(tab),
       userNavigationLease: tab.trustedUserNavigationLease,
       contents,
     };
@@ -4165,6 +4194,7 @@ export class BrowserManager {
       tab.view?.webContents === lease.contents &&
       !lease.contents.isDestroyed() &&
       tab.generation === lease.tabGeneration &&
+      this.currentDocumentEpoch(tab) === (lease.documentEpoch ?? 0) &&
       tab.trustedUserNavigationLease === lease.userNavigationLease
     );
   }
@@ -4198,6 +4228,7 @@ export class BrowserManager {
     authority = {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: this.currentDocumentEpoch(tab),
       userNavigationLease: tab.trustedUserNavigationLease,
       panelAuthorityGeneration: this.panelAuthorityGeneration(tab.shell.conversationId),
       contents,
@@ -4219,6 +4250,7 @@ export class BrowserManager {
     const documentStillMatches =
       authority.tabId === tab.shell.id &&
       authority.tabGeneration === tab.generation &&
+      (authority.documentEpoch ?? 0) === this.currentDocumentEpoch(tab) &&
       authority.userNavigationLease === tab.trustedUserNavigationLease &&
       authority.contents === contents &&
       this.tabs.get(tab.shell.id) === tab &&
@@ -4236,13 +4268,24 @@ export class BrowserManager {
   }
 
   private browserPageLeaseToken(lease: BrowserPageLease): string {
-    return [lease.tabId, lease.tabGeneration, lease.userNavigationLease, lease.contents.id].join(':');
+    return [
+      lease.tabId,
+      lease.tabGeneration,
+      lease.documentEpoch ?? 0,
+      lease.userNavigationLease,
+      lease.contents.id,
+    ].join(':');
   }
 
   private browserMenuPreviewIdentity(tab: InternalTab): string {
-    return [tab.shell.id, tab.generation, tab.trustedUserNavigationLease, tab.shell.url, tab.shell.updatedAt].join(
-      '\u0000',
-    );
+    return [
+      tab.shell.id,
+      tab.generation,
+      this.currentDocumentEpoch(tab),
+      tab.trustedUserNavigationLease,
+      tab.shell.url,
+      tab.shell.updatedAt,
+    ].join('\u0000');
   }
 
   private assertBrowserMenuPreviewIdentity(tab: InternalTab, identity: string): void {
@@ -4941,7 +4984,8 @@ export class BrowserManager {
       contents.isDestroyed() ||
       this.tabs.get(tab.shell.id) !== tab ||
       tab.view?.webContents !== contents ||
-      tab.generation !== documentLease.tabGeneration
+      tab.generation !== documentLease.tabGeneration ||
+      this.currentDocumentEpoch(tab) !== (documentLease.documentEpoch ?? 0)
     )
       return;
     try {
@@ -5166,6 +5210,17 @@ export class BrowserManager {
     }, TRUSTED_USER_NAVIGATION_AUTHORITY_MS);
     tab.trustedUserNavigationTimer.unref?.();
     return lease;
+  }
+
+  /** Some focused tests use deliberately partial tab fixtures. Treat their
+   * absent epoch as the pre-navigation document while production tabs always
+   * initialize this field explicitly. */
+  private currentDocumentEpoch(tab: InternalTab): number {
+    return Number.isSafeInteger(tab.documentEpoch) && tab.documentEpoch >= 0 ? tab.documentEpoch : 0;
+  }
+
+  private advanceCommittedDocumentEpoch(tab: InternalTab): void {
+    tab.documentEpoch = this.currentDocumentEpoch(tab) + 1;
   }
 
   private clearTrustedUserNavigation(tab: InternalTab, lease?: number): boolean {
@@ -6273,6 +6328,7 @@ export class BrowserManager {
     return {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: this.currentDocumentEpoch(tab),
       origin: normalizedOrigin(tab.shell.url),
       url: tab.shell.url,
       tabRef: tab,
@@ -6294,6 +6350,7 @@ export class BrowserManager {
       tabOrder,
       tabRefs: exactTabs,
       tabGenerations: exactTabs.map((tab) => tab.generation),
+      documentEpochs: exactTabs.map((tab) => this.currentDocumentEpoch(tab)),
       tabUrls: exactTabs.map((tab) => tab.shell.url),
       userNavigationLeases: exactTabs.map((tab) => tab.trustedUserNavigationLease),
     };
@@ -6310,6 +6367,7 @@ export class BrowserManager {
           id === approval.tabOrder[index] &&
           this.tabs.get(id) === approval.tabRefs[index] &&
           this.tabs.get(id)?.generation === approval.tabGenerations[index] &&
+          this.currentDocumentEpoch(this.tabs.get(id)!) === approval.documentEpochs[index] &&
           this.tabs.get(id)?.shell.url === approval.tabUrls[index] &&
           this.tabs.get(id)?.trustedUserNavigationLease === approval.userNavigationLeases[index],
       );
@@ -6347,6 +6405,7 @@ export class BrowserManager {
       approval = {
         tabId: tab.shell.id,
         tabGeneration: tab.generation,
+        documentEpoch: this.currentDocumentEpoch(tab),
         origin: normalizedOrigin(tab.shell.url),
         url: tab.shell.url,
         tabRef: tab,
@@ -6426,6 +6485,7 @@ export class BrowserManager {
     if (
       typeof approval.tabId !== 'string' ||
       typeof approval.tabGeneration !== 'number' ||
+      typeof approval.documentEpoch !== 'number' ||
       typeof approval.origin !== 'string'
     ) {
       throw new Error('The approved browser tab target is no longer available.');
@@ -6433,6 +6493,7 @@ export class BrowserManager {
     this.assertBrowserDocumentApproval(tab, {
       tabId: approval.tabId,
       tabGeneration: approval.tabGeneration,
+      documentEpoch: approval.documentEpoch,
       origin: approval.origin,
       ...(approval.url !== undefined ? { url: approval.url } : {}),
       ...(approval.tabRef !== undefined ? { tabRef: approval.tabRef } : {}),
@@ -6567,6 +6628,7 @@ export class BrowserManager {
             partition,
             scopeKey,
             generation: 0,
+            documentEpoch: 0,
             lastUsedAt: Date.now(),
             assistantOwnerId: owner === 'assistant' ? assistantRun!.id : null,
             aiNetworkRestricted: shell.owner === 'assistant',
@@ -7764,6 +7826,7 @@ export class BrowserManager {
       runGeneration: generation,
       hostRendererAuthorityGeneration: this.hostRendererAuthorityGeneration,
       tabGeneration: tab.generation,
+      documentEpoch: this.currentDocumentEpoch(tab),
       userNavigationLease: tab.trustedUserNavigationLease,
       url: tab.shell.url,
     };
@@ -8044,6 +8107,7 @@ export class BrowserManager {
       return {
         ...documentLease,
         tabGeneration: tab.generation,
+        documentEpoch: this.currentDocumentEpoch(tab),
         userNavigationLease: tab.trustedUserNavigationLease,
         url: tab.shell.url,
       };
@@ -9175,6 +9239,7 @@ export class BrowserManager {
       partition: opener.partition,
       scopeKey: opener.scopeKey,
       generation: 0,
+      documentEpoch: 0,
       lastUsedAt: Date.now(),
       assistantOwnerId,
       aiNetworkRestricted: popupAiNetworkRestricted,
@@ -9280,7 +9345,13 @@ export class BrowserManager {
     };
   }
 
-  private destroyView(tab: InternalTab): void {
+  private destroyView(tab: InternalTab, preserveTrustedUserNavigation = false): void {
+    // Trusted-navigation authority belongs to one live renderer/request chain.
+    // Intentional teardown nulls tab.view before Electron's destroyed event, so
+    // revoke it here as the common lifecycle boundary. The sole exception is
+    // resetScriptedRendererForUser(), which creates a replacement specifically
+    // to carry the user's already-authorized navigation.
+    if (!preserveTrustedUserNavigation) this.clearTrustedUserNavigation(tab);
     const view = tab.view;
     if (view) {
       this.rejectMenuPreviewForContents(
@@ -9498,6 +9569,11 @@ export class BrowserManager {
     });
     contents.on('did-navigate', (_event, url) => {
       if (!ownsContents()) return;
+      // did-start-navigation revokes capabilities held by the departing page,
+      // but work can be admitted while Chromium is still loading. Rotate a
+      // second identity at commit so provisional same-URL work cannot cross
+      // into the replacement document.
+      this.advanceCommittedDocumentEpoch(tab);
       this.commitBrowserNetworkNavigation(tab);
       // Only a committed new document clears password-sensitive state. Starting
       // a navigation is insufficient: it can fail or be cancelled while the old
@@ -9583,6 +9659,7 @@ export class BrowserManager {
       }
       // A terminal navigation failure represents the attempted replacement
       // (typically Chromium's error document), not the departed page.
+      this.advanceCommittedDocumentEpoch(tab);
       this.commitBrowserNetworkNavigation(tab);
       tab.shell.loading = false;
       tab.shell.error = `${errorDescription} (${errorCode})`;
@@ -10865,6 +10942,7 @@ export class BrowserManager {
         conversationId: tab.shell.conversationId,
         scopeKey: tab.scopeKey,
         tabGeneration: tab.generation,
+        documentEpoch: this.currentDocumentEpoch(tab),
         origin,
         permission: permissionDescription,
         ...(target ? { target } : {}),
@@ -12042,6 +12120,7 @@ export class BrowserManager {
       conversationId: tab.shell.conversationId,
       scopeKey: tab.scopeKey,
       tabGeneration: tab.generation,
+      documentEpoch: this.currentDocumentEpoch(tab),
       ...(trustedUserNavigationAuth
         ? {
             trustedUserNavigationLease: tab.trustedUserNavigationLease,
@@ -13746,6 +13825,7 @@ export class BrowserManager {
     if (abortSignal?.aborted) throw new Error(`${operation} was cancelled.`);
     if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
     const targetGeneration = tab.generation;
+    const targetDocumentEpoch = this.currentDocumentEpoch(tab);
     const targetUserNavigationLease = tab.trustedUserNavigationLease;
     const targetDocumentIsCurrent = (): boolean =>
       this.tabs.get(tab.shell.id) === tab &&
@@ -13753,7 +13833,9 @@ export class BrowserManager {
       !contents.isDestroyed() &&
       (cancellationDocumentIsCurrent
         ? cancellationDocumentIsCurrent()
-        : tab.generation === targetGeneration && tab.trustedUserNavigationLease === targetUserNavigationLease);
+        : tab.generation === targetGeneration &&
+          this.currentDocumentEpoch(tab) === targetDocumentEpoch &&
+          tab.trustedUserNavigationLease === targetUserNavigationLease);
     let cancellation: 'timeout' | 'abort' | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortListener: (() => void) | undefined;
@@ -13910,7 +13992,7 @@ export class BrowserManager {
     tab.assistantDialogsDisabledRunId = null;
     tab.assistantDownloadAttribution = undefined;
     tab.generation++;
-    this.destroyView(tab);
+    this.destroyView(tab, true);
     tab.shell.discarded = true;
     tab.shell.sensitive = false;
     return true;
@@ -14925,6 +15007,9 @@ export class BrowserManager {
       );
       this.assertHostRendererOperationCurrent();
       this.assertBrowserPageLease(tab, exportPageLease, 'screenshot export selection');
+      if (request.documentToken && request.documentToken !== this.browserPageLeaseToken(exportPageLease)) {
+        throw new Error('The browser page changed before the screenshot export dialog opened. Try again.');
+      }
       const exportContents = tab.view?.webContents;
       if (!exportContents || !this.hasBrowserNativeDialogAuthority(tab, exportContents, nativeDialogPanelGeneration)) {
         return true;
@@ -15247,13 +15332,16 @@ export class BrowserManager {
     return this.screenshotQueue.run(operation);
   }
 
-  async pickElement(conversationId: string, tabId: string): Promise<BrowserElementPickResult> {
+  async pickElement(conversationId: string, tabId: string, documentToken: string): Promise<BrowserElementPickResult> {
     const tab = this.requireTab(conversationId, tabId);
     return this.runTabOperation(tab, async () => {
       const contents = (await this.ensureView(tab)).webContents;
       const pageLease = this.captureBrowserPageLease(tab, contents);
       const assertPageCurrent = (): void => this.assertBrowserPageLease(tab, pageLease, 'element picking');
       assertPageCurrent();
+      if (documentToken !== this.browserPageLeaseToken(pageLease)) {
+        throw new Error('The browser page changed before element picking could start. Try again.');
+      }
       await this.assertTabNotSensitive(tab, contents, 'Element picking');
       assertPageCurrent();
       const pickedValue = await new Promise<string>((resolve, reject) => {
@@ -16133,6 +16221,7 @@ export class BrowserManager {
     if (
       !tab ||
       tab.generation !== pending.tabGeneration ||
+      this.currentDocumentEpoch(tab) !== (pending.documentEpoch ?? 0) ||
       tab.scopeKey !== pending.scopeKey ||
       tab.shell.conversationId !== pending.conversationId ||
       (pending.trustedUserNavigationLease !== undefined &&
@@ -16178,6 +16267,7 @@ export class BrowserManager {
     if (
       !tab ||
       tab.generation !== pending.tabGeneration ||
+      this.currentDocumentEpoch(tab) !== (pending.documentEpoch ?? 0) ||
       tab.scopeKey !== pending.scopeKey ||
       tab.shell.conversationId !== pending.conversationId
     ) {

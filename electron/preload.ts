@@ -1105,8 +1105,8 @@ const appAPI = {
     cancelMenuPreview: (requestId: string) => ipcRenderer.invoke('browser:cancel-menu-preview', requestId),
     screenshot: (conversationId: string, request: BrowserScreenshotRequest) =>
       ipcRenderer.invoke('browser:screenshot', conversationId, request),
-    pickElement: (conversationId: string, tabId: string) =>
-      ipcRenderer.invoke('browser:pick-element', conversationId, tabId),
+    pickElement: (conversationId: string, tabId: string, documentToken: string) =>
+      ipcRenderer.invoke('browser:pick-element', conversationId, tabId, documentToken),
     listHistory: (conversationId: string, query?: string) =>
       ipcRenderer.invoke('browser:list-history', conversationId, query),
     clearHistory: (conversationId: string) => ipcRenderer.invoke('browser:clear-history', conversationId),

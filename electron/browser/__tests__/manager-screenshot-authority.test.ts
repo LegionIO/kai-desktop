@@ -47,7 +47,7 @@ function screenshotManager(options?: {
   revokePanelAfterCapture?: boolean;
   navigateAfterCapture?: boolean;
 }) {
-  const contents = { isDestroyed: () => false };
+  const contents = { id: 42, isDestroyed: () => false };
   const tab = {
     shell: {
       id: 'tab-1',
@@ -58,6 +58,7 @@ function screenshotManager(options?: {
     },
     scopeKey: 'global',
     generation: 4,
+    documentEpoch: 2,
     trustedUserNavigationLease: 2,
     assistantOwnerId: null,
     aiControlOwnerId: 'run-1',
@@ -70,6 +71,7 @@ function screenshotManager(options?: {
     runGeneration: 7,
     hostRendererAuthorityGeneration: 3,
     tabGeneration: 4,
+    documentEpoch: 2,
     userNavigationLease: 2,
     url: 'https://example.com',
   };
@@ -101,12 +103,24 @@ function screenshotManager(options?: {
     runningActions: new Map(),
     screenshotQueue: new BrowserActionQueue(),
     visibleAssistantQueue: new BrowserActionQueue(),
-    assertBrowserPageLease: vi.fn((_tab: unknown, pageLease: { generation: number }) => {
-      if (pageLease.generation !== tab.generation) {
-        throw new Error('The browser page changed while this screenshot was in progress.');
-      }
-    }),
-    captureBrowserPageLease: vi.fn(() => ({ tabId: tab.shell.id, generation: tab.generation })),
+    assertBrowserPageLease: vi.fn(
+      (_tab: unknown, pageLease: { tabGeneration: number; documentEpoch: number; userNavigationLease: number }) => {
+        if (
+          pageLease.tabGeneration !== tab.generation ||
+          pageLease.documentEpoch !== tab.documentEpoch ||
+          pageLease.userNavigationLease !== tab.trustedUserNavigationLease
+        ) {
+          throw new Error('The browser page changed while this screenshot was in progress.');
+        }
+      },
+    ),
+    captureBrowserPageLease: vi.fn(() => ({
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      contents,
+    })),
     setAutomationOverlay: vi.fn(async () => undefined),
     tabOrder: new Map([['chat-1', [tab.shell.id]]]),
     tabs: new Map([[tab.shell.id, tab]]),
@@ -182,6 +196,21 @@ describe('assistant screenshot renderer authority', () => {
     resolveDialog({ canceled: false, filePath: '/tmp/exported-browser.png' });
 
     await expect(screenshot).rejects.toThrow(/Kai renderer changed/);
+    expect(atomicWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it('rejects a stale renderer token before opening the native export dialog', async () => {
+    const manager = screenshotManager();
+
+    await expect(
+      manager.screenshot('chat-1', {
+        mode: 'viewport',
+        documentToken: 'tab-1:4:1:2:42',
+        exportToFile: true,
+      }),
+    ).rejects.toThrow(/before the screenshot export dialog opened/i);
+
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
     expect(atomicWriteFileSync).not.toHaveBeenCalled();
   });
 

@@ -995,6 +995,7 @@ describe('browser manager renderer lifecycle', () => {
     };
     const tab = {
       generation: 3,
+      documentEpoch: 5,
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       trustedUserNavigationLease: 7,
       view,
@@ -1013,7 +1014,7 @@ describe('browser manager renderer lifecycle', () => {
       runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
     });
 
-    const picked = manager.pickElement('chat-1', 'tab-1');
+    const picked = manager.pickElement('chat-1', 'tab-1', 'tab-1:3:5:7:42');
     await vi.waitFor(() =>
       expect(mainFrame.send).toHaveBeenCalledWith(
         'browser-page:element-picker-arm',
@@ -1038,7 +1039,7 @@ describe('browser manager renderer lifecycle', () => {
 
     await expect(picked).resolves.toEqual({
       selector: '#target',
-      documentToken: 'tab-1:3:7:42',
+      documentToken: 'tab-1:3:5:7:42',
     });
     expect(mainFrame.send).toHaveBeenCalledWith('browser-page:element-picker-disarm', { token });
     tabs.clear();
@@ -1072,6 +1073,7 @@ describe('browser manager renderer lifecycle', () => {
     };
     const tab = {
       generation: 3,
+      documentEpoch: 5,
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       trustedUserNavigationLease: 7,
       view,
@@ -1090,7 +1092,7 @@ describe('browser manager renderer lifecycle', () => {
       runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
     });
 
-    const picked = manager.pickElement('chat-1', 'tab-1');
+    const picked = manager.pickElement('chat-1', 'tab-1', 'tab-1:3:5:7:42');
     await vi.waitFor(() =>
       expect(childFrame.send).toHaveBeenCalledWith(
         'browser-page:element-picker-arm',
@@ -1107,6 +1109,45 @@ describe('browser manager renderer lifecycle', () => {
     await expect(picked).rejects.toThrow(/embedded frames/);
     expect(childFrame.send).not.toHaveBeenCalledWith('browser-page:element-picker-select-at', expect.anything());
     expect(childFrame.send).toHaveBeenCalledWith('browser-page:element-picker-disarm', { token });
+    tabs.clear();
+    manager.dispose();
+  });
+
+  it('rejects a stale document token before arming an element picker frame', async () => {
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      send: vi.fn(),
+    };
+    mainFrame.framesInSubtree = [mainFrame];
+    const contents = { id: 42, isDestroyed: () => false, mainFrame };
+    const tab = {
+      generation: 3,
+      documentEpoch: 5,
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      trustedUserNavigationLease: 7,
+      view: { webContents: contents },
+    };
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-picker-token-test',
+      () => ({ browser: { dataScope: 'global' } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    const tabs = Reflect.get(manager, 'tabs') as Map<string, typeof tab>;
+    tabs.set(tab.shell.id, tab);
+    Object.assign(manager as unknown as Record<string, unknown>, {
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureView: vi.fn(async () => tab.view),
+      runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
+    });
+
+    await expect(manager.pickElement('chat-1', 'tab-1', 'tab-1:3:4:7:42')).rejects.toThrow(
+      /before element picking could start/i,
+    );
+    expect(mainFrame.send).not.toHaveBeenCalled();
     tabs.clear();
     manager.dispose();
   });
@@ -3997,6 +4038,12 @@ describe('browser manager renderer lifecycle', () => {
     const tab = {
       shell: { id: 'tab-1' },
       view: null,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/private',
+      trustedUserNavigationRequestId: 17,
+      trustedUserNavigationPanelGeneration: 2,
+      trustedUserNavigationLease: 3,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
       overlayTimer: null,
       overlayGeneration: 0,
       networkRequests: new Map([
@@ -4024,6 +4071,46 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(tab, 'diagnosticActiveNetworkRequestIds')).toBeUndefined();
     expect(tab.networkRequestSequence).toBe(0);
     expect(tab.networkLastBlockingActivityAt).toBeUndefined();
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.trustedUserNavigationTarget).toBeNull();
+    expect(tab.trustedUserNavigationRequestId).toBeNull();
+    expect(tab.trustedUserNavigationPanelGeneration).toBeNull();
+    expect(tab.trustedUserNavigationTimer).toBeNull();
+  });
+
+  it('preserves only the explicit user-navigation lease during a guarded renderer reset', () => {
+    const timer = setTimeout(() => undefined, 60_000);
+    const tab = {
+      shell: { id: 'tab-1' },
+      view: null,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/next',
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationPanelGeneration: 2,
+      trustedUserNavigationLease: 3,
+      trustedUserNavigationTimer: timer,
+      overlayTimer: null,
+      overlayGeneration: 0,
+    };
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      automationGestureTokens: new Map(),
+      getWindow: () => null,
+      oneTimePermissions: new Set(),
+      pendingAuth: new Map(),
+      pendingCredentials: new Map(),
+      pendingElementPickerCancels: new Map(),
+      pendingPermissions: new Map(),
+      webContentsToTab: new Map(),
+    });
+
+    invokePrivate(manager, 'destroyView', tab, true);
+
+    expect(tab.trustedUserNavigation).toBe(true);
+    expect(tab.trustedUserNavigationTarget).toBe('https://example.com/next');
+    expect(tab.trustedUserNavigationPanelGeneration).toBe(2);
+    expect(tab.trustedUserNavigationTimer).toBe(timer);
+    clearTimeout(timer);
   });
 
   it('reclaims the owning native view when its renderer process exits', () => {
@@ -6225,11 +6312,13 @@ describe('browser manager renderer lifecycle', () => {
     const tab = {
       shell: { id: 'tab-1', url: 'https://example.com/account' },
       generation: 4,
+      documentEpoch: 2,
     };
     const manager = managerWithoutConstructor({});
     const approval = {
       tabId: 'tab-1',
       tabGeneration: 3,
+      documentEpoch: 2,
       origin: 'https://example.com',
       url: 'https://example.com/account',
     };
@@ -6239,6 +6328,12 @@ describe('browser manager renderer lifecycle', () => {
     );
 
     tab.generation = 3;
+    tab.documentEpoch = 3;
+    expect(() => invokePrivate(manager, 'assertBrowserDocumentApproval', tab, approval)).toThrow(
+      /page changed while approval was pending/i,
+    );
+
+    tab.documentEpoch = 2;
     tab.shell.url = 'https://example.com/other';
     expect(() => invokePrivate(manager, 'assertBrowserDocumentApproval', tab, approval)).toThrow(
       /page changed while approval was pending/i,
@@ -6294,6 +6389,7 @@ describe('browser manager renderer lifecycle', () => {
         updatedAt: '2026-01-01T00:00:00.000Z',
       },
       generation: 7,
+      documentEpoch: 2,
       trustedUserNavigationLease: 3,
       view: { webContents: firstContents },
     };
@@ -6303,20 +6399,65 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([['tab-1', tab]]),
     });
 
-    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:3:41');
+    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:2:3:41');
     tab.view = { webContents: replacementContents };
-    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:3:42');
+    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:2:3:42');
+  });
+
+  it('rotates renderer document tokens when a same-URL replacement commits', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      id: 41,
+      getTitle: () => 'Same URL',
+      getURL: () => 'https://example.com/same',
+      isCurrentlyAudible: () => false,
+      isDestroyed: () => false,
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/same',
+        title: 'Same URL',
+        sensitive: false,
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      generation: 7,
+      documentEpoch: 2,
+      trustedUserNavigationLease: 3,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'tab-1']]),
+      tabOrder: new Map([['chat-1', ['tab-1']]]),
+      tabs: new Map([['tab-1', tab]]),
+      emitTabs: vi.fn(),
+    });
+
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+    const provisionalToken = manager.getState('chat-1').tabs[0]?.documentToken;
+    listeners.get('did-navigate')?.({}, 'https://example.com/same');
+
+    expect(provisionalToken).toBe('tab-1:7:2:3:41');
+    expect(manager.getState('chat-1').tabs[0]?.documentToken).toBe('tab-1:7:3:3:41');
+    expect(tab.generation).toBe(7);
+    expect(tab.documentEpoch).toBe(3);
   });
 
   it('binds tab-list read approval to the exact active tab, order, shells, and documents', () => {
     const first = {
       shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://one.example/account' },
       generation: 3,
+      documentEpoch: 2,
       trustedUserNavigationLease: 4,
     };
     const second = {
       shell: { id: 'tab-2', conversationId: 'chat-1', url: 'https://two.example/' },
       generation: 5,
+      documentEpoch: 6,
       trustedUserNavigationLease: 6,
     };
     const manager = managerWithoutConstructor({
@@ -6334,6 +6475,10 @@ describe('browser manager renderer lifecycle', () => {
     Reflect.get(manager, 'activeTabs').set('chat-1', second.shell.id);
     expect(() => manager.assertTabsReadApproval('chat-1', approval)).toThrow(/tab list changed while approval/i);
     Reflect.get(manager, 'activeTabs').set('chat-1', first.shell.id);
+
+    second.documentEpoch++;
+    expect(() => manager.assertTabsReadApproval('chat-1', approval)).toThrow(/tab list changed while approval/i);
+    second.documentEpoch--;
 
     second.shell.url = 'https://two.example/replaced';
     expect(() => manager.assertTabsReadApproval('chat-1', approval)).toThrow(/tab list changed while approval/i);
@@ -7894,6 +8039,7 @@ describe('browser manager renderer lifecycle', () => {
       assistantDialogsDisabledRunId: 'run-1' as string | null,
       openerLinkedContentsId: sourceContents.id as number | undefined,
       generation: 4,
+      documentEpoch: 2,
       shell: {
         id: 'popup-1',
         conversationId: 'chat-1',
@@ -7909,6 +8055,7 @@ describe('browser manager renderer lifecycle', () => {
     const approval = {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
       origin: 'https://example.com',
       url: tab.shell.url,
       userNavigationLease: tab.trustedUserNavigationLease,
@@ -7929,6 +8076,7 @@ describe('browser manager renderer lifecycle', () => {
     tab.view = replacementView;
     tab.shell.discarded = false;
     tab.generation++;
+    tab.documentEpoch++;
     invokePrivate(
       manager,
       'advanceBrowserApprovalRendererResetAfterRestore',
@@ -7940,7 +8088,7 @@ describe('browser manager renderer lifecycle', () => {
     );
     invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval, replacementView);
 
-    expect(approval).toMatchObject({ tabGeneration: 6, allowInternalRestore: false });
+    expect(approval).toMatchObject({ tabGeneration: 6, documentEpoch: 3, allowInternalRestore: false });
     expect(tab.openerLinkedContentsId).toBeUndefined();
   });
 
@@ -7950,6 +8098,7 @@ describe('browser manager renderer lifecycle', () => {
     const tab = {
       assistantDialogsDisabledRunId: null as string | null,
       generation: 4,
+      documentEpoch: 2,
       shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
       trustedUserNavigationLease: 2,
       view: null as typeof replacementView | null,
@@ -7958,6 +8107,7 @@ describe('browser manager renderer lifecycle', () => {
     const approval = {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
       origin: 'https://example.com',
       url: tab.shell.url,
       userNavigationLease: tab.trustedUserNavigationLease,
@@ -7973,6 +8123,7 @@ describe('browser manager renderer lifecycle', () => {
     // ensureView can navigate through an inert bootstrap before restoring the
     // requested page. Both are manager-owned document replacements.
     tab.generation += 2;
+    tab.documentEpoch += 2;
     invokePrivate(
       manager,
       'advanceBrowserApprovalRendererResetAfterRestore',
@@ -7984,12 +8135,13 @@ describe('browser manager renderer lifecycle', () => {
     );
     invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval, replacementView);
 
-    expect(approval).toMatchObject({ tabGeneration: 6, allowInternalRestore: false });
+    expect(approval).toMatchObject({ tabGeneration: 6, documentEpoch: 4, allowInternalRestore: false });
   });
 
   it.each([
     'restore generation',
     'generation',
+    'document epoch',
     'url',
     'origin',
     'navigation lease',
@@ -8003,6 +8155,7 @@ describe('browser manager renderer lifecycle', () => {
     const tab = {
       assistantDialogsDisabledRunId: null as string | null,
       generation: 4,
+      documentEpoch: 2,
       shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
       trustedUserNavigationLease: 2,
       view: null as typeof sourceView | typeof replacementView | null,
@@ -8011,6 +8164,7 @@ describe('browser manager renderer lifecycle', () => {
     const approval = {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
       origin: 'https://example.com',
       url: tab.shell.url,
       userNavigationLease: tab.trustedUserNavigationLease,
@@ -8050,6 +8204,7 @@ describe('browser manager renderer lifecycle', () => {
     let run = { id: 'run-1' };
     let consumedView = replacementView;
     if (change === 'generation') tab.generation += 1;
+    if (change === 'document epoch') tab.documentEpoch += 1;
     if (change === 'url') tab.shell.url = 'https://example.com/other';
     if (change === 'origin') tab.shell.url = 'https://other.example/account';
     if (change === 'navigation lease') tab.trustedUserNavigationLease += 1;
@@ -11021,6 +11176,7 @@ describe('browser manager renderer lifecycle', () => {
       },
       scopeKey: 'global',
       generation: 4,
+      documentEpoch: 7,
       scriptTainted: false,
       queue: { run: (task: () => Promise<unknown>) => task() },
     };
@@ -11072,6 +11228,7 @@ describe('browser manager renderer lifecycle', () => {
     const approval = {
       tabId: 'tab-1',
       tabGeneration: 4,
+      documentEpoch: 7,
       origin: 'https://login.example',
       url: 'https://login.example/account',
       credentialId: 'credential-1',
@@ -17167,7 +17324,7 @@ describe('browser manager renderer lifecycle', () => {
 
     await manager.navigate('chat-1', tab.shell.id, 'https://example.com/next');
 
-    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(destroyView).toHaveBeenCalledWith(tab, true);
     expect(ensureView).toHaveBeenCalledOnce();
     expect(tab.shell.url).toBe('https://example.com/next');
     expect(tab.assistantNativeUiNewDocumentGuard).toBeUndefined();
@@ -19673,6 +19830,7 @@ describe('browser manager renderer lifecycle', () => {
         loadURL: vi.fn(async (url: string) => {
           currentUrl = url;
           tab.generation++;
+          tab.documentEpoch++;
           await pageLoad.promise;
         }),
       },
@@ -19688,6 +19846,7 @@ describe('browser manager renderer lifecycle', () => {
       view: null as typeof view | null,
       viewLoadPromise: null as Promise<typeof view> | null,
       generation: 4,
+      documentEpoch: 2,
       trustedUserNavigation: false,
       trustedUserNavigationLease: 2,
       aiNetworkRestricted: false,
@@ -19698,6 +19857,7 @@ describe('browser manager renderer lifecycle', () => {
     const approval = {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
       origin: 'https://approved.example',
       url: tab.shell.url,
       userNavigationLease: tab.trustedUserNavigationLease,
@@ -19708,6 +19868,7 @@ describe('browser manager renderer lifecycle', () => {
       runGeneration: 7,
       hostRendererAuthorityGeneration: 0,
       tabGeneration: tab.generation,
+      documentEpoch: tab.documentEpoch,
       userNavigationLease: tab.trustedUserNavigationLease,
       url: tab.shell.url,
     }));
@@ -19751,6 +19912,7 @@ describe('browser manager renderer lifecycle', () => {
       runGeneration: 7,
       hostRendererAuthorityGeneration: 0,
       tabGeneration: 4,
+      documentEpoch: 2,
       userNavigationLease: tab.trustedUserNavigationLease,
       url: tab.shell.url,
     };
@@ -19769,7 +19931,7 @@ describe('browser manager renderer lifecycle', () => {
 
     expect(guardAssistantTab).toHaveBeenCalledOnce();
     expect(installAssistantNativeUiGuard).toHaveBeenCalledWith(tab, view.webContents, undefined, documentLease);
-    expect(approval).toMatchObject({ tabGeneration: 5, allowInternalRestore: false });
+    expect(approval).toMatchObject({ tabGeneration: 5, documentEpoch: 3, allowInternalRestore: false });
     expect(tab.viewLoadPromise).toBeNull();
     expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
   });
@@ -21925,6 +22087,7 @@ describe('browser manager renderer lifecycle', () => {
     const tab = {
       shell: { id: 'tab-1', url: 'https://example.com' },
       generation: 4,
+      documentEpoch: 2,
       trustedUserNavigationLease: 2,
       aiControlOwnerId: 'run-1',
       aiControlGeneration: 7,
@@ -21939,6 +22102,7 @@ describe('browser manager renderer lifecycle', () => {
       runGeneration: 7,
       hostRendererAuthorityGeneration: 5,
       tabGeneration: 4,
+      documentEpoch: 2,
       userNavigationLease: 2,
       url: 'https://example.com',
     };
@@ -21953,6 +22117,9 @@ describe('browser manager renderer lifecycle', () => {
     );
     tab.aiControlGeneration = 7;
     tab.generation++;
+    expect(() => invokePrivate(manager, 'assertAssistantDocumentLease', tab, lease)).toThrow(/page navigated/);
+    tab.generation--;
+    tab.documentEpoch++;
     expect(() => invokePrivate(manager, 'assertAssistantDocumentLease', tab, lease)).toThrow(/page navigated/);
   });
 
@@ -26452,7 +26619,7 @@ describe('browser manager renderer lifecycle', () => {
       manager.screenshot('chat-1', {
         mode: 'element',
         selector: '#picked',
-        documentToken: 'tab-1:1:4:42',
+        documentToken: 'tab-1:1:0:4:42',
       }),
     ).rejects.toThrow(/changed after the element was picked/);
     expect(capturePage).not.toHaveBeenCalled();
@@ -26486,7 +26653,7 @@ describe('browser manager renderer lifecycle', () => {
     await expect(
       manager.screenshot('chat-1', {
         mode: 'viewport',
-        documentToken: 'tab-1:2:4:41',
+        documentToken: 'tab-1:2:0:4:41',
       }),
     ).rejects.toThrow(/page changed/i);
     expect(capturePage).not.toHaveBeenCalled();

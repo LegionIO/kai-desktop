@@ -2089,7 +2089,7 @@ describe('BrowserPanel', () => {
         exportToFile: true,
       }),
     );
-    expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id);
+    expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id, tab.documentToken);
   });
 
   it('rejects a component picker result from a replacement document', async () => {
@@ -2356,7 +2356,8 @@ describe('BrowserPanel', () => {
     expect(screenshot).not.toHaveBeenCalled();
 
     await act(async () => visibleMount.resolve());
-    if (mode === 'element') await waitFor(() => expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id));
+    if (mode === 'element')
+      await waitFor(() => expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id, tab.documentToken));
     await waitFor(() => expect(screenshot).toHaveBeenCalledOnce());
   });
 

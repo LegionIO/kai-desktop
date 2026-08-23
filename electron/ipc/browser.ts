@@ -130,9 +130,12 @@ export function registerBrowserHandlers(
     }
     return getBrowserManager().screenshot(conversationId, request);
   });
-  handle('browser:pick-element', (conversationId: string, tabId: string) =>
-    getBrowserManager().pickElement(conversationId, tabId),
-  );
+  handle('browser:pick-element', (conversationId: string, tabId: string, documentToken: string) => {
+    if (typeof documentToken !== 'string' || documentToken.length === 0 || documentToken.length > 256) {
+      throw new Error('Browser element picking requires the current page document token.');
+    }
+    return getBrowserManager().pickElement(conversationId, tabId, documentToken);
+  });
   handle('browser:list-history', (conversationId: string, query?: string) =>
     getBrowserManager().listHistory(conversationId, query),
   );

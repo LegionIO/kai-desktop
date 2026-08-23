@@ -21,6 +21,7 @@ const manager = {
     tabOrder: [],
     tabRefs: [],
     tabGenerations: [],
+    documentEpochs: [],
     tabUrls: [],
     userNavigationLeases: [],
   })),
@@ -803,6 +804,7 @@ describe('browser tools', () => {
       tabOrder: [documentApproval.tabId],
       tabRefs: [{}],
       tabGenerations: [7],
+      documentEpochs: [0],
       tabUrls: ['https://example.com/page'],
       userNavigationLeases: [2],
     };

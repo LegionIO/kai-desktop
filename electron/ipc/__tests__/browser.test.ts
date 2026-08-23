@@ -52,6 +52,7 @@ const manager = vi.hoisted(() => ({
     width: 10,
     height: 10,
   })),
+  pickElement: vi.fn(async () => ({ selector: '#target', documentToken: 'tab-1:7:2:3:42' })),
   setZoom: vi.fn(async (_conversationId: string, _tabId: string, level: number) => level),
   setChromeFocus: vi.fn(),
   listCredentials: vi.fn(() => []),
@@ -309,12 +310,28 @@ describe('browser IPC authorization', () => {
     const request = {
       tabId: 'tab-1',
       mode: 'viewport' as const,
-      documentToken: 'tab-1:7:3:42',
+      documentToken: 'tab-1:7:2:3:42',
       exportToFile: true,
     };
     await expect(
       harness.invoke('browser:screenshot', { sender: primaryContents, senderFrame: mainFrame }, 'chat-1', request),
     ).resolves.toMatchObject({ tabId: 'tab-1', mode: 'viewport' });
     expect(manager.screenshot).toHaveBeenCalledWith('chat-1', request);
+
+    await expect(
+      harness.invoke('browser:pick-element', { sender: primaryContents, senderFrame: mainFrame }, 'chat-1', 'tab-1'),
+    ).rejects.toThrow(/document token/i);
+    expect(manager.pickElement).not.toHaveBeenCalled();
+
+    await expect(
+      harness.invoke(
+        'browser:pick-element',
+        { sender: primaryContents, senderFrame: mainFrame },
+        'chat-1',
+        'tab-1',
+        request.documentToken,
+      ),
+    ).resolves.toMatchObject({ selector: '#target' });
+    expect(manager.pickElement).toHaveBeenCalledWith('chat-1', 'tab-1', request.documentToken);
   });
 });
