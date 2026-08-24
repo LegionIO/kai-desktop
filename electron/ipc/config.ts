@@ -92,6 +92,8 @@ function getDefaultConfig() {
         minDimension: 256,
         minQuality: 40,
         reserveTokens: 4000,
+        maxImageBytes: 5 * 1024 * 1024,
+        maxTotalBytes: 12 * 1024 * 1024,
       },
     },
     tools: {

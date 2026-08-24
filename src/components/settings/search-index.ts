@@ -177,6 +177,30 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     tab: 'runtimes',
     keywords: ['working memory', 'semantic recall', 'context', 'compaction', 'summarize'],
   },
+  {
+    id: 'compaction.media',
+    label: 'Media fitting (image/file size limits)',
+    section: 'models',
+    tab: 'runtimes',
+    fallbackId: 'mastra.advanced',
+    keywords: [
+      'media',
+      'image',
+      'screenshot',
+      'omitted',
+      'was omitted',
+      'downscale',
+      'resize',
+      're-encode',
+      'per-image limit',
+      'max image size',
+      'maxImageBytes',
+      'maxTotalBytes',
+      'MB',
+      'context window',
+      'attachment',
+    ],
+  },
 
   // ─── Models › Profiles ───
   {

@@ -131,6 +131,7 @@ import {
 } from './ipc/agents.js';
 import { TaskDispatcher } from './agent/task-dispatcher.js';
 import { terminateTokenizerWorker } from './agent/tokenization.js';
+import { applyMediaLimits } from './agent/tool-model-content.js';
 import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
@@ -1821,6 +1822,10 @@ if (gotSingleInstanceLock) {
       // Dictation hotkey hot-reload
       updateDictationConfig(config);
 
+      // Media byte-cap hot-reload (compaction.media.maxImageBytes/maxTotalBytes) —
+      // seeds the single source of truth read by the sanitizer, media-fit, and compaction.
+      applyMediaLimits(config);
+
       // App Shots hotkey hot-reload
       updateAppShotsConfig(config);
 
@@ -1872,6 +1877,9 @@ if (gotSingleInstanceLock) {
       handleBrowserConfigChanged,
       (mutation) => workspaceHandlers?.invalidateMutationProvenance(mutation),
     );
+    // Seed the configurable media byte-caps from the loaded config (handleConfigChanged
+    // only fires on subsequent changes, so the first turn needs this initial apply).
+    applyMediaLimits(getConfig());
     setBrowserRollbackConfig = setConfig;
     workspaceHandlers = registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     registerConversationHandlers(

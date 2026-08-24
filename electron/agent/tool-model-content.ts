@@ -18,10 +18,55 @@ export type ModelContentPart =
   | { type: 'image'; data: string; mediaType: string }
   | { type: 'file'; data: string; mediaType: string; filename?: string };
 
-/** Max bytes for a single image/file part before it is dropped (base64 inflates ~4/3). */
-const MAX_PART_BYTES = 5 * 1024 * 1024;
-/** Max total bytes across all parts in one tool result. */
-const MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+/** Default max bytes for a single image/file part before it is dropped
+ *  (base64 inflates ~4/3). Overridable via `applyMediaLimits`. */
+const DEFAULT_MAX_PART_BYTES = 5 * 1024 * 1024;
+/** Default max total bytes across all parts in one tool result. Overridable. */
+const DEFAULT_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+
+// ── Configurable media caps (single source of truth) ────────────────────────
+// The per-part / per-result byte ceilings are enforced in three coupled places:
+// this sanitizer (the authority), media-fit's budget fitter, and compaction's
+// retention mirror. They MUST agree — if media-fit lets an image through that
+// this sanitizer then drops, the model sees a broken/omitted part. So the caps
+// live here as mutable module state, seeded from `config.compaction.media` via
+// `applyMediaLimits` (called at startup + on every config change), and the other
+// two modules read them through the getters below rather than keeping their own
+// constants.
+let maxPartBytes = DEFAULT_MAX_PART_BYTES;
+let maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES;
+
+/** Current per-image/file part byte ceiling (decoded bytes). */
+export function getMaxPartBytes(): number {
+  return maxPartBytes;
+}
+/** Current per-tool-result total media byte ceiling (decoded bytes). */
+export function getMaxTotalBytes(): number {
+  return maxTotalBytes;
+}
+
+/**
+ * Apply the configured media byte caps from `config.compaction.media`. Called at
+ * startup and on every config change (see main.ts `handleConfigChanged`), the
+ * same lifecycle used by `updateDictationConfig` / `updateAppShotsConfig`.
+ *
+ * Values are defensive-clamped: non-finite/≤0 falls back to the default, and a
+ * per-part cap larger than the total is clamped down to the total (the schema
+ * already enforces `maxImageBytes ≤ maxTotalBytes`, but config can arrive from
+ * disk/bridge without re-validation, so we don't trust it blindly here).
+ */
+export function applyMediaLimits(config: unknown): void {
+  const media = (config as { compaction?: { media?: { maxImageBytes?: unknown; maxTotalBytes?: unknown } } })
+    ?.compaction?.media;
+  const total = coerceCap(media?.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES);
+  const part = Math.min(coerceCap(media?.maxImageBytes, DEFAULT_MAX_PART_BYTES), total);
+  maxTotalBytes = total;
+  maxPartBytes = part;
+}
+
+function coerceCap(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
 
 function approxBytes(base64: string): number {
   // 4 base64 chars ≈ 3 bytes; ignore padding for an estimate.
@@ -113,7 +158,7 @@ export function extractModelContent(result: unknown): {
     // and forwarded is genuine base64.
     const { data, mediaType } = normalizeMediaData(item.data, item.mediaType);
     const bytes = approxBytes(data);
-    if (bytes > MAX_PART_BYTES || total + bytes > MAX_TOTAL_BYTES) {
+    if (bytes > maxPartBytes || total + bytes > maxTotalBytes) {
       const label = item.type === 'image' ? 'image' : 'file';
       parts.push({
         type: 'text',

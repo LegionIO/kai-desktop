@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { extractModelContent, buildMcpToolContent } from '../tool-model-content.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import {
+  extractModelContent,
+  buildMcpToolContent,
+  applyMediaLimits,
+  getMaxPartBytes,
+  getMaxTotalBytes,
+} from '../tool-model-content.js';
 
 describe('extractModelContent', () => {
   it('passes through results without _modelContent', () => {
@@ -147,5 +153,63 @@ describe('extractModelContent hardening', () => {
     const many = Array.from({ length: 100 }, (_, i) => ({ type: 'text', text: `t${i}` }));
     const { modelContent } = extractModelContent({ _modelContent: many });
     expect(modelContent!.length).toBeLessThanOrEqual(64);
+  });
+});
+
+describe('applyMediaLimits (configurable byte caps)', () => {
+  // These mutate module-level state; restore defaults after each test so the
+  // rest of the suite sees the canonical 5/12 MiB caps.
+  afterEach(() => {
+    applyMediaLimits({ compaction: { media: { maxImageBytes: 5 * 1024 * 1024, maxTotalBytes: 12 * 1024 * 1024 } } });
+  });
+
+  it('defaults to 5 MiB per-part / 12 MiB per-result', () => {
+    expect(getMaxPartBytes()).toBe(5 * 1024 * 1024);
+    expect(getMaxTotalBytes()).toBe(12 * 1024 * 1024);
+  });
+
+  it('raises the per-image cap so a formerly-oversized image is kept', () => {
+    const bigBase64 = 'A'.repeat(8 * 1024 * 1024); // ~6 MB decoded, over the 5 MB default
+    // Default: dropped to a text note.
+    expect(
+      extractModelContent({ _modelContent: [{ type: 'image', data: bigBase64, mediaType: 'image/png' }] })
+        .modelContent![0].type,
+    ).toBe('text');
+    // Raise the cap → same image is now retained as an image part.
+    applyMediaLimits({ compaction: { media: { maxImageBytes: 16 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024 } } });
+    const kept = extractModelContent({
+      _modelContent: [{ type: 'image', data: bigBase64, mediaType: 'image/png' }],
+    }).modelContent!;
+    expect(kept[0].type).toBe('image');
+  });
+
+  it('lowers the per-image cap so a formerly-kept image is dropped', () => {
+    const midBase64 = 'A'.repeat(Math.ceil((3 * 1024 * 1024 * 4) / 3)); // ~3 MB decoded
+    // Default: kept.
+    expect(
+      extractModelContent({ _modelContent: [{ type: 'image', data: midBase64, mediaType: 'image/png' }] })
+        .modelContent![0].type,
+    ).toBe('image');
+    // Lower the cap below the image size → dropped to a note.
+    applyMediaLimits({ compaction: { media: { maxImageBytes: 1 * 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024 } } });
+    expect(
+      extractModelContent({ _modelContent: [{ type: 'image', data: midBase64, mediaType: 'image/png' }] })
+        .modelContent![0].type,
+    ).toBe('text');
+  });
+
+  it('clamps a per-part cap larger than the total down to the total', () => {
+    applyMediaLimits({ compaction: { media: { maxImageBytes: 50 * 1024 * 1024, maxTotalBytes: 10 * 1024 * 1024 } } });
+    expect(getMaxPartBytes()).toBe(10 * 1024 * 1024);
+    expect(getMaxTotalBytes()).toBe(10 * 1024 * 1024);
+  });
+
+  it('falls back to defaults for missing/invalid config values', () => {
+    applyMediaLimits({});
+    expect(getMaxPartBytes()).toBe(5 * 1024 * 1024);
+    expect(getMaxTotalBytes()).toBe(12 * 1024 * 1024);
+    applyMediaLimits({ compaction: { media: { maxImageBytes: -1, maxTotalBytes: 0 } } });
+    expect(getMaxPartBytes()).toBe(5 * 1024 * 1024);
+    expect(getMaxTotalBytes()).toBe(12 * 1024 * 1024);
   });
 });

@@ -164,26 +164,54 @@ const conversationCompactionSchema = z.object({
  * `.optional()` with a default so existing configs (written before this section
  * existed) keep working and pick up the default behavior.
  */
-const mediaCompactionSchema = z.object({
-  enabled: z.boolean().default(true),
-  strategy: z.enum(['downscale', 'drop']).default('downscale'),
-  /** Smallest longest-edge (px) `downscale` will shrink an image to before it
-   *  gives up and fails safe (drop-with-note). Below this the image is too small
-   *  to be useful anyway. Integer — sharp's resize rejects fractional dimensions.
-   *  Upper-bounded: this is a shrink FLOOR, so a huge value is nonsensical AND
-   *  dangerous — an out-of-range config value reaching sharp.resize as a target
-   *  could request a massive upscale and OOM the main process. 4096 is well above
-   *  any useful floor. */
-  minDimension: z.number().int().positive().max(4096).default(256),
-  /** Lowest JPEG/WebP quality (1-100) `downscale` will re-encode at before
-   *  failing safe. Integer — sharp's jpeg quality rejects fractional values. */
-  minQuality: z.number().int().min(1).max(100).default(40),
-  /** Tokens to hold back from the model's context window when computing the
-   *  remaining budget for an incoming media part — leaves headroom for the
-   *  model's own reply + framing so a part that "just fits" doesn't tip the
-   *  next request over. */
-  reserveTokens: z.number().nonnegative().default(4000),
-});
+const mediaCompactionSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    strategy: z.enum(['downscale', 'drop']).default('downscale'),
+    /** Smallest longest-edge (px) `downscale` will shrink an image to before it
+     *  gives up and fails safe (drop-with-note). Below this the image is too small
+     *  to be useful anyway. Integer — sharp's resize rejects fractional dimensions.
+     *  Upper-bounded: this is a shrink FLOOR, so a huge value is nonsensical AND
+     *  dangerous — an out-of-range config value reaching sharp.resize as a target
+     *  could request a massive upscale and OOM the main process. 4096 is well above
+     *  any useful floor. */
+    minDimension: z.number().int().positive().max(4096).default(256),
+    /** Lowest JPEG/WebP quality (1-100) `downscale` will re-encode at before
+     *  failing safe. Integer — sharp's jpeg quality rejects fractional values. */
+    minQuality: z.number().int().min(1).max(100).default(40),
+    /** Tokens to hold back from the model's context window when computing the
+     *  remaining budget for an incoming media part — leaves headroom for the
+     *  model's own reply + framing so a part that "just fits" doesn't tip the
+     *  next request over. */
+    reserveTokens: z.number().nonnegative().default(4000),
+    /** Hard ceiling (decoded bytes) for a SINGLE image/file part. Above this the
+     *  part is dropped with a "resize or re-encode" note — this is the cap that
+     *  produces the "Media from … was omitted" message. It is a fixed limit
+     *  checked BEFORE any downscale, so raising it lets larger single images
+     *  through. Bounded: an image is decoded/re-encoded by libvips (sharp), so an
+     *  unbounded value invites OOM. 64 MiB is well above any legitimate screenshot
+     *  and stays under typical provider request limits. Must be ≤ maxTotalBytes
+     *  (a single part can't exceed the per-request total). */
+    maxImageBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(64 * 1024 * 1024)
+      .default(5 * 1024 * 1024),
+    /** Hard ceiling (decoded bytes) for ALL media parts across one tool result.
+     *  Bounds the aggregate a single result can carry so many small parts can't
+     *  blow the request. Bounded for the same OOM reason as maxImageBytes. */
+    maxTotalBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(128 * 1024 * 1024)
+      .default(12 * 1024 * 1024),
+  })
+  .refine((m) => m.maxImageBytes <= m.maxTotalBytes, {
+    message: 'maxImageBytes must be ≤ maxTotalBytes (a single part cannot exceed the per-result total)',
+    path: ['maxImageBytes'],
+  });
 
 const shellGuardrailsSchema = z.object({
   enabled: z.boolean(),
@@ -996,6 +1024,8 @@ export const appConfigSchema = z.object({
       minDimension: 256,
       minQuality: 40,
       reserveTokens: 4000,
+      maxImageBytes: 5 * 1024 * 1024,
+      maxTotalBytes: 12 * 1024 * 1024,
     }),
   }),
   tools: z.object({

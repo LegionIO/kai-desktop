@@ -18,6 +18,7 @@ import {
   estimateFileTokensFromBytes,
   isSanitizerRetainableMedia,
 } from './media-fit.js';
+import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
 // Cap on CONCURRENT outstanding summarizer generates. An aborted/timed-out compaction
@@ -398,8 +399,7 @@ export async function shouldCompactAsync(
 
   const { tokenization, triggerTokens, extraMediaTokens: extra } = gate;
   const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
-  const usedTokens =
-    ((await countBranchTokensCachedAsync(messages, tokenization, lastMessageId, signal)) ?? 0) + extra;
+  const usedTokens = ((await countBranchTokensCachedAsync(messages, tokenization, lastMessageId, signal)) ?? 0) + extra;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
@@ -491,7 +491,11 @@ async function stripMediaForSerialization(
       // bare image with no accompanying text vanishes silently from future context.
       if ((p.type === 'image' || p.type === 'file') && typeof (p.data ?? p.image) === 'string') {
         touched = true;
-        mediaToEstimate.push({ data: (p.data ?? p.image) as string, isImage: p.type === 'image', mediaType: (p.mimeType ?? p.mediaType) as string | undefined });
+        mediaToEstimate.push({
+          data: (p.data ?? p.image) as string,
+          isImage: p.type === 'image',
+          mediaType: (p.mimeType ?? p.mediaType) as string | undefined,
+        });
         const label = p.type === 'image' ? 'image' : 'file';
         const name = typeof p.filename === 'string' && p.filename ? ` "${p.filename}"` : '';
         return { type: 'text', text: `[${label}${name} attachment omitted from summary]` };
@@ -504,11 +508,12 @@ async function stripMediaForSerialization(
       if (res && typeof res === 'object' && !Array.isArray(res) && Array.isArray(res._modelContent)) {
         touched = true;
         const keptText: string[] = [];
-        // Mirror extractModelContent's per-result retention (5 MiB per-part, 12 MiB
-        // per-result, 64-part cap, validity) so a media part the sanitizer DROPS isn't
-        // charged native tokens — it becomes an omission note provider-side, not sent.
-        const MC_MAX_PART_BYTES = 5 * 1024 * 1024;
-        const MC_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+        // Mirror extractModelContent's per-result retention (configurable per-part /
+        // per-result byte caps, 64-part cap, validity) so a media part the sanitizer
+        // DROPS isn't charged native tokens — it becomes an omission note provider-side,
+        // not sent.
+        const MC_MAX_PART_BYTES = getMaxPartBytes();
+        const MC_MAX_TOTAL_BYTES = getMaxTotalBytes();
         const MC_MAX_PARTS = 64;
         let mcPartCount = 0;
         let mcTotalBytes = 0;
@@ -530,13 +535,19 @@ async function stripMediaForSerialization(
               // label + MB size, no filename) — otherwise the counted length drifts
               // from what's sent.
               const label = mcp.type === 'image' ? 'image' : 'file';
-              keptText.push(`[${label} omitted: ${(bytes / (1024 * 1024)).toFixed(1)} MB exceeds the per-result media limit]`);
+              keptText.push(
+                `[${label} omitted: ${(bytes / (1024 * 1024)).toFixed(1)} MB exceeds the per-result media limit]`,
+              );
               mcPartCount += 1;
               continue;
             }
             mcPartCount += 1;
             mcTotalBytes += bytes;
-            mediaToEstimate.push({ data: mcp.data as string, isImage: mcp.type === 'image', mediaType: mcp.mediaType as string });
+            mediaToEstimate.push({
+              data: mcp.data as string,
+              isImage: mcp.type === 'image',
+              mediaType: mcp.mediaType as string,
+            });
             const name = typeof mcp.filename === 'string' && mcp.filename ? ` "${mcp.filename}"` : '';
             keptText.push(`[${mcp.type === 'image' ? 'image' : 'file'}${name} attachment omitted from summary]`);
           }
@@ -593,7 +604,9 @@ async function stripMediaForSerialization(
   const MEDIA_ESTIMATE_MAX = 128;
   const toProbe = mediaToEstimate.slice(0, MEDIA_ESTIMATE_MAX);
   for (const item of mediaToEstimate.slice(MEDIA_ESTIMATE_MAX)) {
-    mediaTokens += item.isImage ? estimateImageTokensFromBytes(item.data) : estimateFileTokensFromBytes(item.data, item.mediaType);
+    mediaTokens += item.isImage
+      ? estimateImageTokensFromBytes(item.data)
+      : estimateFileTokensFromBytes(item.data, item.mediaType);
   }
   for (let i = 0; i < toProbe.length; i += CONCURRENCY) {
     if (options.signal?.aborted) break;
@@ -684,7 +697,8 @@ export async function compactConversationPrefix(
   const promptOverReserve = Math.max(0, promptTokens - Math.max(0, config.promptReserveTokens));
   // The summarizer USER message wraps the serialized prefix in fixed framing lines
   // (see `prompt` below) — those tokens are part of the summarizer request, reserve them.
-  const SUMMARIZER_FRAMING = 'Summarize the conversation prefix for future continuation.\nKeep durable constraints, decisions, requirements, unresolved TODOs, IDs, names, and references.\n\nConversation prefix (JSON):\n';
+  const SUMMARIZER_FRAMING =
+    'Summarize the conversation prefix for future continuation.\nKeep durable constraints, decisions, requirements, unresolved TODOs, IDs, names, and references.\n\nConversation prefix (JSON):\n';
   const framingTokens =
     tokenization.encoding && !tokenization.isFallbackEncoding
       ? encodeCappedWith(SUMMARIZER_FRAMING, tokenization.encoding)
@@ -697,7 +711,8 @@ export async function compactConversationPrefix(
   //  (2) NEXT-TURN budget — governs the compacted SUMMARY's fit in the NEXT real turn.
   //      Reduced by that turn's static excess (externalPromptOverReserve). No framing
   //      (the summary is a normal assistant message, not wrapped by the summarizer prompt).
-  const baseBudget = tokenization.contextWindowTokens - Math.max(0, config.outputMaxTokens) - Math.max(0, config.promptReserveTokens);
+  const baseBudget =
+    tokenization.contextWindowTokens - Math.max(0, config.outputMaxTokens) - Math.max(0, config.promptReserveTokens);
   const summarizerInputBudget = Math.floor(baseBudget - promptOverReserve - framingTokens);
   const nextTurnBudget = Math.floor(baseBudget - Math.max(0, options?.externalPromptOverReserve ?? 0));
   if (summarizerInputBudget <= 0 || nextTurnBudget <= 0) {
@@ -808,7 +823,8 @@ export async function compactConversationPrefix(
       fittedLen = fittedPrefix.length;
       // Re-tokenize the shrunk covered prefix so the no-op guard below compares the ACTUAL
       // covered token count against the budget.
-      candidateTokens = fittedPrefix.length >= MIN_SUMMARIZED ? await countForLength(fittedLen) : Number.POSITIVE_INFINITY;
+      candidateTokens =
+        fittedPrefix.length >= MIN_SUMMARIZED ? await countForLength(fittedLen) : Number.POSITIVE_INFINITY;
     }
   }
   // The prefix's images are summarized AWAY (replaced by the text summary), not sent — so the
@@ -974,10 +990,11 @@ export async function compactConversationPrefix(
   // a bounded summary plus a large suffix could exceed it; shipping an over-budget
   // request would defeat the point. If it still doesn't fit, return the null no-op —
   // the turn proceeds on the full (uncompacted) context ("null ⇒ no message loss").
-  const { messages: serializableCompacted, mediaTokens: compactedMediaTokens } =
-    await stripMediaForSerialization(compactedMessages, { signal });
-  const compactedTokens =
-    (await countBody(serializeForTokenCounting(serializableCompacted))) + compactedMediaTokens;
+  const { messages: serializableCompacted, mediaTokens: compactedMediaTokens } = await stripMediaForSerialization(
+    compactedMessages,
+    { signal },
+  );
+  const compactedTokens = (await countBody(serializeForTokenCounting(serializableCompacted))) + compactedMediaTokens;
   if (compactedTokens > nextTurnBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
@@ -1263,7 +1280,14 @@ export async function compactToolResult(
 
   // Try AI extraction first
   if (settings.useAI && modelConfig) {
-    const extracted = await aiExtractRelevantInfo(content, toolName, userQuery, settings.outputMaxTokens, modelConfig, abortSignal);
+    const extracted = await aiExtractRelevantInfo(
+      content,
+      toolName,
+      userQuery,
+      settings.outputMaxTokens,
+      modelConfig,
+      abortSignal,
+    );
     if (extracted) {
       // Bound AI output to outputMaxTokens in case the model went over
       const bounded = truncateToTokenBudget(extracted, settings.outputMaxTokens, truncateOpts, modelName);

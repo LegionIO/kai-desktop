@@ -17,6 +17,7 @@
  */
 
 import type SharpNs from 'sharp';
+import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
 
 /** Media-fit settings, mirroring the `compaction.media` config section. */
 export type MediaFitConfig = {
@@ -105,22 +106,27 @@ function truncateTextToTokens(text: string, maxTokens: number): string {
  * Hard ceiling on a single image's DECODED byte size that we're willing to feed
  * to `Buffer.from`/sharp. Untrusted plugin `_modelContent` reaches here; a
  * multi-hundred-MB base64 blob would otherwise force an unbounded allocation +
- * native libvips decode before we even measure it. Matches the per-part cap the
- * downstream `extractModelContent` sanitizer enforces (5 MiB) — anything larger
- * is dropped WITHOUT decoding (it would be dropped downstream regardless). The
- * base64 STRING length is checked first (cheap, no allocation).
+ * native libvips decode before we even measure it. Reads the SAME per-part cap
+ * the downstream `extractModelContent` sanitizer enforces (configurable via
+ * `compaction.media.maxImageBytes`) — anything larger is dropped WITHOUT decoding
+ * (it would be dropped downstream regardless). The base64 STRING length is
+ * checked first (cheap, no allocation).
  */
-const MAX_DECODE_BYTES = 5 * 1024 * 1024;
+function maxDecodeBytes(): number {
+  return getMaxPartBytes();
+}
 /** Whole-REQUEST media byte ceiling (branch + this turn), the default for
  *  fitModelContentToBudget's maxTotalMediaBytes. Larger than the per-tool-result
- *  12 MiB (extractModelContent's MAX_TOTAL_BYTES) because a request legitimately
+ *  cap (extractModelContent's per-result total) because a request legitimately
  *  carries media from several turns; kept well under typical provider request
  *  limits (Anthropic ~32 MB total incl. text/schemas) so the media alone can't
  *  bloat a request that also carries the transcript + tool schemas. */
 export const DEFAULT_MAX_TOTAL_MEDIA_BYTES = 20 * 1024 * 1024;
-/** Max base64 chars for MAX_DECODE_BYTES (base64 inflates ~4/3). A generous
- *  upper bound so we reject before allocating the Buffer. */
-const MAX_DECODE_BASE64_CHARS = Math.ceil((MAX_DECODE_BYTES * 4) / 3) + 4;
+/** Max base64 chars for the per-part decode cap (base64 inflates ~4/3). A
+ *  generous upper bound so we reject before allocating the Buffer. */
+function maxDecodeBase64Chars(): number {
+  return Math.ceil((maxDecodeBytes() * 4) / 3) + 4;
+}
 
 /**
  * Max decoded PIXEL AREA (width×height) we're willing to actually re-encode. The
@@ -237,7 +243,8 @@ const NATIVE_MEDIA_CACHE_MAX = 512;
  *  occur in practice). */
 const CACHE_KEY_SAMPLE = 1024;
 function cacheKeyFor(s: string): string {
-  const head = s.length <= CACHE_KEY_SAMPLE * 2 ? s : s.slice(0, CACHE_KEY_SAMPLE) + s.slice(s.length - CACHE_KEY_SAMPLE);
+  const head =
+    s.length <= CACHE_KEY_SAMPLE * 2 ? s : s.slice(0, CACHE_KEY_SAMPLE) + s.slice(s.length - CACHE_KEY_SAMPLE);
   let h = 0x811c9dc5;
   for (let i = 0; i < head.length; i++) {
     h ^= head.charCodeAt(i);
@@ -341,11 +348,11 @@ export async function stripBranchMediaForCount(
 ): Promise<{ stripped: unknown[]; nativeMediaTokens: number; retainedMediaBytes: number }> {
   // Mirror extractModelContent's per-tool-result retention so we count ONLY the media
   // the sanitizer actually forwards to the provider — a historical result with four
-  // 5.1 MiB images becomes omission notes provider-side (each over the 5 MiB per-part
-  // cap), so counting their raw bytes would over-seed the whole-request ceiling and
-  // wrongly drop a new small image. Values match tool-model-content.ts.
-  const SANITIZER_MAX_PART_BYTES = 5 * 1024 * 1024;
-  const SANITIZER_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+  // images each over the per-part cap becomes omission notes provider-side, so counting
+  // their raw bytes would over-seed the whole-request ceiling and wrongly drop a new
+  // small image. Values come from tool-model-content.ts (the single source of truth).
+  const SANITIZER_MAX_PART_BYTES = getMaxPartBytes();
+  const SANITIZER_MAX_TOTAL_BYTES = getMaxTotalBytes();
   const SANITIZER_MAX_PARTS = 64;
   const mediaToEstimate: Array<{ data: string; isImage: boolean; mediaType?: string }> = [];
   let retainedMediaBytes = 0;
@@ -497,7 +504,6 @@ function mb(base64: string): string {
  *  namespace itself, so we read `.default` first and fall back to the module. */
 type SharpFactory = typeof SharpNs;
 
-
 /**
  * Lazily load sharp. Returns null when the native addon can't be loaded (dev/test
  * without the binary, or a load failure) so callers fall back to the drop path
@@ -547,11 +553,11 @@ export async function fitImagePart(
   // (cheap, no allocation) so untrusted plugin content can't force an unbounded
   // Buffer.from()/sharp decode. Above the cap the image would be dropped by the
   // downstream sanitizer anyway; drop it here without touching sharp.
-  if (data.length > MAX_DECODE_BASE64_CHARS) {
+  if (data.length > maxDecodeBase64Chars()) {
     return {
       kind: 'dropped',
       originalTokens: estimateImageTokensFromBytes(data),
-      note: `[image omitted: ~${mb(data)} MB exceeds the ${(MAX_DECODE_BYTES / (1024 * 1024)).toFixed(0)} MB per-image limit; resize or re-encode the image smaller, then retry]`,
+      note: `[image omitted: ~${mb(data)} MB exceeds the ${(maxDecodeBytes() / (1024 * 1024)).toFixed(1)} MB per-image limit; resize or re-encode the image smaller, then retry]`,
     };
   }
 
@@ -668,11 +674,11 @@ export async function fitImagePart(
     if (!reencoded) break; // re-encode failed → fail safe below
     const est = estimateImageTokensFromDimensions(reencoded.width, reencoded.height);
     // The re-encoded output must ALSO fit the downstream per-part byte cap that
-    // extractModelContent enforces (MAX_DECODE_BYTES) — a large re-encoded PNG can
+    // extractModelContent enforces (maxDecodeBytes) — a large re-encoded PNG can
     // exceed it and be silently dropped there despite being "kept" here. If it's
     // over the byte cap, keep shrinking rather than returning an output that will
     // be discarded downstream.
-    if (est <= budgetTokens && reencoded.buffer.byteLength <= MAX_DECODE_BYTES) {
+    if (est <= budgetTokens && reencoded.buffer.byteLength <= maxDecodeBytes()) {
       const outData = reencoded.buffer.toString('base64');
       return {
         kind: 'downscaled',
@@ -696,7 +702,7 @@ export async function fitImagePart(
         if (signal?.aborted) return abortedUnchanged();
         const quality = Math.max(floor, q);
         const lower = await reencode(sharpMod, buffer, targetEdge, quality, meta.format, meta.hasAlpha === true);
-        if (lower && lower.buffer.byteLength <= MAX_DECODE_BYTES) {
+        if (lower && lower.buffer.byteLength <= maxDecodeBytes()) {
           const lowerEst = estimateImageTokensFromDimensions(lower.width, lower.height);
           if (lowerEst <= budgetTokens) {
             return {
@@ -758,14 +764,12 @@ async function reencode(
     // re-encode strips metadata by default — without this, a JPEG/WebP that
     // relied on an EXIF orientation flag would be resized in its stored (un-
     // rotated) orientation and emitted rotated/mirrored to the model.
-    let pipeline = sharpMod(buffer, { limitInputPixels: MAX_DECODE_PIXELS })
-      .rotate()
-      .resize({
-        width: targetEdgeInt,
-        height: targetEdgeInt,
-        fit: 'inside',
-        withoutEnlargement: true,
-      });
+    let pipeline = sharpMod(buffer, { limitInputPixels: MAX_DECODE_PIXELS }).rotate().resize({
+      width: targetEdgeInt,
+      height: targetEdgeInt,
+      fit: 'inside',
+      withoutEnlargement: true,
+    });
     const encodeQuality = Math.max(1, Math.min(100, Math.floor(quality)));
     // PNG is lossless — quality doesn't apply (only JPEG honors the descent).
     pipeline = format === 'jpeg' ? pipeline.jpeg({ quality: encodeQuality }) : pipeline.png();
@@ -881,7 +885,7 @@ export async function fitModelContentToBudget(
   //
   // A part is dropped (loudly, via droppedCount → UI note) once accepting it would
   // cross EITHER ceiling.
-  const MAX_AGGREGATE_MEDIA_BYTES = 12 * 1024 * 1024;
+  const MAX_AGGREGATE_MEDIA_BYTES = getMaxTotalBytes();
   const seed = Math.max(0, alreadyCommittedMediaBytes);
   const totalCeiling = Math.max(0, maxTotalMediaBytes ?? DEFAULT_MAX_TOTAL_MEDIA_BYTES);
   // Per-call aggregate starts at 0 (only THIS call's kept bytes); whole-request total
@@ -936,8 +940,7 @@ export async function fitModelContentToBudget(
     // string `data` AND a non-empty string `mediaType` (and a file's optional
     // `filename`, if present, must be a string). Parts failing this are discarded
     // downstream WITHOUT consuming its 64-part cap, so they must not consume ours.
-    const dataOk =
-      typeof (part as { data?: unknown }).data === 'string' && (part as { data: string }).data.length > 0;
+    const dataOk = typeof (part as { data?: unknown }).data === 'string' && (part as { data: string }).data.length > 0;
     const mediaTypeOk =
       typeof (part as { mediaType?: unknown }).mediaType === 'string' &&
       (part as { mediaType: string }).mediaType.length > 0;
@@ -1041,11 +1044,12 @@ export async function fitModelContentToBudget(
         (part as { data: string }).data,
         (part as { mediaType?: string }).mediaType,
       );
-      // Also respect the downstream PER-PART 5 MiB cap (MAX_DECODE_BYTES) — a file
-      // over it is silently replaced downstream, so drop it here (loud) instead of
-      // charging phantom keptTokens that shrink later media's budget.
+      // Also respect the downstream PER-PART byte cap (maxDecodeBytes / the
+      // configurable maxImageBytes) — a file over it is silently replaced
+      // downstream, so drop it here (loud) instead of charging phantom keptTokens
+      // that shrink later media's budget.
       const fileCap = capExceeded(fileBytes);
-      if (est <= budget && fileBytes <= MAX_DECODE_BYTES && fileCap === null) {
+      if (est <= budget && fileBytes <= maxDecodeBytes() && fileCap === null) {
         callMediaBytes += fileBytes;
         totalMediaBytes += fileBytes;
         keptMediaBytes += fileBytes;
@@ -1058,10 +1062,10 @@ export async function fitModelContentToBudget(
         droppedCount += 1;
         // Emit the omission note ONLY if it fits the remaining budget; else drop
         // the media SILENTLY (the aggregate UI note + droppedCount still record it).
-        // Pick the remedy by WHY it dropped: a FIXED cap (per-attachment 5 MiB, or the
-        // per-result 12 MiB combined-media cap) can't be relieved by /compact — ask for
+        // Pick the remedy by WHY it dropped: a FIXED cap (per-attachment, or the
+        // per-result combined-media cap) can't be relieved by /compact — ask for
         // smaller/fewer files; a whole-request/context drop CAN be relieved by /compact.
-        const fixedCap = fileBytes > MAX_DECODE_BYTES || fileCap === 'per-result';
+        const fixedCap = fileBytes > maxDecodeBytes() || fileCap === 'per-result';
         const note = fixedCap
           ? `[file omitted: exceeds the per-attachment/per-result media size limit; send a smaller file, then retry]`
           : `[file omitted: too large for the remaining context window; run /compact to free space, then retry]`;
@@ -1082,14 +1086,14 @@ export async function fitModelContentToBudget(
       // cap? If so, drop it here (loudly) rather than let extractModelContent drop
       // it silently. (Compares the ACTUAL bytes that would be sent.)
       const partBytes = approxBytesFromBase64(fit.data);
-      // The sanitizer's per-part predicate is on DECODED bytes (MAX_DECODE_BYTES), but
+      // The sanitizer's per-part predicate is on DECODED bytes (maxDecodeBytes), but
       // fitImagePart's cheap guard is on base64 STRING length — base64 padding makes the
-      // two disagree right at the 5 MiB boundary, so an image of ~5 MiB+1 can return
+      // two disagree right at the cap boundary, so an image of ~cap+1 can return
       // `unchanged` here yet be DROPPED by extractModelContent downstream. Charging it as
       // retained then over-counts the budget (phantom bytes) and can push a following
       // valid image out. Enforce the same per-part decoded-byte cap the sanitizer uses —
       // treat an over-cap image as a FIXED-cap drop (compaction can't relieve it).
-      const overPerPart = partBytes > MAX_DECODE_BYTES;
+      const overPerPart = partBytes > maxDecodeBytes();
       const imgCap = overPerPart ? 'per-result' : capExceeded(partBytes);
       if (imgCap !== null) {
         changed = true;
