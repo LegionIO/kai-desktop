@@ -7097,7 +7097,8 @@ export function registerAgentHandlers(
                       true, // match the actual live compaction boundary (protects newest user)
                     );
                     const prefix = (chatMessages as unknown[]).slice(0, boundaryIndex);
-                    prefixMediaBytes = (await stripBranchMediaForCount(prefix, controller.signal)).retainedMediaBytes;
+                    prefixMediaBytes = (await stripBranchMediaForCount(prefix, controller.signal, appHome))
+                      .retainedMediaBytes;
                   } catch {
                     /* best-effort — treat as removable (fall through to force) */
                     prefixMediaBytes = branchMediaBytes;

@@ -2432,6 +2432,7 @@ export function registerConversationHandlers(
             config.compaction.conversation.triggerPercent,
             em.window, // RAW window: trigger = triggerPercent × window (not pre-reduced)
             signal,
+            appHome,
           );
           const inputBudget =
             em.window -

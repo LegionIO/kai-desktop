@@ -202,9 +202,13 @@ export function saveMediaToFile(
  * Returns a URL like <protocol>://images/file.png
  */
 export function filePathToUrl(filePath: string): string {
-  // Extract the relative path after /media/ to form the protocol URL
+  // Extract the relative path after the media root to form the protocol URL. Use the
+  // LAST `/media/` segment, not the first: a custom app home (KAI_USER_DATA) can itself
+  // contain `/media/` — e.g. `/tmp/media/kai/media/images/x.png` — and slicing at the
+  // first occurrence would yield `kai-media://kai/media/images/x.png`, which the
+  // protocol handler (rooted at <appHome>/media) then resolves to the wrong path.
   const mediaMarker = '/media/';
-  const idx = filePath.indexOf(mediaMarker);
+  const idx = filePath.lastIndexOf(mediaMarker);
   if (idx !== -1) {
     const relativePath = filePath.slice(idx + mediaMarker.length);
     return __BRAND_MEDIA_PROTOCOL + '://' + relativePath;

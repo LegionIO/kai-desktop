@@ -1125,7 +1125,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       // the realpath check above cannot redirect the read to another target.
       const ext = extname(realMediaPath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      let data: Buffer;
+      const MEDIA_RANGE_CHUNK = 4 * 1024 * 1024; // cap a single range response at 4 MiB
       let fd: number | null = null;
       try {
         // O_NOFOLLOW: after realpathSync every ancestor is already canonical, so
@@ -1139,7 +1139,50 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           res.end('Not Found');
           return;
         }
-        data = Buffer.allocUnsafe(st.size);
+        // Honor a single `bytes=start-end` Range (R2-3): a media element / bounded
+        // preview fetch can request just the bytes it needs so we never allocate the
+        // whole (up to 512 MiB) file. Read ONLY the requested span (capped), through
+        // the same fd, and answer 206. Multi-range / malformed → fall through to a
+        // bounded full read below.
+        const rangeHeader = req.headers.range;
+        const m = typeof rangeHeader === 'string' ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+        if (m && (m[1] !== '' || m[2] !== '')) {
+          let start: number;
+          let end: number;
+          if (m[1] === '') {
+            // suffix range bytes=-N → last N bytes
+            const n = Math.min(parseInt(m[2], 10), st.size);
+            start = Math.max(0, st.size - n);
+            end = st.size - 1;
+          } else {
+            start = parseInt(m[1], 10);
+            end = m[2] === '' ? st.size - 1 : Math.min(parseInt(m[2], 10), st.size - 1);
+          }
+          if (Number.isNaN(start) || start >= st.size || start > end) {
+            res.writeHead(416, { 'Content-Range': `bytes */${st.size}`, 'Content-Type': 'text/plain' });
+            res.end('Range Not Satisfiable');
+            return;
+          }
+          end = Math.min(end, start + MEDIA_RANGE_CHUNK - 1);
+          const span = end - start + 1;
+          const buf = Buffer.allocUnsafe(span);
+          let off = 0;
+          while (off < span) {
+            const r = readSync(fd, buf, off, span - off, start + off);
+            if (r <= 0) break;
+            off += r;
+          }
+          res.writeHead(206, {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${start}-${start + off - 1}/${st.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': off,
+            'Cache-Control': 'no-cache',
+          });
+          res.end(off === span ? buf : buf.subarray(0, off));
+          return;
+        }
+        let data = Buffer.allocUnsafe(st.size);
         let offset = 0;
         while (offset < st.size) {
           const bytesRead = readSync(fd, data, offset, st.size - offset, offset);
@@ -1147,6 +1190,14 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           offset += bytesRead;
         }
         if (offset !== st.size) data = data.subarray(0, offset);
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Length': data.byteLength,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-cache',
+        });
+        res.end(data);
+        return;
       } catch {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
@@ -1160,13 +1211,6 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           }
         }
       }
-      res.writeHead(200, {
-        'Content-Type': contentType,
-        'Content-Length': data.byteLength,
-        'Cache-Control': 'no-cache',
-      });
-      res.end(data);
-      return;
     }
 
     // --- Serve plugin frontend files directly from plugin directory ---

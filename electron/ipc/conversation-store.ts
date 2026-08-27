@@ -1104,16 +1104,22 @@ export function sanitizeConversationTree(
   // is nothing to offload. appHome is optional so structural-only test callers skip
   // media offload entirely.
   let tree = sanitizedTree;
+  let mediaOffloaded = false;
   if (appHome) {
     const offloaded = offloadTreeDisplayMedia(sanitizedTree, appHome);
     if (offloaded.rewritten > 0) {
       tree = offloaded.tree as typeof sanitizedTree;
-      // Also offload the linear `messages` mirror: the backfill-only path below maps
-      // it from `conv.messages` (not re-derived from the tree), so without this the
-      // mirror keeps the base64 the tree just shed. Content-addressed → identical
-      // bytes resolve to the same URL on both arrays.
-      if (Array.isArray(conv.messages)) {
-        conv = { ...conv, messages: offloadTreeDisplayMedia(conv.messages, appHome).tree as unknown[] };
+      mediaOffloaded = true;
+    }
+    // Offload the linear `messages` mirror INDEPENDENTLY: the backfill-only path
+    // below maps it from `conv.messages` (not re-derived from the tree), so a tree
+    // that was already URL-ized could still carry a stale base64 mirror. Content-
+    // addressed → identical bytes resolve to the same URL on both arrays.
+    if (Array.isArray(conv.messages)) {
+      const msgOffload = offloadTreeDisplayMedia(conv.messages, appHome);
+      if (msgOffload.rewritten > 0) {
+        conv = { ...conv, messages: msgOffload.tree as unknown[] };
+        mediaOffloaded = true;
       }
     }
   }
@@ -1191,7 +1197,16 @@ export function sanitizeConversationTree(
     backfilled++;
   }
 
-  if (!report.changed && backfilled === 0) return conv;
+  if (!report.changed && backfilled === 0) {
+    // Nothing structural changed and no count was (re)computed. But if media offload
+    // rewrote the tree and/or messages mirror (files already written to disk), we
+    // must persist the URL-ized versions — returning the original `conv` would drop
+    // them, re-persisting base64 AND orphaning the just-written media file.
+    if (mediaOffloaded) {
+      return { ...conv, messageTree: tree as unknown[] };
+    }
+    return conv;
+  }
 
   if (report.changed) {
     // A repair means an upstream write produced a corrupt tree (dup id / parent
@@ -1479,6 +1494,26 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
     console.error('[conversation-store] writeConversation: index maintenance failed after file commit', err);
   }
   lastWriteSuppressed.delete(sanitized.id);
+  // Reclaim media a REWRITE dropped: if the prior on-disk tree referenced media the
+  // newly-committed tree no longer does (e.g. dropConversationMessages during an
+  // automation rollback removed the last reference), that file would otherwise never
+  // enter deletion GC (which only sees the CURRENT record). Diff prior→new refs and
+  // GC the dropped ones. gcMediaAfterDelete scans surviving conversations — including
+  // this just-written record — so a ref still present anywhere is correctly retained.
+  if (appHome) {
+    try {
+      const priorRefs = collectReferencedMediaPaths(priorTree);
+      if (priorRefs.size > 0) {
+        const newRefs = collectReferencedMediaPaths(sanitized.messageTree);
+        collectReferencedMediaPaths(sanitized.messages, newRefs);
+        const dropped = new Set<string>();
+        for (const r of priorRefs) if (!newRefs.has(r)) dropped.add(r);
+        if (dropped.size > 0) gcMediaAfterDelete(appHome, dropped);
+      }
+    } catch {
+      /* best-effort rewrite GC — never fails a committed write */
+    }
+  }
   return sanitized;
 }
 

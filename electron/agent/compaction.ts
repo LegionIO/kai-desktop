@@ -19,6 +19,8 @@ import {
   isSanitizerRetainableMedia,
 } from './media-fit.js';
 import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
+import { extForMime } from './offload-display-media.js';
+import { offloadedMediaSize, estimateNativeTokensFromSize } from './media-fit.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
 // Cap on CONCURRENT outstanding summarizer generates. An aborted/timed-out compaction
@@ -47,35 +49,48 @@ let outstandingSummarizerGenerates = 0;
 /**
  * A representation-invariant identity for a media part's value, used by
  * messageContentSignature so the inline-base64 and offloaded-`kai-media://` forms
- * of the SAME bytes sign identically (no false compaction drift after offload),
- * while DIFFERENT bytes still differ (a same-id attachment swap is real drift).
+ * of the SAME bytes+type sign identically (no false compaction drift after offload),
+ * while DIFFERENT bytes OR a different declared type still differ (a same-id swap,
+ * or the same bytes relabeled PDF↔text, is real drift).
  *
- * Both forms must map to the SAME token for the same bytes. Display-media offload
- * names files `sha256(decodedBytes).slice(0,16).<ext>`, so:
- * - `kai-media://<type>/<hash>.<ext>`: the hash IS the byte identity → use it.
- * - `data:...;base64,<payload>`: decode and take the same sha256 prefix, so it
- *   equals the URL form's hash for identical bytes.
- * - anything else (http URL, bare base64, undecodable): fall back to a hash of the
- *   raw string (stable, though not cross-form — those never undergo the transform).
+ * Both forms must map to the same token for the same bytes AND type. Display-media
+ * offload names files `sha256(decodedBytes).slice(0,16).<ext>` under a type subdir,
+ * so:
+ * - `kai-media://<type>/<hash>.<ext>`: KEEP the full `<hash>.<ext>` basename (the ext
+ *   encodes the type → PDF vs text of identical bytes differ).
+ * - `data:<mime>;base64,<payload>`: `sha256(decodedBytes)[:16]` + the ext the offload
+ *   would assign for `<mime>` → equals the URL form for identical bytes+type.
+ * - anything else (http URL, bare/malformed/empty base64): hash the raw string (never
+ *   cross-form — these don't undergo the offload transform; hashing the raw value also
+ *   avoids the empty-decode collision where distinct malformed payloads share 0 bytes).
+ *
+ * NB: the data-URL branch decodes the full payload to match the offload filename's
+ * digest exactly (cross-form invariance is load-bearing for compaction reuse). This
+ * is a transient allocation of an already-resident payload, and only occurs for a
+ * not-yet-offloaded in-memory tree — a persisted tree signs the cheap URL form.
  */
 function mediaIdentityToken(value: string): string {
   const MEDIA_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
   if (value.startsWith(MEDIA_PREFIX)) {
-    // e.g. images/<hash>.png → the basename minus extension is the content hash.
     const rel = value.slice(MEDIA_PREFIX.length).split('?')[0];
-    const base = rel.split('/').pop() ?? rel;
-    const hash = base.replace(/\.[a-z0-9]+$/i, '');
-    return 'm:' + hash;
+    return 'm:' + (rel.split('/').pop() ?? rel); // <hash>.<ext> — ext carries the type
   }
-  const base64Match = /^data:[^;,]*(?:;[^,]*)?;base64,([\s\S]*)$/.exec(value);
+  const base64Match = /^data:([^;,]*)(?:;[^,]*)?;base64,([\s\S]*)$/.exec(value);
   if (base64Match) {
-    try {
-      const bytes = Buffer.from(base64Match[1], 'base64');
-      // Same digest + prefix length the offload filename uses, so data-URL and
-      // kai-media:// identities coincide for identical bytes.
-      return 'm:' + createHash('sha256').update(bytes).digest('hex').slice(0, 16);
-    } catch {
-      /* fall through to raw-string hash */
+    const mime = base64Match[1] ?? '';
+    const payload = base64Match[2] ?? '';
+    if (payload.length > 0) {
+      try {
+        const bytes = Buffer.from(payload, 'base64');
+        // Reject an empty/undecodable payload (matches the offload's own guard) so two
+        // distinct malformed values don't collide on a zero-byte digest.
+        if (bytes.length > 0) {
+          const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+          return `m:${digest}.${extForMime(mime)}`;
+        }
+      } catch {
+        /* fall through to raw-string hash */
+      }
     }
   }
   return 'h:' + createHash('sha1').update(value).digest('hex');
@@ -496,8 +511,9 @@ export async function shouldCompactBranchMediaAware(
   triggerPercent: number,
   contextWindowOverride?: number,
   signal?: AbortSignal,
+  appHome?: string,
 ): Promise<ShouldCompactResult> {
-  const { messages: stripped, mediaTokens } = await stripMediaForSerialization(messages, { signal });
+  const { messages: stripped, mediaTokens } = await stripMediaForSerialization(messages, { signal, appHome });
   return shouldCompactAsync(stripped, modelName, triggerPercent, contextWindowOverride, signal, mediaTokens);
 }
 
@@ -532,7 +548,7 @@ export function isStrictPrefix(ids: readonly string[], branchIds: readonly strin
  */
 async function stripMediaForSerialization(
   messages: ChatMessage[],
-  options: { countMedia?: boolean; signal?: AbortSignal } = {},
+  options: { countMedia?: boolean; signal?: AbortSignal; appHome?: string } = {},
 ): Promise<{ messages: ChatMessage[]; mediaTokens: number }> {
   // Collect media payloads to estimate by DIMENSIONS (via estimateNativeMediaTokens
   // — sharp header probe, cached), not compressed bytes: bytes/2 charges a 1 MiB
@@ -543,7 +559,13 @@ async function stripMediaForSerialization(
   // dropped entirely) avoid decoding a media-heavy history for a number they throw
   // away.
   const countMedia = options.countMedia !== false;
+  const appHome = options.appHome;
   const mediaToEstimate: Array<{ data: string; isImage: boolean; mediaType?: string }> = [];
+  // Native tokens for OFFLOADED (kai-media://) attachments resolved by file size —
+  // estimateNativeMediaTokens can't probe a URL string (it would decode the ~40-char
+  // URL as base64 → a garbage ~0 estimate, undercounting the request). Accumulated
+  // here and folded into mediaTokens at the end.
+  let offloadedMediaTokens = 0;
   const out = messages.map((m) => {
     if (!m || typeof m !== 'object') return m;
     const content = (m as { content?: unknown }).content;
@@ -558,11 +580,20 @@ async function stripMediaForSerialization(
       // bare image with no accompanying text vanishes silently from future context.
       if ((p.type === 'image' || p.type === 'file') && typeof (p.data ?? p.image) === 'string') {
         touched = true;
-        mediaToEstimate.push({
-          data: (p.data ?? p.image) as string,
-          isImage: p.type === 'image',
-          mediaType: (p.mimeType ?? p.mediaType) as string | undefined,
-        });
+        const value = (p.data ?? p.image) as string;
+        const mediaType = (p.mimeType ?? p.mediaType) as string | undefined;
+        // An offloaded kai-media:// value: resolve its real size and estimate from
+        // that (a URL can't be sharp-probed). A missing/unresolvable file contributes
+        // nothing. Everything else (inline base64) goes through the normal probe path.
+        const offSize = countMedia && appHome ? offloadedMediaSize(value, appHome) : null;
+        if (offSize !== null) {
+          const urlExt = value.split('?')[0].split('.').pop() ?? '';
+          offloadedMediaTokens += estimateNativeTokensFromSize(offSize, p.type === 'image', mediaType, urlExt);
+        } else if (!value.includes('://')) {
+          // Inline data URL / bare base64 — probe as before. (A non-kai-media scheme
+          // URL — http, or an unresolvable kai-media — is left uncounted here.)
+          mediaToEstimate.push({ data: value, isImage: p.type === 'image', mediaType });
+        }
         const label = p.type === 'image' ? 'image' : 'file';
         const name = typeof p.filename === 'string' && p.filename ? ` "${p.filename}"` : '';
         return { type: 'text', text: `[${label}${name} attachment omitted from summary]` };
@@ -666,7 +697,7 @@ async function stripMediaForSerialization(
   // (a pathological media-heavy history could otherwise stall the turn); media
   // beyond it is charged the cheap byte estimate (never zero). Abort promptly if
   // the run was cancelled during the probes.
-  let mediaTokens = 0;
+  let mediaTokens = offloadedMediaTokens;
   const CONCURRENCY = 4;
   const MEDIA_ESTIMATE_MAX = 128;
   const toProbe = mediaToEstimate.slice(0, MEDIA_ESTIMATE_MAX);

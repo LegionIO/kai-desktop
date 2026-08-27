@@ -219,20 +219,20 @@ export async function captureHeapSnapshot(
           // an untracked file at `filePath` outside retention. So when the timeout wins,
           // attach a late settler that removes whatever the abandoned capture eventually
           // wrote. Swallow its rejection so it never surfaces unhandled.
-          native.then(
-            () => {
-              if (timedOut) {
-                try {
-                  rmSync(filePath, { force: true });
-                } catch {
-                  /* best-effort late cleanup */
-                }
-              }
-            },
-            () => {
-              /* abandoned capture failed on its own — nothing to clean */
-            },
-          );
+          // If the timeout won the race, the native capture was abandoned but may
+          // still WRITE (then resolve OR reject with a partial left behind) or RECREATE
+          // the file at `filePath`. On EITHER late outcome, remove whatever it wrote so
+          // no untracked file escapes retention. (Not timed-out ⇒ the race resolved
+          // normally and the file is a real tracked snapshot — leave it.)
+          const cleanupLate = (): void => {
+            if (!timedOut) return;
+            try {
+              rmSync(filePath, { force: true });
+            } catch {
+              /* best-effort late cleanup */
+            }
+          };
+          native.then(cleanupLate, cleanupLate);
           // Whichever settles first wins; clear the timer in finally so a resolved
           // capture leaves no dangling handle.
           return Promise.race([native, timeout]).finally(() => {

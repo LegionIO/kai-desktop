@@ -26,7 +26,7 @@ import { safeReadRangeWithin } from '../utils/safe-file-read.js';
  *  attributes an offloaded attachment its REAL size instead of the ~40-char URL
  *  string — otherwise /compact and the media budget under-count it. A 1-byte
  *  ranged read yields the total size without buffering the file. */
-function offloadedMediaSize(value: string, appHome: string): number | null {
+export function offloadedMediaSize(value: string, appHome: string): number | null {
   const prefix = __BRAND_MEDIA_PROTOCOL + '://';
   if (!value.startsWith(prefix)) return null;
   const mediaDir = join(appHome, 'media');
@@ -244,6 +244,12 @@ function isDocumentMediaType(mediaType: string | undefined): boolean {
     m.includes('presentation')
   );
 }
+/** Document-ness from a file EXTENSION (offloaded URLs carry ext, not MIME). */
+function isDocumentExt(ext: string): boolean {
+  return ['pdf', 'doc', 'docx', 'rtf', 'epub', 'ppt', 'pptx', 'xls', 'xlsx', 'odt', 'ods', 'odp'].includes(
+    ext.toLowerCase(),
+  );
+}
 export function estimateFileTokensFromBytes(base64: string, mediaType?: string): number {
   const bytes = approxBytesFromBase64(stripDataUrlPrefix(base64));
   // A document is a document whether declared via the outer mediaType OR the
@@ -254,14 +260,28 @@ export function estimateFileTokensFromBytes(base64: string, mediaType?: string):
 }
 
 /** Native token estimate from a KNOWN decoded byte count (for an offloaded
- *  kai-media:// attachment whose bytes we don't read — only its file size). Mirrors
- *  estimateImageTokensFromBytes / estimateFileTokensFromBytes but takes raw bytes,
- *  and (having no data-URL) relies solely on the declared mediaType for the
- *  document check. */
-export function estimateNativeTokensFromSize(bytes: number, isImage: boolean, mediaType?: string): number {
+ *  kai-media:// attachment whose bytes we don't read — only its file size, and
+ *  optionally its declared type). Mirrors estimateImageTokensFromBytes /
+ *  estimateFileTokensFromBytes but takes raw bytes.
+ *
+ *  For an IMAGE we lack dimensions, and bytes/2 UNDER-counts a pixel-bomb (tiny
+ *  compressed bytes, huge dimensions). Since a single image's dimension-based cost
+ *  is BOUNDED (~1536 patches × 2.5 ≈ 3840 tokens — see estimateImageTokensFrom
+ *  Dimensions), floor the estimate at that maximum so a small-bytes/huge-pixels
+ *  image can't slip under the budget. Over-estimating only shrinks the media budget,
+ *  which is the safe direction. `ext` (from the offloaded URL) refines the file
+ *  document-multiplier when no mediaType was declared. */
+const MAX_SINGLE_IMAGE_TOKENS = 3840; // ceil(1536 patches × 2.5) — the per-image cap
+export function estimateNativeTokensFromSize(
+  bytes: number,
+  isImage: boolean,
+  mediaType?: string,
+  ext?: string,
+): number {
   if (bytes <= 0) return 0;
-  if (isImage) return Math.ceil(bytes / 2);
-  return isDocumentMediaType(mediaType) ? bytes * DOCUMENT_EXPANSION_MULTIPLIER : bytes;
+  if (isImage) return Math.max(Math.ceil(bytes / 2), MAX_SINGLE_IMAGE_TOKENS);
+  const isDoc = isDocumentMediaType(mediaType) || (ext !== undefined && isDocumentExt(ext));
+  return isDoc ? bytes * DOCUMENT_EXPANSION_MULTIPLIER : bytes;
 }
 
 /** LRU cache of native token estimates keyed by a fast hash of the bare base64.
@@ -460,10 +480,12 @@ export async function stripBranchMediaForCount(
           if (size === null) return part; // unresolvable → leave untouched
           retainedMediaBytes += size;
           const mediaType = (p.mimeType ?? p.mediaType) as string | undefined;
-          // Size-based native token estimate (no bytes needed). estimateImageTokensFromBytes
-          // / estimateFileTokensFromBytes accept the DECODED byte count via a fake-length
-          // base64 string is unnecessary — use the dimensions-agnostic byte estimators.
-          preResolvedNativeTokens += estimateNativeTokensFromSize(size, p.type === 'image', mediaType);
+          // Size-based native token estimate (we don't read the bytes). For an image
+          // this floors at the per-image dimension cap so a pixel-bomb can't undercount;
+          // for a file the URL's extension refines the document multiplier when no
+          // mediaType is declared.
+          const urlExt = data.split('?')[0].split('.').pop() ?? '';
+          preResolvedNativeTokens += estimateNativeTokensFromSize(size, p.type === 'image', mediaType, urlExt);
           touched = true;
           const { data: _du, image: _iu, ...restU } = p;
           void _du;

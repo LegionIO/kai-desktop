@@ -11,6 +11,7 @@ import {
   fitImagePart,
   fitModelContentToBudget,
   stripBranchMediaForCount,
+  estimateNativeTokensFromSize,
   type MediaFitConfig,
 } from '../media-fit';
 
@@ -913,5 +914,30 @@ describe('stripBranchMediaForCount (sanitizer-aware retention for the whole-requ
     // Dropped by the sanitizer → neither counted as bytes nor charged native tokens.
     expect(retainedMediaBytes).toBe(0);
     expect(nativeMediaTokens).toBe(0);
+  });
+});
+
+describe('estimateNativeTokensFromSize (R3-F4 — size-only, no dimensions)', () => {
+  it('floors an image at the per-image dimension cap so a small-bytes pixel-bomb cannot undercount', () => {
+    // A 2 KB compressed image: bytes/2 = ~1024, but a huge-dimension image can cost far
+    // more; the floor guarantees a safe over-estimate.
+    const small = estimateNativeTokensFromSize(2048, true);
+    expect(small).toBeGreaterThanOrEqual(3840);
+    // A large image is charged by bytes when that exceeds the floor.
+    expect(estimateNativeTokensFromSize(20_000, true)).toBe(10_000);
+  });
+
+  it('applies the document multiplier from the URL extension when no mediaType is declared', () => {
+    // PDF by extension → 5× bytes even without a mediaType.
+    expect(estimateNativeTokensFromSize(1000, false, undefined, 'pdf')).toBe(5000);
+    // Plain file → 1× bytes.
+    expect(estimateNativeTokensFromSize(1000, false, undefined, 'txt')).toBe(1000);
+    // Declared mediaType still works.
+    expect(estimateNativeTokensFromSize(1000, false, 'application/pdf')).toBe(5000);
+  });
+
+  it('returns 0 for a non-positive size', () => {
+    expect(estimateNativeTokensFromSize(0, true)).toBe(0);
+    expect(estimateNativeTokensFromSize(-5, false)).toBe(0);
   });
 });

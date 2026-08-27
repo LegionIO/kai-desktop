@@ -313,8 +313,39 @@ describe('rehydrateModelMedia byte cap (R2-4)', () => {
     const out = rehydrateModelMedia(branch, appHome, 5000); // room for one 4KB image only
     const first = (out[0] as { content: Array<Record<string, unknown>> }).content[0].image as string;
     const second = (out[1] as { content: Array<Record<string, unknown>> }).content[0].image as string;
-    expect(first.startsWith('data:')).toBe(true); // first rehydrated (within cap)
-    expect(second.startsWith('data:')).toBe(false); // second left as a URL (cap exhausted)
-    expect(second).toBe(bUrl);
+    // Budgeting is NEWEST-FIRST: the most-recent (end-of-branch) attachment is kept,
+    // the older one is shed when the cap is hit (the current turn is about the newest).
+    expect(second.startsWith('data:')).toBe(true); // newest rehydrated (within cap)
+    expect(first.startsWith('data:')).toBe(false); // oldest left as a URL (cap exhausted)
+    expect(first).toBe(aUrl);
+  });
+});
+
+describe('collectReferencedMediaPaths — embedded URLs (R3-F2)', () => {
+  it('finds kai-media URLs embedded in markdown / prose / html, not just bare values', () => {
+    const proto = __BRAND_MEDIA_PROTOCOL;
+    const tree = [
+      { role: 'assistant', content: [{ type: 'text', text: `see ![x](${proto}://images/aaaa.png) and more` }] },
+      { role: 'assistant', content: [{ type: 'text', text: `<img src="${proto}://videos/bbbb.mp4?t=1">` }] },
+      { role: 'user', content: [{ type: 'image', image: `${proto}://images/cccc.png` }] },
+    ];
+    const refs = collectReferencedMediaPaths(tree);
+    expect(refs.has('images/aaaa.png')).toBe(true); // markdown link
+    expect(refs.has('videos/bbbb.mp4')).toBe(true); // html src, query stripped
+    expect(refs.has('images/cccc.png')).toBe(true); // bare value
+    expect(refs.size).toBe(3);
+  });
+
+  it('does not let a markdown-embedded surviving ref be GC-deleted', () => {
+    const proto = __BRAND_MEDIA_PROTOCOL;
+    const removed = collectReferencedMediaPaths([{ content: [{ image: `${proto}://images/shared0000000.png` }] }]);
+    // A survivor references the same file ONLY via markdown text.
+    const surviving = collectReferencedMediaPaths([
+      { content: [{ type: 'text', text: `![keep](${proto}://images/shared0000000.png)` }] },
+    ]);
+    expect(surviving.has('images/shared0000000.png')).toBe(true);
+    // gcOrphanedMedia would skip it because it's in survivingRefs (no unlink attempted).
+    expect(removed.size).toBe(1);
+    expect(surviving.has([...removed][0])).toBe(true);
   });
 });

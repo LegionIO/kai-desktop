@@ -80,6 +80,13 @@ function mediaTarget(mime: string): { type: 'images' | 'videos' | 'audio' | 'fil
   return { type: 'files', ext: 'bin' };
 }
 
+/** The file extension the offload assigns for a MIME type — the single source of
+ *  truth so the compaction identity token can reproduce an offloaded file's ext for
+ *  a not-yet-offloaded data: URL and hash cross-form-consistently. */
+export function extForMime(mime: string | undefined): string {
+  return mediaTarget(mime ?? '').ext;
+}
+
 /** True when a string is already a servable URL (offloaded or remote) — leave it. */
 function isAlreadyUrl(value: string): boolean {
   return (
@@ -231,6 +238,11 @@ export function offloadTreeDisplayMedia(tree: unknown, appHome: string): { tree:
 
 const MEDIA_PROTOCOL_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
 
+/** Escape a literal string for use inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** MIME for a media file extension (inverse of mediaTarget), for the data: prefix. */
 function mimeForExt(ext: string): string {
   const map: Record<string, string> = {
@@ -261,13 +273,23 @@ function mimeForExt(ext: string): string {
 /**
  * Resolve a `kai-media://images/<name>` URL to a `data:<mime>;base64,<...>` URL by
  * reading the referenced file. Returns null if the value isn't a media URL, the
- * path escapes mediaDir, or the file can't be read — callers then leave the value
- * as-is (a broken model image is better than crashing the turn). Security mirrors
+ * path escapes mediaDir, the file can't be read, or its size exceeds `maxBytes` —
+ * callers then leave the value as-is (a broken model image is better than crashing
+ * the turn, and an over-budget file must NOT be read into memory). Security mirrors
  * the protocol handler: strip query, decode, join under mediaDir, lexical
- * containment check so a crafted `../` URL can't read outside the media dir.
+ * containment, then a symlink/TOCTOU-safe (realpath + O_NOFOLLOW) read.
  * `mimeType` (from the part) takes precedence over the extension-derived MIME.
+ *
+ * The size is PROBED first (a 1-byte ranged read that returns the total size) so an
+ * over-`maxBytes` file is rejected WITHOUT allocating it — the bound is enforced
+ * before the read, not after.
  */
-export function rehydrateMediaUrl(value: string, appHome: string, mimeType?: string): string | null {
+export function rehydrateMediaUrl(
+  value: string,
+  appHome: string,
+  mimeType?: string,
+  maxBytes = MAX_MEDIA_BYTES,
+): string | null {
   if (typeof value !== 'string' || !value.startsWith(MEDIA_PROTOCOL_PREFIX)) return null;
   const mediaDir = join(appHome, 'media');
   const rawPath = value.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
@@ -278,15 +300,14 @@ export function rehydrateMediaUrl(value: string, appHome: string, mimeType?: str
     return null;
   }
   const filePath = join(mediaDir, rel);
-  // Lexical containment (cheap first pass); the symlink/TOCTOU-safe read below is
-  // authoritative. A bare statSync/readFileSync would FOLLOW a symlink planted
-  // inside mediaDir (by a crafted conversation/plugin tree) and read an arbitrary
-  // file, then send it to the model — so use the same realpath + O_NOFOLLOW helper
-  // the media protocol handler uses. A ranged read caps the size (a media file is
-  // ≤ MAX_MEDIA_BYTES; a larger/symlinked target is rejected via `size`).
   if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) return null;
-  const ranged = safeReadRangeWithin(mediaDir, filePath, 0, MAX_MEDIA_BYTES - 1);
-  if (!ranged || ranged.size === 0 || ranged.size > MAX_MEDIA_BYTES) return null;
+  const cap = Math.min(maxBytes, MAX_MEDIA_BYTES);
+  // Probe the size with a 1-byte read FIRST (symlink/TOCTOU-safe), so an
+  // over-budget/oversized/symlinked target is rejected before we allocate it.
+  const probe = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+  if (!probe || probe.size === 0 || probe.size > cap) return null;
+  const ranged = safeReadRangeWithin(mediaDir, filePath, 0, probe.size - 1);
+  if (!ranged || ranged.size === 0 || ranged.size > cap) return null;
   const buf = ranged.data;
   const ext = filePath.split('.').pop() ?? '';
   const mime = mimeType && typeof mimeType === 'string' ? mimeType : mimeForExt(ext);
@@ -303,31 +324,54 @@ export function rehydrateMediaUrl(value: string, appHome: string, mimeType?: str
  *
  * BOUNDED: rehydration base64-encodes files into memory, so an unbounded history of
  * attachments could spike the MAIN process (the very OOM we're preventing in the
- * renderer). We rehydrate in branch order until `maxTotalBytes` of decoded media has
- * been materialized, then leave further URLs un-rehydrated. The whole-request media
- * ceiling means the provider can't accept more than that anyway; the most-recent
- * turn's attachments (end of the branch) are what matter and comfortably fit, while
- * a pathological deep-history media pile can't OOM main. Default cap is generous
- * (4× the per-result media total) — enough for any realistic turn.
+ * renderer). We rehydrate NEWEST-FIRST until `maxTotalBytes` of decoded media has
+ * been materialized, then leave older URLs un-rehydrated: the current turn is about
+ * the most-recent attachments (end of the branch), so if the cap is ever hit it
+ * sheds the least-relevant OLDEST media, not the newest. The whole-request media
+ * ceiling means the provider can't accept more than the cap anyway. Default cap is
+ * generous (64 MiB) — enough for any realistic turn.
+ *
+ * Two passes so budgeting is newest-first while output stays in branch order: pass 1
+ * walks messages in REVERSE, resolving each media value into a map (value → data URL)
+ * until the budget is spent; pass 2 maps the branch forward, substituting only the
+ * values pass 1 chose to materialize.
  */
 export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTotalBytes = REHYDRATE_TOTAL_CAP): unknown[] {
   if (!Array.isArray(messages)) return messages;
-  let anyChanged = false;
+
+  // Pass 1 (newest-first): decide which media values to materialize within budget.
+  const resolved = new Map<string, string>(); // original value → data: URL
   let budget = maxTotalBytes;
-  // Resolve a value within the remaining byte budget; decrements budget by the
-  // materialized size. Returns null (leave as-is) when unresolvable OR the budget
-  // is exhausted / this file alone would blow it.
-  const resolve = (value: string, mimeType?: string): string | null => {
-    if (budget <= 0) return null;
-    const data = rehydrateMediaUrl(value, appHome, mimeType);
-    if (!data) return null;
-    // Approx decoded bytes from the produced data: URL (payload len * 3/4).
-    const payloadLen = data.length - (data.indexOf(',') + 1);
-    const bytes = Math.floor((payloadLen * 3) / 4);
-    if (bytes > budget) return null; // would exceed the cap → leave the URL
-    budget -= bytes;
-    return data;
-  };
+  for (let mi = messages.length - 1; mi >= 0 && budget > 0; mi--) {
+    const msg = messages[mi] as { content?: unknown };
+    if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) continue;
+    for (const raw of msg.content as LoosePart[]) {
+      if (budget <= 0) break;
+      const part = raw as LoosePart;
+      if (!part || typeof part !== 'object') continue;
+      const value =
+        part.type === 'image' && typeof part.image === 'string'
+          ? part.image
+          : part.type === 'file' && typeof part.data === 'string'
+            ? (part.data as string)
+            : null;
+      if (value === null || resolved.has(value)) continue; // dedup identical values (content-addressed)
+      const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
+      // Pass the REMAINING budget so an over-budget file is rejected before it's read
+      // into memory (the cap is enforced pre-allocation, not after).
+      const data = rehydrateMediaUrl(value, appHome, mime, budget);
+      if (!data) continue; // not a resolvable kai-media URL (or missing/over-budget) — leave as-is
+      const payloadLen = data.length - (data.indexOf(',') + 1);
+      const bytes = Math.floor((payloadLen * 3) / 4);
+      if (bytes > budget) continue; // defensive (probe already enforced) → leave as a URL
+      budget -= bytes;
+      resolved.set(value, data);
+    }
+  }
+  if (resolved.size === 0) return messages;
+
+  // Pass 2 (branch order): substitute only the values pass 1 materialized.
+  let anyChanged = false;
   const out = messages.map((rawMsg) => {
     const msg = rawMsg as { content?: unknown } & Record<string, unknown>;
     if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) return rawMsg;
@@ -335,9 +379,8 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
     const content = (msg.content as LoosePart[]).map((raw) => {
       const part = raw as LoosePart;
       if (!part || typeof part !== 'object') return raw;
-      const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
       if (part.type === 'image' && typeof part.image === 'string') {
-        const data = resolve(part.image, mime);
+        const data = resolved.get(part.image);
         if (data) {
           contentChanged = true;
           return { ...part, image: data };
@@ -345,7 +388,7 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
         return raw;
       }
       if (part.type === 'file' && typeof part.data === 'string') {
-        const data = resolve(part.data, mime);
+        const data = resolved.get(part.data);
         if (data) {
           contentChanged = true;
           return { ...part, data };
@@ -371,18 +414,32 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
 // references it. Collection scans the WHOLE tree (display parts AND tool
 // results / _modelContent), since generated media is referenced from tool output.
 
-/** Collect every `<mediaDir>`-relative path referenced by `kai-media://` URLs
- *  anywhere in a value (deep walk over arrays/objects/strings). Returned paths are
- *  normalized (query stripped, percent-decoded) for set membership. */
+/** Collect every `<mediaDir>`-relative path referenced by a `kai-media://` URL
+ *  ANYWHERE in a value — including URLs EMBEDDED in a larger string (markdown
+ *  `![alt](kai-media://images/x.png)`, HTML `src="…"`, prose), not just a bare
+ *  value that starts with the prefix. Deep walk over arrays/objects/strings.
+ *  Missing these embedded refs would let GC delete still-referenced media. Paths
+ *  are normalized (query stripped, percent-decoded) for set membership. */
 export function collectReferencedMediaPaths(value: unknown, into: Set<string> = new Set()): Set<string> {
+  // A kai-media URL ends at the first char that can't be part of one: whitespace,
+  // quote, paren/bracket, backtick, angle bracket (markdown/HTML/prose delimiters),
+  // OR `#` (a fragment like #page=2 is not part of the stored path). The query is
+  // stripped below. A trailing sentence punctuation char is then trimmed so prose
+  // like "...see kai-media://images/x.png." doesn't capture the period into the path
+  // — otherwise a survivor's bare-URL ref wouldn't match and GC could delete a live file.
+  const urlRe = new RegExp(escapeRegExp(MEDIA_PROTOCOL_PREFIX) + '[^\\s\'"`)\\]<>#]+', 'g');
   const visit = (v: unknown): void => {
     if (typeof v === 'string') {
-      if (v.startsWith(MEDIA_PROTOCOL_PREFIX)) {
-        const raw = v.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
-        try {
-          into.add(decodeURIComponent(raw));
-        } catch {
-          into.add(raw);
+      if (v.includes(MEDIA_PROTOCOL_PREFIX)) {
+        for (const match of v.match(urlRe) ?? []) {
+          const noQuery = match.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
+          const raw = noQuery.replace(/[.,;:!?]+$/, ''); // trim trailing prose punctuation
+          if (raw.length === 0) continue;
+          try {
+            into.add(decodeURIComponent(raw));
+          } catch {
+            into.add(raw);
+          }
         }
       }
       return;
