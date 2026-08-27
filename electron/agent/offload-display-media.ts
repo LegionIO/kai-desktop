@@ -25,9 +25,10 @@
  * left untouched rather than throwing (a persist must never fail on bad media).
  */
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { mkdirSync, statSync, readFileSync, rmSync } from 'fs';
+import { join, sep } from 'path';
 
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { filePathToUrl, MAX_MEDIA_BYTES } from '../tools/media-gen-utils.js';
 
 /** `data:<mime>;base64,<payload>` — capture the mime and the base64 body. Also
@@ -100,9 +101,23 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   const filePath = join(dir, filename);
 
   try {
-    if (!existsSync(filePath)) {
+    // Reuse an existing content-addressed file only if it's a real, non-empty
+    // regular file matching the payload size — never trust a partial/zero-byte
+    // leftover from a crashed/ENOSPC write (which would let us drop the inline
+    // base64 while the on-disk copy is corrupt). Re-materialize otherwise.
+    let reusable = false;
+    try {
+      const st = statSync(filePath);
+      reusable = st.isFile() && st.size === buf.length;
+    } catch {
+      /* missing → not reusable */
+    }
+    if (!reusable) {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(filePath, buf);
+      // Atomic write: tmp sibling opened O_EXCL|O_NOFOLLOW, then rename into place.
+      // A crash mid-write can never leave a partial at `filePath` (only an orphan
+      // .tmp), and a symlink planted at the destination can't redirect the write.
+      atomicWriteFileSync(filePath, buf);
     }
   } catch {
     // If we can't persist the file, keep the inline base64 (correctness over
@@ -184,4 +199,181 @@ export function offloadTreeDisplayMedia(tree: unknown, appHome: string): { tree:
   // Nothing rewritten → return the ORIGINAL array reference (no needless clone),
   // so callers can cheaply detect "no offload happened".
   return rewritten === 0 ? { tree, rewritten: 0 } : { tree: next, rewritten };
+}
+
+// ─── Rehydration (the inverse: kai-media:// URL → base64 data URL) ────────────
+// User image/file parts are DUAL-PURPOSE: display AND model input. The runtimes
+// (Mastra/AI-SDK, Claude, Codex) only accept data:/http media, not kai-media://.
+// So before an offloaded tree is sent to a provider, each kai-media:// display
+// part must be resolved back to a data: URL by reading its file from mediaDir.
+// (The renderer serves the same URLs via the media protocol; this path is for the
+// MODEL boundary, where there's no protocol handler.)
+
+const MEDIA_PROTOCOL_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
+
+/** MIME for a media file extension (inverse of mediaTarget), for the data: prefix. */
+function mimeForExt(ext: string): string {
+  const map: Record<string, string> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    gif: 'image/gif',
+    svg: 'image/svg+xml',
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    mov: 'video/quicktime',
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    flac: 'audio/flac',
+    opus: 'audio/opus',
+    ogg: 'audio/ogg',
+  };
+  return map[ext.toLowerCase()] ?? 'application/octet-stream';
+}
+
+/**
+ * Resolve a `kai-media://images/<name>` URL to a `data:<mime>;base64,<...>` URL by
+ * reading the referenced file. Returns null if the value isn't a media URL, the
+ * path escapes mediaDir, or the file can't be read — callers then leave the value
+ * as-is (a broken model image is better than crashing the turn). Security mirrors
+ * the protocol handler: strip query, decode, join under mediaDir, lexical
+ * containment check so a crafted `../` URL can't read outside the media dir.
+ * `mimeType` (from the part) takes precedence over the extension-derived MIME.
+ */
+export function rehydrateMediaUrl(value: string, appHome: string, mimeType?: string): string | null {
+  if (typeof value !== 'string' || !value.startsWith(MEDIA_PROTOCOL_PREFIX)) return null;
+  const mediaDir = join(appHome, 'media');
+  const rawPath = value.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
+  let rel: string;
+  try {
+    rel = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  const filePath = join(mediaDir, rel);
+  // Lexical containment: the resolved path must stay under mediaDir.
+  if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) return null;
+  let buf: Buffer;
+  try {
+    const st = statSync(filePath);
+    if (!st.isFile() || st.size === 0 || st.size > MAX_MEDIA_BYTES) return null;
+    buf = readFileSync(filePath);
+  } catch {
+    return null;
+  }
+  const ext = filePath.split('.').pop() ?? '';
+  const mime = mimeType && typeof mimeType === 'string' ? mimeType : mimeForExt(ext);
+  return `data:${mime};base64,${buf.toString('base64')}`;
+}
+
+/**
+ * Return a NEW messages array with every `kai-media://` display media value
+ * rehydrated to a data: URL, for the model boundary. Never mutates the input
+ * (branch objects are shared with persisted/renderer state) — nodes and their
+ * content arrays are cloned only when a part actually changes. Non-array content
+ * and non-media parts pass through by reference. Leaves a part unchanged if its
+ * URL can't be resolved. NEVER descends into tool-result `result`/`_modelContent`
+ * (those carry their own model media via a separate path).
+ */
+export function rehydrateModelMedia(messages: unknown[], appHome: string): unknown[] {
+  if (!Array.isArray(messages)) return messages;
+  let anyChanged = false;
+  const out = messages.map((rawMsg) => {
+    const msg = rawMsg as { content?: unknown } & Record<string, unknown>;
+    if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) return rawMsg;
+    let contentChanged = false;
+    const content = (msg.content as LoosePart[]).map((raw) => {
+      const part = raw as LoosePart;
+      if (!part || typeof part !== 'object') return raw;
+      if (part.type === 'image' && typeof part.image === 'string') {
+        const data = rehydrateMediaUrl(part.image, appHome, typeof part.mimeType === 'string' ? part.mimeType : undefined);
+        if (data) {
+          contentChanged = true;
+          return { ...part, image: data };
+        }
+        return raw;
+      }
+      if (part.type === 'file' && typeof part.data === 'string') {
+        const data = rehydrateMediaUrl(part.data, appHome, typeof part.mimeType === 'string' ? part.mimeType : undefined);
+        if (data) {
+          contentChanged = true;
+          return { ...part, data };
+        }
+        return raw;
+      }
+      return raw;
+    });
+    if (!contentChanged) return rawMsg;
+    anyChanged = true;
+    return { ...msg, content };
+  });
+  return anyChanged ? out : messages;
+}
+
+// ─── Reference-aware media GC ─────────────────────────────────────────────────
+// Offloaded (and generated) media live in a GLOBAL per-app media dir, shared
+// across conversations (content-addressed → identical bytes are one file). When a
+// conversation is deleted/cleared, its media must be reclaimed — both to bound
+// disk and, for privacy, so a deleted sensitive chat's attachments don't linger.
+// But a file may be referenced by OTHER conversations, so deletion is
+// reference-counted: a file is removed only when NO surviving conversation
+// references it. Collection scans the WHOLE tree (display parts AND tool
+// results / _modelContent), since generated media is referenced from tool output.
+
+/** Collect every `<mediaDir>`-relative path referenced by `kai-media://` URLs
+ *  anywhere in a value (deep walk over arrays/objects/strings). Returned paths are
+ *  normalized (query stripped, percent-decoded) for set membership. */
+export function collectReferencedMediaPaths(value: unknown, into: Set<string> = new Set()): Set<string> {
+  const visit = (v: unknown): void => {
+    if (typeof v === 'string') {
+      if (v.startsWith(MEDIA_PROTOCOL_PREFIX)) {
+        const raw = v.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
+        try {
+          into.add(decodeURIComponent(raw));
+        } catch {
+          into.add(raw);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    if (v && typeof v === 'object') {
+      for (const key of Object.keys(v as Record<string, unknown>)) visit((v as Record<string, unknown>)[key]);
+    }
+  };
+  visit(value);
+  return into;
+}
+
+/**
+ * Delete media files that WERE referenced by removed conversations but are NOT
+ * referenced by any surviving conversation. `removedRefs` is the union of media
+ * paths from the deleted conversation trees; `survivingRefs` is the union across
+ * all conversations that remain on disk. Only files in `removedRefs \ survivingRefs`
+ * are unlinked, and only if they resolve safely under mediaDir. Best-effort: a
+ * failure to remove one file never throws (GC is a cleanup, not a correctness gate).
+ * Returns the number of files actually removed.
+ */
+export function gcOrphanedMedia(appHome: string, removedRefs: Set<string>, survivingRefs: Set<string>): number {
+  const mediaDir = join(appHome, 'media');
+  let removed = 0;
+  for (const rel of removedRefs) {
+    if (survivingRefs.has(rel)) continue; // still referenced elsewhere — keep
+    const filePath = join(mediaDir, rel);
+    // Containment: never unlink outside mediaDir (a crafted path in a tree).
+    if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) continue;
+    try {
+      const st = statSync(filePath);
+      if (!st.isFile()) continue; // never rmdir; only regular media files
+      rmSync(filePath, { force: true });
+      removed++;
+    } catch {
+      /* missing or unremovable — best-effort */
+    }
+  }
+  return removed;
 }

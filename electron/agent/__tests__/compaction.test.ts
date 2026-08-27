@@ -32,6 +32,29 @@ describe('messageContentSignature (prefix-free — no structural collisions)', (
     expect(sig([{ type: 'text', text: 'hello' }])).toBe(sig([{ type: 'text', text: 'hello' }]));
     expect(sig([{ type: 'text', text: 'hello' }])).not.toBe(sig([{ type: 'text', text: 'hell' }]));
   });
+
+  it('is media-representation invariant: base64 and kai-media:// forms of a part hash equal', () => {
+    // Display-media offload rewrites a user attachment's inline base64 to a kai-media:// URL
+    // (lossless, content-addressed). A compaction record signed pre-offload must still match
+    // the post-migration content, else a valid summary is false-rejected + re-billed.
+    const userSig = (content: unknown) =>
+      messageContentSignature({ id: 'u', role: 'user', content } as Parameters<typeof messageContentSignature>[0]);
+    const asBase64 = [
+      { type: 'text', text: 'see attached' },
+      { type: 'image', image: 'data:image/png;base64,AAAABBBB', mimeType: 'image/png' },
+    ];
+    const asUrl = [
+      { type: 'text', text: 'see attached' },
+      { type: 'image', image: 'kai-media://images/deadbeef00000000.png', mimeType: 'image/png' },
+    ];
+    expect(userSig(asBase64)).toBe(userSig(asUrl));
+    // But a change to the SURROUNDING text still drifts (media normalization doesn't blind the sig).
+    const asUrlDifferentText = [
+      { type: 'text', text: 'different' },
+      { type: 'image', image: 'kai-media://images/deadbeef00000000.png', mimeType: 'image/png' },
+    ];
+    expect(userSig(asUrl)).not.toBe(userSig(asUrlDifferentText));
+  });
 });
 
 describe('shouldCompact (cheap pre-check gate + exact count)', () => {

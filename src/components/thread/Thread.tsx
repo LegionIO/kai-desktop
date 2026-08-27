@@ -105,6 +105,7 @@ import {
 } from '../../../shared/computer-use';
 import { getResponseTiming, formatElapsed } from '@/lib/response-timing';
 import { formatModelDisplayName } from '@/lib/model-display';
+import { resolveMediaSrc, isMediaProtocolUrl } from '@/lib/media-url';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
 import { useTasksOptional } from '@/providers/TaskProvider';
 
@@ -796,16 +797,18 @@ const EditComposer: FC = () => {
 
 const UserImagePart: FC<{ image: string }> = ({ image }) => {
   const [previewOpen, setPreviewOpen] = useState(false);
+  // Resolve kai-media:// → /media/ in the web bridge; passthrough in Electron.
+  const resolved = resolveMediaSrc(image);
   return (
     <>
       <button type="button" onClick={() => setPreviewOpen(true)} className="block my-1">
         <img
-          src={image}
+          src={resolved}
           alt="Attached"
           className="max-w-[25vw] max-h-[200px] rounded-lg object-contain cursor-pointer hover:opacity-90 transition-opacity"
         />
       </button>
-      {previewOpen && <FilePreviewModal src={image} onClose={() => setPreviewOpen(false)} />}
+      {previewOpen && <FilePreviewModal src={resolved} mimeType="image/*" onClose={() => setPreviewOpen(false)} />}
     </>
   );
 };
@@ -841,8 +844,54 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
   const isPreviewable = isPdf || mimeType.startsWith('image/') || isText;
 
   const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+  // Resolve the media src for the current runtime (kai-media:// → /media/ on web).
+  const resolvedSrc = useMemo(() => (data ? resolveMediaSrc(data) : ''), [data]);
+  // Plain boolean (not the type-guard return) so it doesn't narrow `data` to `never`
+  // in the branches below where `data` is already known to be a non-empty string.
+  const isOffloadedUrl: boolean = data ? isMediaProtocolUrl(data) : false;
+
+  // Text preview: a data: URL decodes synchronously; an offloaded kai-media:// text
+  // file must be FETCHED (the bytes live on disk, not inline). Both cap at the size
+  // limit. Fetched state lives in its own async effect below.
+  const [fetchedText, setFetchedText] = useState<string | null>(null);
+  const [fetchError, setFetchError] = useState(false);
+  useEffect(() => {
+    if (!previewOpen || !isText || !isOffloadedUrl) return;
+    let cancelled = false;
+    setFetchedText(null);
+    setFetchError(false);
+    void (async () => {
+      try {
+        const resp = await fetch(resolvedSrc);
+        if (!resp.ok) throw new Error(`status ${resp.status}`);
+        const blob = await resp.blob();
+        if (blob.size > TEXT_PREVIEW_MAX_BYTES * 1.4) {
+          if (!cancelled)
+            setFetchedText(`(${filename} is too large to preview inline — ${(blob.size / 1024 / 1024).toFixed(1)} MB.)`);
+          return;
+        }
+        let decoded = await blob.text();
+        if (mimeType === 'application/json' || /\.json$/i.test(filename)) {
+          try {
+            decoded = JSON.stringify(JSON.parse(decoded), null, 2);
+          } catch {
+            /* leave as-is */
+          }
+        }
+        if (!cancelled) setFetchedText(decoded);
+      } catch {
+        if (!cancelled) setFetchError(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [previewOpen, isText, isOffloadedUrl, resolvedSrc, filename, mimeType]);
+
   const previewText = useMemo(() => {
     if (!previewOpen || !isText || !data) return null;
+    // Offloaded URL → served by the async fetch effect above.
+    if (isOffloadedUrl) return fetchError ? `(Could not load ${filename}.)` : fetchedText;
     if (data.length > TEXT_PREVIEW_MAX_BYTES * 1.4) {
       return `(${filename} is too large to preview inline — ${(data.length / 1024 / 1024).toFixed(1)} MB encoded.)`;
     }
@@ -856,7 +905,7 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
       }
     }
     return decoded;
-  }, [previewOpen, isText, data, mimeType, filename]);
+  }, [previewOpen, isText, isOffloadedUrl, fetchedText, fetchError, data, mimeType, filename]);
 
   const ext = filename.split('.').pop()?.toUpperCase() ?? 'FILE';
   const iconColors: Record<string, string> = {
@@ -900,18 +949,25 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
         {isPreviewable && <span className="text-[10px] opacity-50 ml-auto shrink-0">Click to preview</span>}
       </button>
       {previewOpen && data && (
-        <FilePreviewModal src={data} text={previewText} filename={filename} onClose={() => setPreviewOpen(false)} />
+        <FilePreviewModal
+          src={resolvedSrc}
+          mimeType={mimeType}
+          text={previewText}
+          filename={filename}
+          onClose={() => setPreviewOpen(false)}
+        />
       )}
     </>
   );
 };
 
-const FilePreviewModal: FC<{ src: string; text?: string | null; filename?: string; onClose: () => void }> = ({
-  src,
-  text,
-  filename,
-  onClose,
-}) => {
+const FilePreviewModal: FC<{
+  src: string;
+  mimeType?: string;
+  text?: string | null;
+  filename?: string;
+  onClose: () => void;
+}> = ({ src, mimeType, text, filename, onClose }) => {
   const [copied, setCopied] = useState(false);
   // Close on Escape key
   useEffect(() => {
@@ -962,7 +1018,7 @@ const FilePreviewModal: FC<{ src: string; text?: string | null; filename?: strin
               {text}
             </pre>
           </div>
-        ) : src.startsWith('data:application/pdf') ? (
+        ) : mimeType === 'application/pdf' || src.startsWith('data:application/pdf') ? (
           <iframe src={src} className="w-[80vw] h-[85vh] rounded-lg bg-white" title="PDF preview" />
         ) : (
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />

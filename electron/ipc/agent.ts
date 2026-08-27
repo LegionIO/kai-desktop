@@ -37,6 +37,7 @@ import {
 } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
+import { rehydrateModelMedia } from '../agent/offload-display-media.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
 import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submit-gate.js';
 import {
@@ -3605,6 +3606,15 @@ export function registerAgentHandlers(
         turnStartBranchSig.set(m.id, messageContentSignature(m as Parameters<typeof messageContentSignature>[0]));
       }
     }
+    // Rehydrate offloaded display media (kai-media:// URLs → base64 data URLs) for
+    // the MODEL boundary. User image/file attachment parts are model input, but the
+    // runtimes (Mastra/AI-SDK, Claude, Codex) only accept data:/http media — a
+    // kai-media:// URL would be dropped or rejected, so a follow-up/edit/regenerate
+    // referencing a prior attachment would lose it. Done AFTER turnStartBranchSig
+    // (which must stay disk-equivalent: disk stores the URL) and produces a NEW
+    // array (never mutates the shared/persisted branch). No-op when nothing is
+    // offloaded. NEVER touches tool-result _modelContent (its own model path).
+    messages = rehydrateModelMedia(messages, appHome);
     const effectiveCwd = normalizeAgentCwd(cwd);
     // executionMode reconciliation (R128 finding-1): the renderer-supplied `executionMode` can be
     // STALE — a reconciliation (loadConversationState hydration / a background-conv broadcast) may
@@ -3988,7 +3998,10 @@ export function registerAgentHandlers(
             }
             const finalConv = readConversation(appHome, conversationId) ?? rebuilt;
             const { tree: finalTree } = ensureConversationTree(finalConv);
-            messages = stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]);
+            messages = rehydrateModelMedia(
+              stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]),
+              appHome,
+            );
           }
         }
       } else {
@@ -4064,7 +4077,10 @@ export function registerAgentHandlers(
           if (reconciled) {
             const reread = readConversation(appHome, conversationId) ?? conv;
             const { tree: rt } = ensureConversationTree(reread);
-            messages = stripDisplayOnlyParts(getConversationBranch(rt, head) as unknown[]);
+            messages = rehydrateModelMedia(
+              stripDisplayOnlyParts(getConversationBranch(rt, head) as unknown[]),
+              appHome,
+            );
           }
         }
       }

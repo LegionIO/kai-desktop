@@ -5662,9 +5662,22 @@ export function RuntimeProvider({
             // avoids re-seeding a stuck accumulator (mirrors the mainOwned branches).
             if (hadInlineMedia) {
               void donePersist.then((res) => {
-                // Only adopt on a committed write; a rejected/deleted put means disk
-                // wasn't updated (and loadConversationState would fetch stale/none).
-                if (res && !res.rejected) void loadConversationState(convId, { skipInFlightSeed: true });
+                // Adopt the offloaded URL tree from disk ONLY when the write actually
+                // COMMITTED (res.persisted). A failed ({}) or superseded persist did
+                // not update disk, so reloading would replace the just-finalized reply
+                // with stale/older content. Also re-check the conversation is STILL
+                // active: `isActiveConv` was captured before this await, so a chat
+                // switch during the pending persist must not let the old conversation
+                // drive a load over the newly-selected one.
+                if (res?.persisted === true && activeIdRef.current === convId) {
+                  void loadConversationState(convId, { skipInFlightSeed: true });
+                  // The finalized-branch bridge holds a shallow copy of the full tree
+                  // INCLUDING the base64 we just offloaded; its 15s TTL would otherwise
+                  // pin those bytes in memory long after the reload replaced React state.
+                  // The disk copy is now authoritative (persisted) and the reload adopts
+                  // it, so the bridge's onNew-window purpose is served — release it now.
+                  clearFinalizedBranch(convId);
+                }
               });
             }
             // Update the model selector to reflect the actual model used (may differ

@@ -287,4 +287,29 @@ describe('captureHeapSnapshot', () => {
     expect(result.bytes).toBe(2048);
     expect(existsSync(result.path)).toBe(true);
   });
+
+  it('surfaces a SYNCHRONOUS take() throw as a normal rejection (no unhandled timeout)', async () => {
+    // A destroyed WebContents makes takeHeapSnapshot throw synchronously. The bounded
+    // wrapper must fold that into the raced promise (so it rejects here) and clear its
+    // timer — NOT let the timeout promise reject later unhandled. Track unhandled
+    // rejections for the duration to assert none escape.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const take = vi.fn((): Promise<void> => {
+        throw new Error('Object has been destroyed');
+      });
+      await expect(
+        captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 }, new Date(), 5000),
+      ).rejects.toThrow(/Object has been destroyed/);
+      // Let any errant timeout rejection (if the timer were left armed) surface.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });

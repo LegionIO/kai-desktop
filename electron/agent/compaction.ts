@@ -65,6 +65,33 @@ export function messageContentSignature(
     // Mirror stripDisplayOnlyParts: keep the original if stripping empties the content.
     if (filtered.length !== (content as unknown[]).length && filtered.length > 0) content = filtered;
   }
+  // Media-representation invariance: an image/file DISPLAY part's raw value can be
+  // an inline `data:` base64 URL OR, after display-media offload, a `kai-media://`
+  // URL to the SAME bytes (a lossless, content-addressed transform). The producer
+  // may sign one form and the persistence consumer the other (e.g. a compaction
+  // record created pre-offload, then the conversation lazily migrated to URLs), so
+  // hashing the volatile value string would spuriously flag drift and re-summarize
+  // a still-valid summary. Normalize each media part's value to a stable token
+  // (type + mimeType + filename, minus the data/image/url payload) so the signature
+  // is identical across the offload transform. A genuine media SWAP changes the
+  // surrounding structure (a different attachment is a different part/turn) which
+  // the rest of the signature still captures. Mirrors the displayOnly precedent.
+  if (Array.isArray(content)) {
+    let mediaNormalized = false;
+    const norm = (content as Array<Record<string, unknown> | null | undefined>).map((p) => {
+      if (!p || typeof p !== 'object') return p;
+      const isImage = p.type === 'image' && typeof p.image === 'string';
+      const isFile = p.type === 'file' && typeof p.data === 'string';
+      if (!isImage && !isFile) return p;
+      mediaNormalized = true;
+      const { image: _img, data: _data, ...rest } = p as Record<string, unknown>;
+      void _img;
+      void _data;
+      // Sign a fixed sentinel in place of the payload so base64 and kai-media:// forms hash equal.
+      return { ...rest, _mediaRef: true };
+    });
+    if (mediaNormalized) content = norm;
+  }
   const hash = createHash('sha1');
   try {
     // Feed a stable serialization to the hash INCREMENTALLY rather than building one giant

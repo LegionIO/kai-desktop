@@ -407,6 +407,19 @@ export async function stripBranchMediaForCount(
       const p = part as Record<string, unknown>;
       if ((p.type === 'image' || p.type === 'file') && typeof (p.data ?? p.image) === 'string') {
         const data = (p.data ?? p.image) as string;
+        // A kai-media:// (or any scheme://) URL here means display-media offload
+        // happened but the value was NOT rehydrated to a data URL before the model
+        // boundary (see rehydrateModelMedia — streamHandler runs it before this
+        // count). Counting a ~40-char URL as base64 would massively UNDER-count the
+        // attachment's real bytes/tokens and inflate the media budget. We can't read
+        // the file here (no appHome), and this branch shouldn't be reachable on a
+        // rehydrated path, so leave the part UNTOUCHED (its stored tokenCount, if any,
+        // is trusted) rather than strip + mis-count it. NB: only a scheme URL is
+        // skipped — a BARE base64 payload (no `data:` prefix, no `://`) is legitimate
+        // attachment data and must still be counted.
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(data)) {
+          return part;
+        }
         // TOP-LEVEL user attachment (renderer image/file) — NOT routed through the
         // `_modelContent` sanitizer, so its 5 MiB per-part cap does NOT apply: the
         // attachment is forwarded to the provider as-is. Always count it (native token

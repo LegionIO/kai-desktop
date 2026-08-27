@@ -204,9 +204,13 @@ export async function captureHeapSnapshot(
             // Never let the timeout timer hold the process open on its own.
             (timer as { unref?: () => void }).unref?.();
           });
-          // Whichever settles first wins; clear the timer either way so a
-          // resolved capture doesn't leave a dangling handle.
-          return Promise.race([take(filePath), timeout]).finally(() => {
+          // Invoke `take` INSIDE a resolved-promise callback so a SYNCHRONOUS throw
+          // (e.g. takeHeapSnapshot on an already-destroyed WebContents) becomes a
+          // rejection of the raced promise rather than escaping this function — which
+          // would leave `timeout` unhandled (its timer still armed) to reject later as
+          // a spurious unhandled rejection. Whichever settles first wins; clear the
+          // timer in finally so a resolved capture leaves no dangling handle.
+          return Promise.race([Promise.resolve().then(() => take(filePath)), timeout]).finally(() => {
             if (timer) clearTimeout(timer);
           });
         }

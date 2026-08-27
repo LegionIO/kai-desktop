@@ -843,6 +843,20 @@ describe('stripBranchMediaForCount (sanitizer-aware retention for the whole-requ
     expect(retainedMediaBytes).toBeGreaterThan(5.5 * 1024 * 1024);
   });
 
+  it("leaves an un-rehydrated kai-media:// URL part UNTOUCHED (never miscounts the URL string as base64)", async () => {
+    // Defense-in-depth: if an offloaded URL reaches accounting un-rehydrated, it must
+    // NOT be stripped + counted as ~40 base64 bytes (which would inflate the budget).
+    const branch = [
+      { role: "user", content: [{ type: "image", image: "kai-media://images/deadbeef00000000.png", mimeType: "image/png" }] },
+    ];
+    const { stripped, retainedMediaBytes } = await stripBranchMediaForCount(branch);
+    // The URL part is untouched (not stripped to a placeholder) and contributes ~0 counted bytes.
+    const part = (stripped[0] as { content: Array<Record<string, unknown>> }).content[0];
+    expect(part.image).toBe("kai-media://images/deadbeef00000000.png");
+    expect(part._mediaStripped).toBeUndefined();
+    expect(retainedMediaBytes).toBe(0);
+  });
+
   it("does NOT count sanitizer-INVALID _modelContent media (missing mediaType)", async () => {
     // A file part with no mediaType is discarded by extractModelContent before the
     // provider call, so it must not be charged toward the seed.

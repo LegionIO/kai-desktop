@@ -8,7 +8,11 @@ import {
   tokenProjectionSerializedLength,
   tokenProjectionByteCeiling,
 } from '../agent/tokenization.js';
-import { offloadTreeDisplayMedia } from '../agent/offload-display-media.js';
+import {
+  offloadTreeDisplayMedia,
+  collectReferencedMediaPaths,
+  gcOrphanedMedia,
+} from '../agent/offload-display-media.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -1427,28 +1431,39 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   } catch {
     /* best-effort — fall back to fresh backfill */
   }
+  // Resurrection guard runs BEFORE media offload (which writes files to disk):
+  // a stale in-flight persist to a DELETED conversation must be suppressed without
+  // materializing its attachment media under the app home (orphaned files + a
+  // privacy leak for a just-deleted sensitive chat). The structural sanitize is
+  // idempotent and side-effect-free, so the suppressed path still runs it (without
+  // appHome → no media offload) to return a coherent record. Only the media-writing
+  // offload is gated. `conv.id` is the sanitized id (sanitize never rewrites ids),
+  // so checking it here is equivalent to the prior post-sanitize check.
+  //
+  // Two tombstone sources: the in-memory TTL map (fast path, covers the common
+  // mid-flight delete) AND the DURABLE index ring (survives restart / TTL expiry).
+  // The in-memory tombstone is AUTHORITATIVE ON ITS OWN — suppress even if the index
+  // still LISTS the id (R162 f-1): the delete sets the in-memory tombstone BEFORE its
+  // best-effort (can-fail) index update, so requiring index-absence would let a failed
+  // delete index-write resurrect the just-deleted conversation. A legitimate recreate
+  // uses a fresh id, so an in-memory-tombstoned id being written is always stale. The
+  // durable-ring branch keeps requiring index-absence (a durably-deleted id back in the
+  // index was legitimately recreated later).
+  const isTombstoned =
+    isRecentlyDeleted(conv.id) ||
+    (() => {
+      try {
+        const idx = readIndex(appHome);
+        return !idx.conversations[conv.id] && isDurablyDeleted(idx, conv.id);
+      } catch {
+        return false; // index read blip → don't suppress a legitimate write
+      }
+    })();
+  if (isTombstoned) {
+    markWriteSuppressed(conv.id);
+    return sanitizeConversationTree(conv, priorTree); // structural only, no media writes
+  }
   const sanitized = sanitizeConversationTree(conv, priorTree, appHome);
-  // Resurrection guard: if this id was DELETED, a stale in-flight persist is trying to recreate it.
-  // SKIP the write (return the record unchanged) rather than resurrect a deleted conversation with
-  // stale messages + run state. Two tombstone sources: the in-memory TTL map (fast path, covers the
-  // common mid-flight delete) AND the DURABLE index ring (survives process restart / TTL expiry).
-  // The in-memory tombstone is AUTHORITATIVE ON ITS OWN — suppress even if the index still LISTS the
-  // id (R162 f-1): the delete sets the in-memory tombstone BEFORE its (best-effort, can-fail) index
-  // update, so requiring the index entry to be absent would let a failed delete index-write
-  // resurrect the just-deleted conversation. A legitimate recreate uses a fresh id, so an
-  // in-memory-tombstoned id being written is always stale. The durable-ring branch keeps requiring
-  // index-absence (a durably-deleted id that IS back in the index was legitimately recreated later).
-  if (isRecentlyDeleted(sanitized.id)) {
-    markWriteSuppressed(sanitized.id);
-    return sanitized;
-  }
-  {
-    const idx = readIndex(appHome);
-    if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) {
-      markWriteSuppressed(sanitized.id);
-      return sanitized;
-    }
-  }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   // The conversation FILE is now committed — the write SUCCEEDED from the caller's perspective. The
   // index is a DERIVED, rebuildable cache (rebuildIndexFromConversationFiles scans the files), so a
@@ -1496,6 +1511,41 @@ export function consumeWriteWasSuppressed(id: string): boolean {
  *  already absent) and the index entry was dropped — mirrors {@link deleteConversations}'
  *  preserve-on-rm-failure semantics so a failed rm keeps the conversation intact (and the
  *  caller can avoid cancelling/broadcasting for a delete that didn't happen). */
+/**
+ * Reclaim media files that were referenced ONLY by now-deleted conversations.
+ * `removedRefs` is the union of media paths across the deleted conversations'
+ * trees (collected BEFORE their files were removed). This scans every SURVIVING
+ * conversation file to build the still-referenced set, then unlinks any removed
+ * ref no survivor references. Best-effort + throw-safe: GC never blocks or fails a
+ * delete. Skips entirely when nothing was referenced (the overwhelmingly common
+ * media-free conversation), so a normal delete pays no scan cost.
+ */
+function gcMediaAfterDelete(appHome: string, removedRefs: Set<string>): void {
+  if (removedRefs.size === 0) return;
+  try {
+    const surviving = new Set<string>();
+    const dir = conversationsDir(appHome);
+    if (existsSync(dir)) {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.json')) continue;
+        try {
+          const conv = JSON.parse(readFileSync(join(dir, name), 'utf-8')) as ConversationRecord;
+          collectReferencedMediaPaths(conv?.messageTree, surviving);
+          collectReferencedMediaPaths(conv?.messages, surviving);
+        } catch {
+          // A corrupt/unreadable survivor: FAIL SAFE — abort the whole GC for this
+          // batch rather than risk unlinking media a survivor we couldn't parse still
+          // uses. Nothing is deleted; a later delete re-attempts the sweep.
+          return;
+        }
+      }
+    }
+    gcOrphanedMedia(appHome, removedRefs, surviving);
+  } catch {
+    /* GC is best-effort cleanup — never surface a failure to the delete caller */
+  }
+}
+
 export function deleteConversation(appHome: string, id: string): boolean {
   // Reject a malformed / abusively-long id before it enters the tombstone + durable deletedId ring
   // + index (R178): treat it as a benign no-op (nothing to delete).
@@ -1503,6 +1553,16 @@ export function deleteConversation(appHome: string, id: string): boolean {
   // Migrate first (and refuse if migration is pending) so a subsequent
   // readIndex() can't recreate the file we delete or strand old chats.
   assertMigratedBeforeWrite(appHome);
+  // Collect the media this conversation references BEFORE removing its file, so the
+  // post-delete GC can reclaim any file no surviving conversation still uses.
+  let removedRefs = new Set<string>();
+  try {
+    const existing = readConversation(appHome, id);
+    collectReferencedMediaPaths(existing?.messageTree, removedRefs);
+    collectReferencedMediaPaths(existing?.messages, removedRefs);
+  } catch {
+    removedRefs = new Set<string>(); // unreadable → nothing to GC
+  }
   let fileGone = false;
   try {
     const p = conversationPath(appHome, id);
@@ -1548,6 +1608,9 @@ export function deleteConversation(appHome: string, id: string): boolean {
     console.error('[conversation-store] deleteConversation: durable index write failed', err);
     markIndexMayHaveGhosts();
   }
+  // Reclaim media referenced only by this now-deleted conversation (after the file
+  // is gone, so this conversation's own refs don't count as "surviving").
+  gcMediaAfterDelete(appHome, removedRefs);
   return true;
 }
 
@@ -1559,9 +1622,18 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   assertMigratedBeforeWrite(appHome);
   const index = readIndex(appHome);
   const removed: string[] = [];
+  const removedRefs = new Set<string>();
   for (const id of ids) {
     // Skip a malformed / abusively-long id before it touches the tombstone/index structures (R178).
     if (!isPlausibleConversationId(id)) continue;
+    // Collect this record's media refs BEFORE removing its file (union across the batch).
+    try {
+      const existing = readConversation(appHome, id);
+      collectReferencedMediaPaths(existing?.messageTree, removedRefs);
+      collectReferencedMediaPaths(existing?.messages, removedRefs);
+    } catch {
+      /* unreadable → nothing to add */
+    }
     // Only drop the index entry once the data file is GONE (removed now, or already
     // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
     // would orphan that data AND make the conversation invisible — so keep the entry and
@@ -1616,6 +1688,8 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
       markIndexMayHaveGhosts();
     }
   }
+  // Reclaim media referenced only by the now-deleted batch (after files are gone).
+  gcMediaAfterDelete(appHome, removedRefs);
   return removed;
 }
 
@@ -1655,8 +1729,17 @@ export function clearAllConversations(
   // confirmed GONE (removed now, or already absent = an index-only entry) are actually cleared.
   const cleared: string[] = [];
   const preserved: Record<string, ConversationIndexEntry> = {};
+  const removedRefs = new Set<string>();
   let anySurvived = false;
   for (const id of candidateIds) {
+    // Collect this record's media refs BEFORE removing its file.
+    try {
+      const existing = readConversation(appHome, id);
+      collectReferencedMediaPaths(existing?.messageTree, removedRefs);
+      collectReferencedMediaPaths(existing?.messages, removedRefs);
+    } catch {
+      /* unreadable → nothing to add */
+    }
     let fileGone = false;
     try {
       const p = conversationPath(appHome, id);
@@ -1704,6 +1787,10 @@ export function clearAllConversations(
     console.error('[conversation-store] clearAllConversations: durable index write failed', err);
     markIndexMayHaveGhosts();
   }
+  // Reclaim media referenced only by cleared conversations. After the clear, only
+  // PRESERVED (rm-failed) record files remain on disk, so gcMediaAfterDelete's
+  // survivor scan correctly retains just their media and removes the rest.
+  gcMediaAfterDelete(appHome, removedRefs);
   return { cleared, fullyCleared: !anySurvived && durablyPersisted };
 }
 

@@ -7,11 +7,7 @@ import { RefreshCwIcon, CheckIcon, SquareIcon } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
 import { CodeFencePreviewButton } from './CodeFencePreviewButton';
 import { cn } from '@/lib/utils';
-
-const isWebBridge = Boolean(
-  (window as unknown as Record<string, unknown>).app &&
-    (window.app as Record<string, unknown>).__isWebBridge,
-);
+import { resolveMediaSrc } from '@/lib/media-url';
 
 const rehypeSanitizeOptions = {
   ...defaultSchema,
@@ -249,17 +245,14 @@ const rehypePlugins: NonNullable<Options['rehypePlugins']> = [rehypeRaw, [rehype
  * react-markdown's defaultUrlTransform only allows http(s), irc(s), mailto, and xmpp protocols.
  * We extend it to also allow our custom media protocol used for locally-generated media.
  */
-const mediaProtocolPrefix = __BRAND_MEDIA_PROTOCOL + '://';
 const allowedProtocols = new RegExp('^' + __BRAND_MEDIA_PROTOCOL + ':', 'i');
 
 function urlTransform(url: string, _key: string, _node: unknown): string {
   if (allowedProtocols.test(url)) {
-    // In web mode, rewrite kai-media:// URLs to relative /media/ paths
-    // so they are served by the web server's media route
-    if (isWebBridge) {
-      return '/media/' + url.slice(mediaProtocolPrefix.length);
-    }
-    return url;
+    // Delegate kai-media:// handling to the shared resolver (Electron passthrough /
+    // web-bridge /media/ rewrite) so markdown media resolves identically to the
+    // <img>/<iframe>/preview sites in Thread.tsx.
+    return resolveMediaSrc(url);
   }
   return defaultUrlTransform(url);
 }

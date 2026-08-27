@@ -6,6 +6,7 @@ import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { toolsForExecutionMode } from './plan-mode-tools.js';
+import { rehydrateModelMedia } from './offload-display-media.js';
 import { readConversation, conversationExistenceState } from '../ipc/conversation-store.js';
 import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
 import { randomUUID } from 'crypto';
@@ -105,7 +106,15 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   stream: AsyncGenerator<StreamEvent>;
   modelKey: string;
 }> {
-  const { appHome, messages, systemPrompt, tools: pluginToolsRaw } = options;
+  const { appHome, systemPrompt, tools: pluginToolsRaw } = options;
+  // Rehydrate offloaded display media (kai-media:// → base64 data URLs) for the
+  // model boundary: this is the shared prep for the plugin/automation stream+
+  // generate family (streamForPlugin / generateForPlugin), a SEPARATE path from
+  // the GUI/CLI streamHandler, so it needs its own rehydration or a follow-up
+  // automation turn referencing a prior attachment would forward an unresolvable
+  // kai-media:// URL to the provider. Produces a NEW array (never mutates the
+  // caller's branch); no-op when nothing is offloaded.
+  const messages = rehydrateModelMedia(options.messages, appHome);
   // Determine the effective execution mode, then filter registered tools + overlay config.
   // Priority: an explicit conversation record (MAIN-authoritative — R129 f-2/f-3) > the
   // passed snapshot > the GLOBAL config.tools.executionMode. The global fallback matters for
