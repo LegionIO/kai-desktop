@@ -439,12 +439,26 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 // reload entails) for legacy media main leaves inline.
 const ACTIVE_MEDIA_MIME_RE = /^data:\s*(image\/svg\+xml|text\/html|application\/xhtml\+xml)\b/i;
 const MAX_OFFLOADABLE_MEDIA_BYTES = 512 * 1024 * 1024; // matches MAX_MEDIA_BYTES (main)
-// Standard base64 alphabet + valid padding (matches main's STRICT_BASE64_RE). We do
-// the cheap charset check but deliberately SKIP the decode round-trip main uses for
-// full canonicality: this predicate only gates a post-persist RELOAD (over-triggering
-// costs one wasted conversations:get, not correctness), and decoding a large base64
-// on the renderer hot path is exactly the work the offload avoids.
-const BASE64_CHARSET_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/** Stack-safe LINEAR base64-shape check (mirrors the main process's hasBase64Shape).
+ *  A starred-group regex over a few-million-char attachment can throw
+ *  `RangeError: Maximum call stack size` on V8 — and this runs synchronously in the
+ *  terminal stream handler, so it must never throw. Length %4, standard alphabet, and
+ *  0–2 trailing `=`. Full canonicality isn't needed here (this only gates a reload). */
+function hasBase64Shape(s: string): boolean {
+  const n = s.length;
+  if (n === 0 || n % 4 !== 0) return false;
+  let i = 0;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 47) continue;
+    if (c === 61) break; // '=' padding — validate the tail below
+    return false;
+  }
+  if (i === n) return true;
+  if (n - i > 2) return false;
+  for (let j = i; j < n; j++) if (s.charCodeAt(j) !== 61) return false;
+  return true;
+}
 function isOffloadableInlineData(value: string): boolean {
   if (!value.startsWith('data:') || ACTIVE_MEDIA_MIME_RE.test(value)) return false;
   const comma = value.indexOf(',');
@@ -452,8 +466,9 @@ function isOffloadableInlineData(value: string): boolean {
   const body = value.slice(comma + 1);
   if (body.length === 0) return false;
   if (!/;base64/i.test(value.slice(0, comma))) return false; // only base64 data URLs are offloaded
-  if (!BASE64_CHARSET_RE.test(body)) return false; // malformed → main leaves it inline
-  return Math.floor((body.length * 3) / 4) <= MAX_OFFLOADABLE_MEDIA_BYTES;
+  // Size gate FIRST (cheap), then the stack-safe shape check.
+  if (Math.floor((body.length * 3) / 4) > MAX_OFFLOADABLE_MEDIA_BYTES) return false;
+  return hasBase64Shape(body); // malformed → main leaves it inline
 }
 export function branchHasInlineBase64Media(messages: StoredMessage[]): boolean {
   for (const m of messages) {

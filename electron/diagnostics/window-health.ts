@@ -37,11 +37,6 @@ const SNAPSHOT_REARM_HYSTERESIS_PCT = 10;
 /** Cooldown before re-arming a heap snapshot after a FAILED capture, so a persistently
  *  high heap gets retried (not latched off) without spamming attempts every heartbeat. */
 const SNAPSHOT_RETRY_COOLDOWN_MS = 60_000;
-/** Backstop for releasing the single-flight snapshot fence if the native capture
- *  NEVER settles (and its renderer is somehow never reloaded). Far longer than any
- *  plausible capture so it can't race a live one; the native-settled callback is the
- *  normal release path. */
-const SNAPSHOT_FENCE_DRAIN_MS = 5 * 60_000;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -586,14 +581,12 @@ export class WindowHealthMonitor {
           this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
           if (error instanceof HeapSnapshotTimeoutError) {
             // The BOUNDED wrapper rejected, but the NATIVE takeHeapSnapshot may still be
-            // running. onNativeSettled (above) releases the fence when it finally does.
-            // As a BACKSTOP for a capture that NEVER settles at all (and whose renderer
-            // is somehow never reloaded), a long drain timer also releases — well beyond
-            // the timeout, generation-guarded — so the fence can't wedge permanently.
-            const drainTimer = setTimeout(() => {
-              clearInFlight();
-            }, SNAPSHOT_FENCE_DRAIN_MS);
-            (drainTimer as { unref?: () => void }).unref?.();
+            // running. Do NOT clear the fence on a fixed timer — that could let a retry
+            // overlap a still-running native capture. The fence is released ONLY when the
+            // native op truly settles (onNativeSettled) OR the renderer is replaced (a
+            // reload's did-start-loading / attachWindow resets it + bumps the generation).
+            // A retry is still armed for the persistently-high heap; the single-flight
+            // fence at trigger prevents it from starting a second concurrent capture.
             armRetry();
             return;
           }
@@ -637,6 +630,13 @@ export class WindowHealthMonitor {
 
     onContents('did-start-loading', () => {
       this.loadedWebContentsIds.delete(contents.id);
+      // A (re)load replaces the document — any prior capture's native op is on the gone
+      // document. Reset the single-flight fence + bump the generation so a genuinely-
+      // hung capture from the OLD document can't keep the fence latched (crash recovery
+      // reloads via webContents.reload(), not attachWindow, so this is the reset path
+      // for that case). A stale native settle then no-ops via the generation guard.
+      this.heapSnapshotInFlight = false;
+      this.heapSnapshotCaptureGen++;
       this.log('main-renderer-load-started', this.windowDetails(window));
     });
     onContents('did-finish-load', () => {

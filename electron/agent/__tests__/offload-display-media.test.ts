@@ -484,3 +484,31 @@ describe('canonicalBase64ToBuffer size gate (R9)', () => {
     expect(canonicalBase64ToBuffer('AB==', 10_000)).toBeNull();
   });
 });
+
+describe('canonicalBase64ToBuffer stack safety (R10)', () => {
+  it('does not throw on a large malformed payload (no regex stack overflow)', () => {
+    // ~5M valid chars + one invalid: a starred regex could RangeError; the linear
+    // scanner must simply return null. Also must never propagate out of the helper.
+    const big = 'A'.repeat(5_000_000) + '!';
+    expect(() => canonicalBase64ToBuffer(big)).not.toThrow();
+    expect(canonicalBase64ToBuffer(big)).toBeNull();
+  });
+
+  it('rejects a large-but-well-formed OVER-CAP payload without decoding (pre-gate)', () => {
+    const big = 'A'.repeat(4_000_000); // multiple of 4, valid charset, ~3MB decoded
+    expect(canonicalBase64ToBuffer(big, 1000)).toBeNull(); // encoded-length gate first
+    expect(() => canonicalBase64ToBuffer(big, 1000)).not.toThrow();
+  });
+
+  it('offloadTreeDisplayMedia leaves a huge malformed attachment inline (no throw)', () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-huge-'));
+    try {
+      const bad = 'data:image/png;base64,' + 'A'.repeat(5_000_000) + '!';
+      let result: ReturnType<typeof offloadTreeDisplayMedia> | undefined;
+      expect(() => { result = offloadTreeDisplayMedia([imageMsg('h', bad)], appHome); }).not.toThrow();
+      expect(result!.rewritten).toBe(0);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
+  });
+});

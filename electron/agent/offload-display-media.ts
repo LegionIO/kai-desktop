@@ -26,11 +26,18 @@
  */
 import { createHash } from 'crypto';
 import { mkdirSync, lstatSync, rmSync, realpathSync } from 'fs';
-import { join, sep } from 'path';
+import { join, sep, posix as pathPosix } from 'path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { safeReadRangeWithin } from '../utils/safe-file-read.js';
 import { filePathToUrl, MAX_MEDIA_BYTES } from '../tools/media-gen-utils.js';
+
+/** Normalize a `kai-media://` relative path for stable set membership in the media GC:
+ *  media URLs use `/` separators, so posix-normalize (collapse `.`/`..`/`//`) so two
+ *  refs that resolve to the same on-disk file compare equal. */
+function normalizeMediaRel(rel: string): string {
+  return pathPosix.normalize(rel.replace(/\\/g, '/'));
+}
 
 /** Ceiling on TOTAL decoded bytes rehydrateModelMedia will materialize into base64
  *  in one pass — a safety bound so a pathological deep history of attachments can't
@@ -43,26 +50,58 @@ const REHYDRATE_TOTAL_CAP = 64 * 1024 * 1024;
  *  tolerates a missing/again-declared charset segment. We only offload base64
  *  data URLs (the heavy ones); a `data:...;utf8,` text URL is left as-is. */
 const DATA_URL_RE = /^data:([^;,]+)?(?:;[^,]*?)?;base64,([\s\S]*)$/;
-/** Standard base64 alphabet + valid terminal padding. Necessary but NOT sufficient:
- *  `AB==` passes this yet is non-canonical (the trailing bits aren't zero), and
- *  Buffer.from normalizes it — so callers use isCanonicalBase64 (regex + round-trip)
- *  as the single source of truth for "cleanly, uniquely decodable". */
-const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
-/** Decode `payload` iff it is CANONICAL base64 (alphabet/padding regex AND round-trips
+/** Stack-safe LINEAR base64-shape check (no regex): length is a multiple of 4, every
+ *  char is in the standard alphabet, and `=` appears only as valid terminal padding
+ *  (0–2 `=` at the very end). A starred regex group (`(?:....){4})*`) over a multi-MB
+ *  string can throw RangeError: Maximum call stack size on Node, so a crafted large
+ *  payload must NOT be validated by regex. This is a necessary shape check; full
+ *  canonicality is confirmed by the decode round-trip in canonicalBase64ToBuffer. */
+function hasBase64Shape(s: string): boolean {
+  const n = s.length;
+  if (n === 0 || n % 4 !== 0) return false;
+  let i = 0;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    // A–Z 65-90, a–z 97-122, 0–9 48-57, + 43, / 47
+    if (
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c === 43 ||
+      c === 47
+    ) {
+      continue;
+    }
+    if (c === 61) break; // '=' — must be terminal padding; validate the tail below
+    return false; // any other char → not base64
+  }
+  // From the first '=' (index i) to the end: only '=', at most 2, and only in the
+  // final group. i must be at position n-1 or n-2 (1 or 2 pad chars).
+  if (i === n) return true; // no padding
+  const pad = n - i;
+  if (pad > 2) return false;
+  for (let j = i; j < n; j++) if (s.charCodeAt(j) !== 61) return false;
+  return true;
+}
+
+/** Decode `payload` iff it is CANONICAL base64 (linear shape check AND round-trips
  *  decode→re-encode === input) AND within the decoded-byte cap, returning the decoded
- *  Buffer — or null otherwise. The ENCODED-length gate runs FIRST (before any decode),
- *  so an oversized payload is rejected without allocating >1 GiB in the main process.
- *  The round-trip rejects non-canonical forms (`AB==`) that the regex alone accepts but
- *  Buffer.from silently normalizes. Returns the buffer so callers needing the bytes
- *  don't decode twice. `maxBytes` defaults to the media cap. */
+ *  Buffer — or null otherwise. Order matters for safety: the cheap ENCODED-length gate
+ *  runs FIRST (so an oversized payload is never decoded/scanned in full), then the
+ *  stack-safe linear shape check, then the decode + round-trip (which rejects
+ *  non-canonical forms like `AB==` that Buffer.from silently normalizes). Everything is
+ *  inside try so a malformed/oversized input can NEVER throw out of here — the contract
+ *  is that such media stays inline. Returns the buffer so callers don't decode twice. */
 export function canonicalBase64ToBuffer(payload: string, maxBytes: number = MAX_MEDIA_BYTES): Buffer | null {
-  if (payload.length === 0 || !STRICT_BASE64_RE.test(payload)) return null;
-  // Reject over-cap by ENCODED length before decoding (4 base64 chars ≈ 3 bytes).
-  if (Math.floor((payload.length * 3) / 4) > maxBytes) return null;
   try {
+    if (payload.length === 0) return null;
+    // Encoded-length gate FIRST (4 base64 chars ≈ 3 bytes) — reject over-cap before
+    // any scan/decode allocates.
+    if (Math.floor((payload.length * 3) / 4) > maxBytes) return null;
+    if (!hasBase64Shape(payload)) return null;
     const buf = Buffer.from(payload, 'base64');
-    if (buf.length > maxBytes) return null;
+    if (buf.length === 0 || buf.length > maxBytes) return null;
     return buf.toString('base64') === payload ? buf : null;
   } catch {
     return null;
@@ -270,11 +309,13 @@ type LooseNode = {
   tokenCountSig?: unknown;
 } & Record<string, unknown>;
 
-/** Cheap eligibility check (no decode): is this value a base64 `data:` URL that
- *  offload would actually MOVE to disk? Must match offloadBase64's criteria exactly
- *  — excludes active/script-capable formats (kept inline for XSS safety), empty
- *  bodies, and over-cap payloads (by encoded length) — so a migration/reload gate
- *  built on it never churns on a value offload will reject. */
+/** Cheap eligibility check (NO decode/allocation): is this value a base64 `data:` URL
+ *  that offload would plausibly MOVE to disk? Uses the stack-safe SHAPE check, not a
+ *  decode — a migration/reload gate must not allocate a decoded+re-encoded copy of
+ *  every attachment (a 64 MiB attachment would spike main just to answer "migrate?").
+ *  The authoritative canonical round-trip runs later in offloadBase64; a shape-valid-
+ *  but-non-canonical value simply no-ops there (rewritten:0). Excludes active formats,
+ *  empty bodies, and over-cap payloads (by encoded length). */
 function isOffloadableDataUrl(value: string): boolean {
   if (!value.startsWith('data:')) return false;
   const m = DATA_URL_RE.exec(value);
@@ -283,10 +324,9 @@ function isOffloadableDataUrl(value: string): boolean {
   if (isActiveFormat(mime)) return false;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return false;
-  // Size gate FIRST (cheap, pre-decode) so an oversized payload isn't decoded by the
-  // canonical check just to be rejected — then canonical validation (matches offloadBase64).
+  // Size gate FIRST (cheap, pre-scan) so an oversized payload isn't scanned in full.
   if (Math.floor((base64.length * 3) / 4) > MAX_MEDIA_BYTES) return false;
-  return isCanonicalBase64(base64); // non-canonical → stays inline (matches offloadBase64)
+  return hasBase64Shape(base64); // shape only (no decode) — offloadBase64 does the round-trip
 }
 
 /** Cheap read-only check: does any node hold an inline base64 image/file DISPLAY
@@ -620,13 +660,22 @@ export function collectReferencedMediaPaths(value: unknown, into: Set<string> = 
       if (v.includes(MEDIA_PROTOCOL_PREFIX)) {
         for (const match of v.match(urlRe) ?? []) {
           const noQuery = match.slice(MEDIA_PROTOCOL_PREFIX.length).split('?')[0];
-          const raw = noQuery.replace(/[.,;:!?]+$/, ''); // trim trailing prose punctuation
-          if (raw.length === 0) continue;
+          const trimmed = noQuery.replace(/[.,;:!?]+$/, ''); // trim trailing prose punctuation
+          if (trimmed.length === 0) continue;
+          let rel: string;
           try {
-            into.add(decodeURIComponent(raw));
+            rel = decodeURIComponent(trimmed);
           } catch {
-            into.add(raw);
+            rel = trimmed;
           }
+          // NORMALIZE the relative path (collapse `.`/`..`/duplicate slashes) so two
+          // references that `join(mediaDir, …)` resolves to the SAME file — e.g.
+          // `files/tmp/../x.pdf` and `files/x.pdf` — compare EQUAL in the survivor/
+          // removed sets; otherwise GC could delete a file a survivor still uses under
+          // its normalized name. A `..` that escapes the root normalizes to a leading
+          // `../` which never matches a real in-root ref (and gcOrphanedMedia's realpath
+          // containment rejects it anyway), so this is safe.
+          into.add(normalizeMediaRel(rel));
         }
       }
       return;
