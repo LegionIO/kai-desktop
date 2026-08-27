@@ -37,6 +37,11 @@ const SNAPSHOT_REARM_HYSTERESIS_PCT = 10;
 /** Cooldown before re-arming a heap snapshot after a FAILED capture, so a persistently
  *  high heap gets retried (not latched off) without spamming attempts every heartbeat. */
 const SNAPSHOT_RETRY_COOLDOWN_MS = 60_000;
+/** Backstop for releasing the single-flight snapshot fence if the native capture
+ *  NEVER settles (and its renderer is somehow never reloaded). Far longer than any
+ *  plausible capture so it can't race a live one; the native-settled callback is the
+ *  normal release path. */
+const SNAPSHOT_FENCE_DRAIN_MS = 5 * 60_000;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -107,7 +112,16 @@ export interface WindowHealthMonitorOptions {
    * monitor passes the attached window; main.ts performs the actual capture +
    * retention. Errors are swallowed by the monitor.
    */
-  onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
+  onHeapSnapshotTrigger?: (
+    window: HealthWindow,
+    sample: RendererHeapSample,
+    /** Invoked when the NATIVE capture truly settles (resolve/reject, incl. a late
+     *  settle after the bounded timeout). Releases the single-flight fence exactly
+     *  when the native op is done — not on a fixed timer — so a still-hung capture
+     *  can't overlap a retry. Safe to call more than once / never (a fallback drain
+     *  timer also releases the fence in case the native op never settles at all). */
+    onNativeSettled?: () => void,
+  ) => void | Promise<void>;
   /**
    * Live renderer-recovery policy. When `reloadStalledRenderer` is set, a
    * renderer that has been unloaded longer than `stallReloadMs` is force-reloaded
@@ -414,6 +428,9 @@ export class WindowHealthMonitor {
   // second capture while one is still running — two concurrent takeHeapSnapshot on the
   // same webContents.
   private heapSnapshotInFlight = false;
+  // Monotonic capture generation — guards fence release against a stale drain-timer /
+  // late settler from an old renderer or superseded capture.
+  private heapSnapshotCaptureGen = 0;
 
   constructor(private readonly options: WindowHealthMonitorOptions) {
     this.now = options.now ?? Date.now;
@@ -550,23 +567,32 @@ export class WindowHealthMonitor {
     const armRetry = (): void => {
       this.heapSnapshotRetryAfter = Date.now() + SNAPSHOT_RETRY_COOLDOWN_MS;
     };
+    // Capture generation: bumped for THIS capture (and on attachWindow — a fresh
+    // renderer). A drain-timer or late settler only releases the fence if the
+    // generation still matches, so a stale timer from an OLD renderer/capture can
+    // never clear a NEW renderer's in-flight fence.
+    const captureGen = ++this.heapSnapshotCaptureGen;
     const clearInFlight = (): void => {
-      this.heapSnapshotInFlight = false;
+      if (this.heapSnapshotCaptureGen === captureGen) this.heapSnapshotInFlight = false;
     };
+    // PRIMARY fence release: the native capture truly settled (main wires this to the
+    // real takeHeapSnapshot promise, including a late settle after the bounded timeout).
+    // Generation-guarded so a settle from an OLD renderer/capture can't release a NEW
+    // one's fence. This is what makes a still-hung capture unable to overlap a retry.
+    const onNativeSettled = clearInFlight;
     try {
-      void Promise.resolve(trigger(window, sample))
+      void Promise.resolve(trigger(window, sample, onNativeSettled))
         .then(clearInFlight, (error) => {
           this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
           if (error instanceof HeapSnapshotTimeoutError) {
             // The BOUNDED wrapper rejected, but the NATIVE takeHeapSnapshot may still be
-            // running (that's the failure this fence guards). Clearing the fence now +
-            // retrying after the cooldown could start a SECOND native capture on the same
-            // webContents. So hold the fence through a native-drain window (the retry
-            // cooldown, ≫ the capture timeout) before allowing another; if the renderer is
-            // genuinely wedged it gets reloaded (attachWindow resets the fence anyway).
+            // running. onNativeSettled (above) releases the fence when it finally does.
+            // As a BACKSTOP for a capture that NEVER settles at all (and whose renderer
+            // is somehow never reloaded), a long drain timer also releases — well beyond
+            // the timeout, generation-guarded — so the fence can't wedge permanently.
             const drainTimer = setTimeout(() => {
               clearInFlight();
-            }, SNAPSHOT_RETRY_COOLDOWN_MS);
+            }, SNAPSHOT_FENCE_DRAIN_MS);
             (drainTimer as { unref?: () => void }).unref?.();
             armRetry();
             return;
@@ -597,6 +623,7 @@ export class WindowHealthMonitor {
     this.heapSnapshotArmed = true;
     this.heapSnapshotRetryAfter = 0;
     this.heapSnapshotInFlight = false; // fresh renderer — no capture in flight
+    this.heapSnapshotCaptureGen++; // invalidate any old renderer's pending drain/settle
     const contents = window.webContents;
 
     const onWindow = (event: string, listener: (...args: never[]) => void): void => {

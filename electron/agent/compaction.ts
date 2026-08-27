@@ -777,6 +777,11 @@ export async function compactConversationPrefix(
      *  replaced by a summary placeholder the model never sees behind. Leave false for
      *  on-demand /compact over historical content. */
     protectNewestUser?: boolean;
+    /** App home, so the final budget check can attribute offloaded (kai-media://)
+     *  media in the protected suffix its real token cost instead of ~0 — else an
+     *  over-budget candidate incurs the paid summarizer call before the outer
+     *  validation rejects it as nothing-to-compact, repeating that cost. */
+    appHome?: string;
   },
 ): Promise<CompactionResult> {
   const tokenization = resolveConversationTokenization(
@@ -1115,7 +1120,7 @@ export async function compactConversationPrefix(
   // the turn proceeds on the full (uncompacted) context ("null ⇒ no message loss").
   const { messages: serializableCompacted, mediaTokens: compactedMediaTokens } = await stripMediaForSerialization(
     compactedMessages,
-    { signal },
+    { signal, appHome: options?.appHome },
   );
   const compactedTokens = (await countBody(serializeForTokenCounting(serializableCompacted))) + compactedMediaTokens;
   if (compactedTokens > nextTurnBudget) {

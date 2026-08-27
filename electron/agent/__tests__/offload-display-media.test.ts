@@ -424,3 +424,26 @@ describe('rehydration per-occurrence cap (R5-F2)', () => {
     expect(rehydratedCount).toBe(1); // NOT 2 — the second copy is charged and left a URL
   });
 });
+
+describe('strict base64 validation (R6-S1)', () => {
+  let appHome: string;
+  beforeEach(() => { appHome = mkdtempSync(join(tmpdir(), 'kai-b64-')); });
+  afterEach(() => rmSync(appHome, { recursive: true, force: true }));
+
+  it('leaves a MALFORMED base64 attachment inline (never persists a corrupted subset)', () => {
+    // `Buffer.from` would silently drop the `!!!!` and persist a truncated file.
+    const bad = 'data:image/png;base64,QUJD!!!!';
+    const { tree, rewritten } = offloadTreeDisplayMedia([imageMsg('m', bad)], appHome);
+    expect(rewritten).toBe(0);
+    const part = ((tree as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>)[1];
+    expect(part.image).toBe(bad); // unchanged, inline
+    expect(existsSync(join(appHome, 'media', 'images'))).toBe(false);
+    expect(existsSync(join(appHome, 'media', 'files'))).toBe(false);
+  });
+
+  it('still offloads clean canonical base64', () => {
+    const clean = 'data:image/png;base64,' + Buffer.from('hello world image bytes').toString('base64');
+    const { rewritten } = offloadTreeDisplayMedia([imageMsg('c', clean)], appHome);
+    expect(rewritten).toBe(1);
+  });
+});

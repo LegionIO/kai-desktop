@@ -190,6 +190,11 @@ export async function captureHeapSnapshot(
   retention: HeapSnapshotRetention,
   now: Date = new Date(),
   timeoutMs = 0,
+  /** Invoked exactly when the NATIVE capture promise settles (resolve/reject),
+   *  INCLUDING a late settle after the bounded timeout already rejected. Lets the
+   *  caller release a single-flight fence on true native completion rather than a
+   *  fixed timer. Fires at most once; never fires if the native op never settles. */
+  onNativeSettled?: () => void,
 ): Promise<HeapSnapshotResult> {
   const dir = heapSnapshotDir(logsDir);
   mkdirSync(dir, { recursive: true });
@@ -232,7 +237,18 @@ export async function captureHeapSnapshot(
               /* best-effort late cleanup */
             }
           };
-          native.then(cleanupLate, cleanupLate);
+          // Notify the caller when the NATIVE op truly settles (either outcome),
+          // including a late settle after the timeout won — plus clean up a late file.
+          native.then(
+            () => {
+              cleanupLate();
+              onNativeSettled?.();
+            },
+            () => {
+              cleanupLate();
+              onNativeSettled?.();
+            },
+          );
           // Whichever settles first wins; clear the timer in finally so a resolved
           // capture leaves no dangling handle.
           return Promise.race([native, timeout]).finally(() => {

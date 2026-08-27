@@ -951,7 +951,7 @@ const windowHealthMonitor = new WindowHealthMonitor({
   },
   // Capture a renderer heap snapshot + enforce retention when the heartbeat
   // decides one is due. Heavy (multi-GB write + GC pause) but rare (latched).
-  onHeapSnapshotTrigger: async (win) => {
+  onHeapSnapshotTrigger: async (win, _sample, onNativeSettled) => {
     const hs = (() => {
       try {
         return readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.heapSnapshot ?? null;
@@ -969,6 +969,10 @@ const windowHealthMonitor = new WindowHealthMonitor({
       // and takeHeapSnapshot then never settles — the timeout turns that hang
       // into a reject so the failure path (partial cleanup + re-arm) runs.
       hs?.captureTimeoutMs ?? 30000,
+      // Release the monitor's single-flight fence exactly when the NATIVE capture
+      // settles (incl. a late settle after the timeout), so a still-hung capture
+      // can never overlap a retry.
+      onNativeSettled,
     );
     windowHealthMonitor.recordLifecycleEvent('renderer-heap-snapshot-captured', {
       path: result.path,

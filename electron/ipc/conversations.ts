@@ -2769,6 +2769,7 @@ export function registerConversationHandlers(
         {
           disableAmbientFallback: providerOverrideApplied,
           externalPromptOverReserve: externalOverReserve,
+          appHome, // charge offloaded (kai-media://) media in the protected suffix its real token cost
           // Honor a hook-rewritten compaction prompt (only when it actually changed).
           ...(compactionSystemPrompt !== COMPACTION_SYSTEM_PROMPT
             ? { systemPromptOverride: compactionSystemPrompt }

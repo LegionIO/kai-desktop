@@ -432,9 +432,23 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
  * kept INLINE and never offloaded, so their presence must NOT trigger a (useless)
  * reload. Only a normal base64 image/file that will actually be shed counts.
  */
+// Mirrors electron/agent/offload-display-media.ts offload eligibility so the reload
+// gate matches what main WILL actually offload: a base64 `data:` URL that is NOT an
+// active/script-capable format, NOT empty, and within the per-file cap. Matching it
+// avoids a futile post-persist reload (and the transient full-tree duplication that
+// reload entails) for legacy media main leaves inline.
 const ACTIVE_MEDIA_MIME_RE = /^data:\s*(image\/svg\+xml|text\/html|application\/xhtml\+xml)\b/i;
+const MAX_OFFLOADABLE_MEDIA_BYTES = 512 * 1024 * 1024; // matches MAX_MEDIA_BYTES (main)
 function isOffloadableInlineData(value: string): boolean {
-  return value.startsWith('data:') && !ACTIVE_MEDIA_MIME_RE.test(value);
+  if (!value.startsWith('data:') || ACTIVE_MEDIA_MIME_RE.test(value)) return false;
+  const comma = value.indexOf(',');
+  if (comma < 0) return false;
+  const body = value.slice(comma + 1);
+  if (body.length === 0) return false;
+  // Only base64 data URLs are offloaded (a `data:...;base64,` header); and the decoded
+  // size must be within the cap (~3/4 of the base64 length).
+  if (!/;base64/i.test(value.slice(0, comma))) return false;
+  return Math.floor((body.length * 3) / 4) <= MAX_OFFLOADABLE_MEDIA_BYTES;
 }
 export function branchHasInlineBase64Media(messages: StoredMessage[]): boolean {
   for (const m of messages) {
