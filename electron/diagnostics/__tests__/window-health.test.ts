@@ -510,9 +510,7 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     // Before the stall window elapses: recovery skips (still "loading").
     monitor.requestRecovery('display-added', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'));
     expect(window.webContents.reload).not.toHaveBeenCalled();
 
     // Advance past the stall window → next recovery force-reloads.
@@ -565,9 +563,7 @@ describe('WindowHealthMonitor recovery policy', () => {
     // must record cooldownMs and reschedule rather than give up.
     now += 1_000; // well past 200ms stall window, still < 60s cooldown
     monitor.requestRecovery('display-added', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('event=auto-reload-suppressed'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=auto-reload-suppressed'));
     const log = readFileSync(logPath, 'utf-8');
     expect(log).toContain('"reason":"reload-loop-guard"');
     // The suppressed branch scheduled a follow-up (cooldownMs>0 path).
@@ -586,9 +582,7 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     // unloadedMs ~0 < 200 threshold → don't reload yet, keep the watchdog alive.
     monitor.requestRecovery('renderer-load-failed', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'));
     expect(window.webContents.reload).not.toHaveBeenCalled();
     expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stalled-load-deadline"');
     monitor.detachWindow();
@@ -626,9 +620,7 @@ describe('WindowHealthMonitor recovery policy', () => {
     window.visible = false;
     now += 1_000;
     monitor.requestRecovery('display-metrics-changed', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'));
     expect(window.webContents.reload).not.toHaveBeenCalled();
     expect(readFileSync(logPath, 'utf-8')).not.toContain('"context":"hidden-startup"');
     monitor.detachWindow();
@@ -641,9 +633,7 @@ describe('WindowHealthMonitor recovery policy', () => {
     // A main-frame navigation (e.g. from a crash auto-reload) must schedule a
     // watchdog even though no recovery-branch armed one.
     window.webContents.emit('did-start-navigation', { isMainFrame: true });
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stall-watchdog"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stall-watchdog"'));
     monitor.detachWindow();
   });
 
@@ -667,9 +657,7 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     now += 120_000; // well past any stall window
     monitor.requestRecovery('display-added', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'));
     expect(window.webContents.reload).not.toHaveBeenCalled();
     monitor.detachWindow();
   });
@@ -748,9 +736,7 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     // First recovery before the deadline (unloadedMs=0 < 200) → skip + reschedule.
     monitor.requestRecovery('display-added', 0);
-    await vi.waitFor(() =>
-      expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stalled-load-deadline"'),
-    );
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stalled-load-deadline"'));
     expect(window.webContents.reload).not.toHaveBeenCalled();
 
     // Advance the injected clock past the stall window; the already-scheduled
@@ -760,6 +746,45 @@ describe('WindowHealthMonitor recovery policy', () => {
     await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1), { timeout: 3000 });
     expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-reload-stalled-load');
     monitor.detachWindow();
+  });
+
+  it('detaches cleanly when the window/webContents was already destroyed', () => {
+    // Regression: on the renderer-crash recovery path (render-process-gone →
+    // reload → attachWindow → detachWindow), the just-crashed webContents — or a
+    // window torn down by the updater — is already destroyed. Electron throws
+    // "Object has been destroyed" when `.off` touches a destroyed emitter;
+    // unhandled inside the native CFRunLoop callback that path runs under, that
+    // escalated to a V8 fatal (SIGTRAP) and took the whole main process down.
+    // detachWindow must skip listener teardown on a destroyed window/webContents.
+    const monitor = makeMonitor();
+
+    // Simulate Electron: `.off` on a destroyed window/webContents throws.
+    const throwDestroyed = (): never => {
+      throw new Error('Object has been destroyed');
+    };
+    vi.spyOn(window, 'off').mockImplementation(throwDestroyed as never);
+    vi.spyOn(window.webContents, 'off').mockImplementation(throwDestroyed as never);
+    window.destroyed = true;
+    window.webContents.destroyed = true;
+
+    expect(() => monitor.detachWindow()).not.toThrow();
+    expect(window.off).not.toHaveBeenCalled();
+    expect(window.webContents.off).not.toHaveBeenCalled();
+  });
+
+  it('detaches cleanly when only the webContents was destroyed', () => {
+    // A destroyed webContents inside a live window (renderer crash before the
+    // BrowserWindow is torn down): window listeners can still be removed, but the
+    // webContents `.off` would throw and must be skipped.
+    const monitor = makeMonitor();
+
+    vi.spyOn(window.webContents, 'off').mockImplementation((() => {
+      throw new Error('Object has been destroyed');
+    }) as never);
+    window.webContents.destroyed = true;
+
+    expect(() => monitor.detachWindow()).not.toThrow();
+    expect(window.webContents.off).not.toHaveBeenCalled();
   });
 });
 

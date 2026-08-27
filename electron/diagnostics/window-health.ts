@@ -357,7 +357,6 @@ export async function sampleRendererHeap(window: HealthWindow): Promise<Renderer
   }
 }
 
-
 /**
  * Owns diagnostics and conservative revival for the primary renderer. Event
  * wiring lives in main.ts so this policy remains unit-testable without booting
@@ -719,9 +718,19 @@ export class WindowHealthMonitor {
       this.recoveryTimerArmedAt = null;
     }
     const window = this.attachedWindow;
-    if (window) {
+    // Guard against a destroyed window/webContents: detachWindow runs on the
+    // renderer-crash recovery path (render-process-gone → attachWindow → detachWindow),
+    // where the just-crashed webContents — or a window torn down by the updater — is
+    // already destroyed. Touching `.off` on a destroyed BrowserWindow or WebContents
+    // throws "Object has been destroyed"; unhandled inside the native CFRunLoop
+    // callback that path runs under, that escalates to a V8 fatal (SIGTRAP) and takes
+    // the whole main process down. Removing listeners from a destroyed emitter is a
+    // no-op anyway (it's gone), so skipping is safe.
+    if (window && !window.isDestroyed()) {
       for (const { event, listener } of this.windowListeners) window.off(event as never, listener);
-      for (const { event, listener } of this.contentsListeners) window.webContents.off(event as never, listener);
+      if (!window.webContents.isDestroyed()) {
+        for (const { event, listener } of this.contentsListeners) window.webContents.off(event as never, listener);
+      }
     }
     this.windowListeners = [];
     this.contentsListeners = [];
@@ -860,7 +869,11 @@ export class WindowHealthMonitor {
             return;
           }
           this.reloadHistory.push(this.now());
-          this.log('renderer-reload-stalled-load', { trigger, context: 'hidden-startup', unloadedMs, ...this.windowDetails(window) }, true);
+          this.log(
+            'renderer-reload-stalled-load',
+            { trigger, context: 'hidden-startup', unloadedMs, ...this.windowDetails(window) },
+            true,
+          );
           this.unloadedSince = this.now();
           this.stallDeadlineRescheduleMs = policy.stallReloadMs + 250;
           window.webContents.reload();
@@ -874,7 +887,11 @@ export class WindowHealthMonitor {
         });
         // Previously-presented hidden window that's unloaded: keep re-checking
         // at the CONFIGURED stall cadence (not a hardcoded default).
-        if (policy.reloadStalledRenderer && this.unloadedSince !== null && !this.loadedWebContentsIds.has(window.webContents.id)) {
+        if (
+          policy.reloadStalledRenderer &&
+          this.unloadedSince !== null &&
+          !this.loadedWebContentsIds.has(window.webContents.id)
+        ) {
           this.stallDeadlineRescheduleMs = policy.stallReloadMs + 250;
         }
         return;
@@ -940,7 +957,12 @@ export class WindowHealthMonitor {
           this.stallDeadlineRescheduleMs = remainingMs;
           return;
         }
-        this.log('recovery-skipped', { trigger, reason: 'renderer-not-loaded', unloadedMs, ...this.windowDetails(window) });
+        this.log('recovery-skipped', {
+          trigger,
+          reason: 'renderer-not-loaded',
+          unloadedMs,
+          ...this.windowDetails(window),
+        });
         return;
       }
 
