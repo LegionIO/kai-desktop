@@ -20,7 +20,7 @@ import {
 } from './media-fit.js';
 import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
 import { extForMime } from './offload-display-media.js';
-import { offloadedMediaSize, estimateNativeTokensFromSize } from './media-fit.js';
+import { offloadedMediaSize, estimateNativeTokensFromSize, estimateOffloadedImageTokens } from './media-fit.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
 // Cap on CONCURRENT outstanding summarizer generates. An aborted/timed-out compaction
@@ -566,6 +566,7 @@ async function stripMediaForSerialization(
   // URL as base64 → a garbage ~0 estimate, undercounting the request). Accumulated
   // here and folded into mediaTokens at the end.
   let offloadedMediaTokens = 0;
+  const offloadedImagesToProbe: Array<{ value: string; size: number }> = [];
   const out = messages.map((m) => {
     if (!m || typeof m !== 'object') return m;
     const content = (m as { content?: unknown }).content;
@@ -582,13 +583,19 @@ async function stripMediaForSerialization(
         touched = true;
         const value = (p.data ?? p.image) as string;
         const mediaType = (p.mimeType ?? p.mediaType) as string | undefined;
-        // An offloaded kai-media:// value: resolve its real size and estimate from
-        // that (a URL can't be sharp-probed). A missing/unresolvable file contributes
-        // nothing. Everything else (inline base64) goes through the normal probe path.
+        // An offloaded kai-media:// value: resolve its real size. FILES estimate from
+        // size + document multiplier (accurate, no dimensions); IMAGES are queued for
+        // an async header probe (dimension-based, so a pixel-bomb isn't under-counted —
+        // a URL can't be sharp-probed inline). A missing/unresolvable file contributes
+        // nothing. Inline base64 goes through the normal probe path.
         const offSize = countMedia && appHome ? offloadedMediaSize(value, appHome) : null;
         if (offSize !== null) {
-          const urlExt = value.split('?')[0].split('.').pop() ?? '';
-          offloadedMediaTokens += estimateNativeTokensFromSize(offSize, p.type === 'image', mediaType, urlExt);
+          if (p.type === 'image') {
+            offloadedImagesToProbe.push({ value, size: offSize });
+          } else {
+            const urlExt = value.split('?')[0].split('.').pop() ?? '';
+            offloadedMediaTokens += estimateNativeTokensFromSize(offSize, false, mediaType, urlExt);
+          }
         } else if (!value.includes('://')) {
           // Inline data URL / bare base64 — probe as before. (A non-kai-media scheme
           // URL — http, or an unresolvable kai-media — is left uncounted here.)
@@ -711,6 +718,19 @@ async function stripMediaForSerialization(
     const batch = toProbe.slice(i, i + CONCURRENCY);
     const ests = await Promise.all(batch.map((x) => estimateNativeMediaTokens(x.data, x.isImage, x.mediaType)));
     for (const e of ests) mediaTokens += e;
+  }
+  // Offloaded images: header-probe for accurate dimension-based tokens (fall back to
+  // the byte estimate on abort so the count still completes).
+  if (appHome) {
+    for (let i = 0; i < offloadedImagesToProbe.length; i += CONCURRENCY) {
+      if (options.signal?.aborted) {
+        for (const x of offloadedImagesToProbe.slice(i)) mediaTokens += Math.ceil(x.size / 2);
+        break;
+      }
+      const batch = offloadedImagesToProbe.slice(i, i + CONCURRENCY);
+      const ests = await Promise.all(batch.map((x) => estimateOffloadedImageTokens(x.value, appHome, x.size)));
+      for (const e of ests) mediaTokens += e;
+    }
   }
   return { messages: out, mediaTokens };
 }

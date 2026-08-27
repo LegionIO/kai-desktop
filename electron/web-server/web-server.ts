@@ -1182,6 +1182,30 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           res.end(off === span ? buf : buf.subarray(0, off));
           return;
         }
+        // A Range header PRESENT but not a parseable single range (multi-range or
+        // malformed) must NOT fall through to an unbounded full-file read (a
+        // `bytes=-BIG` or multi-range against a 512 MiB file would allocate the whole
+        // file). Serve a bounded first chunk as 206 — mirrors the Electron protocol
+        // handler. Only a request with NO Range header gets the full read below.
+        if (typeof req.headers.range === 'string' && req.headers.range.length > 0) {
+          const span = Math.min(MEDIA_RANGE_CHUNK, st.size);
+          const buf = Buffer.allocUnsafe(span);
+          let off = 0;
+          while (off < span) {
+            const r = readSync(fd, buf, off, span - off, off);
+            if (r <= 0) break;
+            off += r;
+          }
+          res.writeHead(206, {
+            'Content-Type': contentType,
+            'Content-Range': `bytes 0-${off - 1}/${st.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': off,
+            'Cache-Control': 'no-cache',
+          });
+          res.end(off === span ? buf : buf.subarray(0, off));
+          return;
+        }
         let data = Buffer.allocUnsafe(st.size);
         let offset = 0;
         while (offset < st.size) {

@@ -37,7 +37,7 @@ import {
 } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
-import { rehydrateModelMedia } from '../agent/offload-display-media.js';
+import { rehydrateModelMedia, stripUnresolvedOffloadedMedia } from '../agent/offload-display-media.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
 import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submit-gate.js';
 import {
@@ -3620,7 +3620,12 @@ export function registerAgentHandlers(
     // (which must stay disk-equivalent: disk stores the URL) and produces a NEW
     // array (never mutates the shared/persisted branch). No-op when nothing is
     // offloaded. NEVER touches tool-result _modelContent (its own model path).
-    messages = rehydrateModelMedia(messages, appHome);
+    // Rehydrate offloaded media to data URLs for the model, then replace any that
+    // stayed a kai-media:// URL (missing/unreadable file, or beyond the rehydration
+    // cap) with an omission note — runtimes only accept data/http media, so leaving
+    // the scheme URL would make Mastra reject the request or Claude silently drop the
+    // image. Mirrors the plugin/automation path.
+    messages = stripUnresolvedOffloadedMedia(rehydrateModelMedia(messages, appHome));
     const effectiveCwd = normalizeAgentCwd(cwd);
     // executionMode reconciliation (R128 finding-1): the renderer-supplied `executionMode` can be
     // STALE — a reconciliation (loadConversationState hydration / a background-conv broadcast) may
@@ -4004,9 +4009,11 @@ export function registerAgentHandlers(
             }
             const finalConv = readConversation(appHome, conversationId) ?? rebuilt;
             const { tree: finalTree } = ensureConversationTree(finalConv);
-            messages = rehydrateModelMedia(
-              stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]),
-              appHome,
+            messages = stripUnresolvedOffloadedMedia(
+              rehydrateModelMedia(
+                stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]),
+                appHome,
+              ),
             );
           }
         }
@@ -4083,9 +4090,8 @@ export function registerAgentHandlers(
           if (reconciled) {
             const reread = readConversation(appHome, conversationId) ?? conv;
             const { tree: rt } = ensureConversationTree(reread);
-            messages = rehydrateModelMedia(
-              stripDisplayOnlyParts(getConversationBranch(rt, head) as unknown[]),
-              appHome,
+            messages = stripUnresolvedOffloadedMedia(
+              rehydrateModelMedia(stripDisplayOnlyParts(getConversationBranch(rt, head) as unknown[]), appHome),
             );
           }
         }

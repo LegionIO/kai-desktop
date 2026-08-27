@@ -3,7 +3,7 @@ import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
-import { offloadTreeDisplayMedia } from '../agent/offload-display-media.js';
+import { offloadTreeDisplayMedia, hasInlineBase64DisplayMedia } from '../agent/offload-display-media.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -968,25 +968,37 @@ export function registerConversationHandlers(
   // re-persists on the next non-compacting read). writeConversation applies its own
   // tombstone/merge guards, so a stale re-persist can't corrupt the tree.
   const migrateConversationMedia = <T extends ConversationRecord>(conv: T, id: string): T => {
+    // Cheap detection of inline base64 display media (no file writes): scan for a
+    // `data:` image/file part in either array. Only then do the (heavier) migration.
+    if (!hasInlineBase64DisplayMedia(conv.messageTree) && !hasInlineBase64DisplayMedia(conv.messages)) {
+      return conv;
+    }
+    // Preferred path: route through writeConversation, which SANITIZES (dropping
+    // malformed/dup nodes) BEFORE offloading — so no orphan file is written for a
+    // node that won't be persisted — then commits the URL-ized tree. Re-read the
+    // committed record so the returned value matches disk exactly.
+    if (!isCompacting(id)) {
+      try {
+        writeConversation(appHome, conv);
+        const reread = readConversation(appHome, id);
+        if (reread) return reread as T;
+      } catch {
+        /* fall through to a direct display-only offload for the return value */
+      }
+    }
+    // Compacting (or the write failed): can't safely persist, but still URL-ize the
+    // RETURNED record so the renderer doesn't receive the base64. Files written here
+    // for any invalid node are reclaimed by a later writeConversation's rewrite GC.
     const treeOffload = offloadTreeDisplayMedia(conv.messageTree, appHome);
     const msgOffload = Array.isArray(conv.messages)
       ? offloadTreeDisplayMedia(conv.messages, appHome)
       : { tree: conv.messages, rewritten: 0 };
     if (treeOffload.rewritten === 0 && msgOffload.rewritten === 0) return conv;
-    const migrated: T = {
+    return {
       ...conv,
       ...(Array.isArray(conv.messageTree) ? { messageTree: treeOffload.tree as unknown[] } : {}),
       ...(Array.isArray(conv.messages) ? { messages: msgOffload.tree as unknown[] } : {}),
     };
-    if (!isCompacting(id)) {
-      try {
-        writeConversation(appHome, migrated);
-      } catch {
-        /* best-effort migration; media files are already written, and a later write
-           (or the next read) re-persists the URL tree. */
-      }
-    }
-    return migrated;
   };
 
   ipcMain.handle('conversations:get', (_event, id: string) => {

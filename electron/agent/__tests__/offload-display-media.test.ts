@@ -9,6 +9,7 @@ import {
   rehydrateMediaUrl,
   collectReferencedMediaPaths,
   gcOrphanedMedia,
+  stripUnresolvedOffloadedMedia,
 } from '../offload-display-media';
 
 // A tiny 1x1 PNG, base64.
@@ -347,5 +348,56 @@ describe('collectReferencedMediaPaths — embedded URLs (R3-F2)', () => {
     // gcOrphanedMedia would skip it because it's in survivingRefs (no unlink attempted).
     expect(removed.size).toBe(1);
     expect(surviving.has([...removed][0])).toBe(true);
+  });
+});
+
+describe('active-format handling (R4-T1: no XSS-capable offload)', () => {
+  let appHome: string;
+  beforeEach(() => { appHome = mkdtempSync(join(tmpdir(), 'kai-active-')); });
+  afterEach(() => rmSync(appHome, { recursive: true, force: true }));
+
+  it('does NOT offload an SVG image (keeps it inline — no servable URL)', () => {
+    const svg = 'data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64');
+    const { tree, rewritten } = offloadTreeDisplayMedia([imageMsg('s', svg)], appHome);
+    expect(rewritten).toBe(0); // left inline
+    const part = ((tree as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>)[1];
+    expect(part.image).toBe(svg);
+    // No file written under media/.
+    expect(existsSync(join(appHome, 'media', 'images'))).toBe(false);
+    expect(existsSync(join(appHome, 'media', 'files'))).toBe(false);
+  });
+
+  it('does NOT offload an HTML file (keeps it inline)', () => {
+    const html = 'data:text/html;base64,' + Buffer.from('<script>alert(1)</script>').toString('base64');
+    const node = {
+      id: 'h', role: 'user', parentId: null, createdAt: '2026-08-26T00:00:00.000Z',
+      content: [{ type: 'file', data: html, mimeType: 'text/html', filename: 'x.html' }],
+    };
+    const { rewritten } = offloadTreeDisplayMedia([node], appHome);
+    expect(rewritten).toBe(0);
+    expect(existsSync(join(appHome, 'media', 'files'))).toBe(false);
+  });
+
+  it('still offloads a normal PNG (regression guard)', () => {
+    const { rewritten } = offloadTreeDisplayMedia([imageMsg('p', PNG_DATA_URL)], appHome);
+    expect(rewritten).toBe(1);
+  });
+});
+
+describe('stripUnresolvedOffloadedMedia (R4-T2)', () => {
+  it('replaces a leftover kai-media:// part with an omission note; leaves data:/http', () => {
+    const proto = __BRAND_MEDIA_PROTOCOL;
+    const msgs = [
+      { role: 'user', content: [
+        { type: 'text', text: 'hi' },
+        { type: 'image', image: `${proto}://images/unresolved0000.png` },
+        { type: 'image', image: 'data:image/png;base64,AAAA' },
+      ] },
+    ];
+    const out = stripUnresolvedOffloadedMedia(msgs) as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(out[0].content[0]).toEqual({ type: 'text', text: 'hi' });
+    expect(out[0].content[1].type).toBe('text'); // unresolved URL → omission note
+    expect(String(out[0].content[1].text)).toMatch(/omitted/i);
+    expect(out[0].content[2].image).toBe('data:image/png;base64,AAAA'); // data URL untouched
   });
 });

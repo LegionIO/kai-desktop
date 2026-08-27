@@ -975,6 +975,9 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
           mimeType={mimeType}
           text={previewText}
           filename={filename}
+          // A text preview whose bytes are still being fetched (offloaded URL) →
+          // show a loading state, never the <img> fallthrough (unbounded GET).
+          textLoading={isText && isOffloadedUrl && previewText === null}
           onClose={() => setPreviewOpen(false)}
         />
       )}
@@ -987,8 +990,11 @@ const FilePreviewModal: FC<{
   mimeType?: string;
   text?: string | null;
   filename?: string;
+  /** True while a text preview's bytes are still being fetched — render a loading
+   *  state, never fall through to <img src> (which would issue an unbounded GET). */
+  textLoading?: boolean;
   onClose: () => void;
-}> = ({ src, mimeType, text, filename, onClose }) => {
+}> = ({ src, mimeType, text, filename, textLoading, onClose }) => {
   const [copied, setCopied] = useState(false);
   // Close on Escape key
   useEffect(() => {
@@ -1038,6 +1044,10 @@ const FilePreviewModal: FC<{
             <pre className="flex-1 overflow-auto p-4 text-xs font-mono leading-5 text-neutral-200 whitespace-pre-wrap break-words">
               {text}
             </pre>
+          </div>
+        ) : textLoading ? (
+          <div className="flex w-[80vw] max-w-[1100px] h-[85vh] items-center justify-center rounded-lg border border-neutral-700 bg-neutral-900 text-sm text-neutral-400">
+            Loading {filename ?? 'file'}…
           </div>
         ) : mimeType === 'application/pdf' || src.startsWith('data:application/pdf') ? (
           // sandbox with NO allow-scripts: the native PDF viewer still renders, but a

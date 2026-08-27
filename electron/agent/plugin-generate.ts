@@ -6,10 +6,11 @@ import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { toolsForExecutionMode } from './plan-mode-tools.js';
-import { rehydrateModelMedia } from './offload-display-media.js';
+import { rehydrateModelMedia, stripUnresolvedOffloadedMedia } from './offload-display-media.js';
 import { DEFAULT_MAX_TOTAL_MEDIA_BYTES } from './media-fit.js';
 import { readConversation, conversationExistenceState } from '../ipc/conversation-store.js';
 import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
+import type { SanitizedPluginMessage } from './plugin-message-sanitizer.js';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
 
@@ -108,20 +109,28 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   modelKey: string;
 }> {
   const { appHome, systemPrompt, tools: pluginToolsRaw } = options;
-  // Rehydrate offloaded display media (kai-media:// → base64 data URLs) for the
-  // model boundary: this is the shared prep for the plugin/automation stream+generate
-  // family (streamForPlugin / generateForPlugin), a SEPARATE path from the GUI/CLI
-  // streamHandler, so it needs its own rehydration or a follow-up automation turn
-  // referencing a prior attachment would forward an unresolvable kai-media:// URL to
-  // the provider. Produces a NEW array (never mutates the caller's branch).
-  //
-  // Cap the total rehydrated bytes at the OUTGOING media ceiling (not the 64 MiB
-  // backstop): unlike streamHandler, this path has no separate media-fit gate, so
-  // materializing more than the request can hold would only build an oversized
-  // request the provider rejects. Bounding rehydration to the ceiling keeps the
-  // request within budget (newest attachments first); older media past the ceiling
-  // stays a URL — unusable by the model, but strictly better than an over-limit send.
-  const messages = rehydrateModelMedia(options.messages, appHome, DEFAULT_MAX_TOTAL_MEDIA_BYTES);
+  // Prepare messages for the model on the plugin/automation stream+generate family
+  // (a SEPARATE path from the GUI/CLI streamHandler, so it owns its media handling):
+  //   1. SANITIZE first — drops file parts and other non-forwardable content. Doing
+  //      this BEFORE rehydration means a soon-to-be-discarded file part never spends
+  //      the media budget (which would starve an older image that actually fits).
+  //   2. REHYDRATE offloaded kai-media:// → data URLs, capped at the OUTGOING media
+  //      ceiling (not the 64 MiB backstop): this path has no separate media-fit gate,
+  //      so materializing more than the request can hold only builds an oversized
+  //      request. Newest attachments first; older media past the ceiling stays a URL.
+  //   3. STRIP any still-unresolved kai-media:// (missing file / past the cap) to an
+  //      omission note — a provider can't dereference the scheme, so leaving it would
+  //      fail the whole request.
+  const prepareForModel = (msgs: Array<{ role: string; content: unknown }>): SanitizedPluginMessage[] => {
+    const sanitizedMsgs = sanitizePluginMessages(msgs);
+    const rehydrated = rehydrateModelMedia(
+      sanitizedMsgs as unknown[],
+      appHome,
+      DEFAULT_MAX_TOTAL_MEDIA_BYTES,
+    );
+    return stripUnresolvedOffloadedMedia(rehydrated) as SanitizedPluginMessage[];
+  };
+  const messages = options.messages as Array<{ role: string; content: unknown }>;
   // Determine the effective execution mode, then filter registered tools + overlay config.
   // Priority: an explicit conversation record (MAIN-authoritative — R129 f-2/f-3) > the
   // passed snapshot > the GLOBAL config.tools.executionMode. The global fallback matters for
@@ -179,7 +188,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     }
     // Fallback: use default model directly
     const dbPath = join(appHome, 'data', 'memory.db');
-    const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
+    const sanitized = prepareForModel(messages);
     const configForStream = configForPluginStream(config, null, systemPrompt);
     const conversationId = options.conversationId ?? syntheticConversationId();
 
@@ -206,7 +215,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
 
   const modelConfig = streamConfig.primaryModel.modelConfig;
   const dbPath = join(appHome, 'data', 'memory.db');
-  const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
+  const sanitized = prepareForModel(messages);
   const configForStream = configForPluginStream(config, streamConfig, systemPrompt);
 
   const conversationId = options.conversationId ?? syntheticConversationId();

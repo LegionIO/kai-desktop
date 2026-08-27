@@ -918,12 +918,11 @@ describe('stripBranchMediaForCount (sanitizer-aware retention for the whole-requ
 });
 
 describe('estimateNativeTokensFromSize (R3-F4 — size-only, no dimensions)', () => {
-  it('floors an image at the per-image dimension cap so a small-bytes pixel-bomb cannot undercount', () => {
-    // A 2 KB compressed image: bytes/2 = ~1024, but a huge-dimension image can cost far
-    // more; the floor guarantees a safe over-estimate.
-    const small = estimateNativeTokensFromSize(2048, true);
-    expect(small).toBeGreaterThanOrEqual(3840);
-    // A large image is charged by bytes when that exceeds the floor.
+  it('estimates an image from bytes (a size-only rough proxy; accurate cost comes from the header probe)', () => {
+    // estimateNativeTokensFromSize is the FALLBACK when a header probe is unavailable;
+    // the accurate dimension-based estimate is estimateOffloadedImageTokens (tested via
+    // stripBranchMediaForCount's real-file path). Here just the byte proxy.
+    expect(estimateNativeTokensFromSize(2048, true)).toBe(1024);
     expect(estimateNativeTokensFromSize(20_000, true)).toBe(10_000);
   });
 

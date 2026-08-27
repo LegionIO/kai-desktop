@@ -264,14 +264,13 @@ export function estimateFileTokensFromBytes(base64: string, mediaType?: string):
  *  optionally its declared type). Mirrors estimateImageTokensFromBytes /
  *  estimateFileTokensFromBytes but takes raw bytes.
  *
- *  For an IMAGE we lack dimensions, and bytes/2 UNDER-counts a pixel-bomb (tiny
- *  compressed bytes, huge dimensions). Since a single image's dimension-based cost
- *  is BOUNDED (~1536 patches × 2.5 ≈ 3840 tokens — see estimateImageTokensFrom
- *  Dimensions), floor the estimate at that maximum so a small-bytes/huge-pixels
- *  image can't slip under the budget. Over-estimating only shrinks the media budget,
- *  which is the safe direction. `ext` (from the offloaded URL) refines the file
- *  document-multiplier when no mediaType was declared. */
-const MAX_SINGLE_IMAGE_TOKENS = 3840; // ceil(1536 patches × 2.5) — the per-image cap
+ *  For an IMAGE, bytes alone can't bound the token cost (a tiny-compressed huge-
+ *  dimension image), and dimension formulas (Anthropic area/750) are unbounded, so
+ *  a fixed floor can't be both safe and non-absurd. The caller therefore PROBES the
+ *  image header for real dimensions (estimateOffloadedImageTokens) and only falls
+ *  back here when the probe is unavailable; this byte path stays a rough proxy.
+ *  `ext` (from the offloaded URL) refines the file document-multiplier when no
+ *  mediaType was declared. */
 export function estimateNativeTokensFromSize(
   bytes: number,
   isImage: boolean,
@@ -279,9 +278,46 @@ export function estimateNativeTokensFromSize(
   ext?: string,
 ): number {
   if (bytes <= 0) return 0;
-  if (isImage) return Math.max(Math.ceil(bytes / 2), MAX_SINGLE_IMAGE_TOKENS);
+  if (isImage) return Math.ceil(bytes / 2);
   const isDoc = isDocumentMediaType(mediaType) || (ext !== undefined && isDocumentExt(ext));
   return isDoc ? bytes * DOCUMENT_EXPANSION_MULTIPLIER : bytes;
+}
+
+/** Accurate native token estimate for an OFFLOADED image, by reading just the
+ *  file HEADER (bounded, symlink-safe) and parsing its dimensions via sharp — the
+ *  same dimension-based estimate used for inline media, so a small-bytes/huge-pixels
+ *  image is charged its true (large) cost rather than an under-count. Reads at most
+ *  IMAGE_HEADER_PROBE_BYTES (dimension headers live at the front of every common
+ *  format). Falls back to the byte estimate when the probe/sharp is unavailable. */
+const IMAGE_HEADER_PROBE_BYTES = 128 * 1024;
+export async function estimateOffloadedImageTokens(
+  value: string,
+  appHome: string,
+  totalBytes: number,
+): Promise<number> {
+  const prefix = __BRAND_MEDIA_PROTOCOL + '://';
+  const byteEst = Math.ceil(totalBytes / 2);
+  if (!value.startsWith(prefix)) return byteEst;
+  const mediaDir = join(appHome, 'media');
+  let rel: string;
+  try {
+    rel = decodeURIComponent(value.slice(prefix.length).split('?')[0]);
+  } catch {
+    return byteEst;
+  }
+  const filePath = join(mediaDir, rel);
+  if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) return byteEst;
+  const probe = safeReadRangeWithin(mediaDir, filePath, 0, IMAGE_HEADER_PROBE_BYTES - 1);
+  if (!probe) return byteEst;
+  const sharpMod = await loadSharp();
+  if (!sharpMod) return byteEst;
+  try {
+    const meta = await sharpMod(probe.data, { limitInputPixels: false }).metadata();
+    const dimEst = estimateImageTokensFromDimensions(meta.width ?? 0, meta.height ?? 0);
+    return dimEst > 0 ? dimEst : byteEst;
+  } catch {
+    return byteEst;
+  }
 }
 
 /** LRU cache of native token estimates keyed by a fast hash of the bare base64.
@@ -416,6 +452,9 @@ export async function stripBranchMediaForCount(
   // size above — folded into nativeMediaTokens at the end (they're not in
   // mediaToEstimate, which holds base64 payloads probed via sharp).
   let preResolvedNativeTokens = 0;
+  // Offloaded IMAGE attachments to probe (header read → dimension-based tokens) in
+  // the async section below; files are estimated inline (size + doc multiplier).
+  const offloadedImagesToProbe: Array<{ value: string; size: number }> = [];
   // Consume a `_modelContent` group applying the sanitizer's per-RESULT limits: walk
   // in order up to MAX_PARTS; a media part is retained only if it's under the per-part
   // cap AND keeps the running per-result total under the total cap — otherwise the
@@ -480,12 +519,15 @@ export async function stripBranchMediaForCount(
           if (size === null) return part; // unresolvable → leave untouched
           retainedMediaBytes += size;
           const mediaType = (p.mimeType ?? p.mediaType) as string | undefined;
-          // Size-based native token estimate (we don't read the bytes). For an image
-          // this floors at the per-image dimension cap so a pixel-bomb can't undercount;
-          // for a file the URL's extension refines the document multiplier when no
-          // mediaType is declared.
           const urlExt = data.split('?')[0].split('.').pop() ?? '';
-          preResolvedNativeTokens += estimateNativeTokensFromSize(size, p.type === 'image', mediaType, urlExt);
+          if (p.type === 'image') {
+            // Probe the image HEADER async for accurate dimension-based tokens (bytes
+            // alone can't bound a pixel-bomb). Queued; resolved in the async section.
+            offloadedImagesToProbe.push({ value: data, size });
+          } else {
+            // Files have no dimensions — the size + document multiplier is accurate.
+            preResolvedNativeTokens += estimateNativeTokensFromSize(size, false, mediaType, urlExt);
+          }
           touched = true;
           const { data: _du, image: _iu, ...restU } = p;
           void _du;
@@ -569,6 +611,19 @@ export async function stripBranchMediaForCount(
     const batch = toProbe.slice(i, i + MEDIA_ESTIMATE_CONCURRENCY);
     const estimates = await Promise.all(batch.map((x) => estimateNativeMediaTokens(x.data, x.isImage, x.mediaType)));
     for (const e of estimates) nativeMediaTokens += e;
+  }
+  // Probe offloaded IMAGES by header for accurate dimension-based tokens (bounded
+  // concurrency; on abort fall back to the byte estimate so accounting still completes).
+  if (appHome) {
+    for (let i = 0; i < offloadedImagesToProbe.length; i += MEDIA_ESTIMATE_CONCURRENCY) {
+      if (signal?.aborted) {
+        for (const x of offloadedImagesToProbe.slice(i)) nativeMediaTokens += Math.ceil(x.size / 2);
+        break;
+      }
+      const batch = offloadedImagesToProbe.slice(i, i + MEDIA_ESTIMATE_CONCURRENCY);
+      const ests = await Promise.all(batch.map((x) => estimateOffloadedImageTokens(x.value, appHome, x.size)));
+      for (const e of ests) nativeMediaTokens += e;
+    }
   }
   return { stripped, nativeMediaTokens, retainedMediaBytes };
 }

@@ -25,7 +25,7 @@
  * left untouched rather than throwing (a persist must never fail on bad media).
  */
 import { createHash } from 'crypto';
-import { mkdirSync, statSync, lstatSync, rmSync } from 'fs';
+import { mkdirSync, statSync, lstatSync, rmSync, realpathSync } from 'fs';
 import { join, sep } from 'path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -97,15 +97,30 @@ function isAlreadyUrl(value: string): boolean {
   );
 }
 
+/** Active/script-capable formats that must NOT be offloaded to a servable
+ *  kai-media:// URL: served from the authenticated app origin (esp. the web bridge's
+ *  /media/ route) they could execute attacker-controlled script with the app's
+ *  origin (SVG carries <script>, HTML is obviously active). Keeping them INLINE as
+ *  base64 means they never get a servable URL — they render sandboxed as a data:
+ *  image / are shown as text, exactly as before offload. The heap/disk win from
+ *  offloading these is negligible (attachments are overwhelmingly images/PDFs). */
+function isActiveFormat(mime: string): boolean {
+  const m = mime.toLowerCase().split(';')[0].trim();
+  return m === 'image/svg+xml' || m === 'text/html' || m === 'application/xhtml+xml';
+}
+
 /**
  * Write a decoded base64 media payload to `mediaDir` (content-addressed so
  * identical bytes reuse one file across edits/regenerations) and return its
- * `kai-media://` URL, or null if the payload is unusable (too large / empty).
+ * `kai-media://` URL, or null if the payload is unusable (too large / empty) or an
+ * active/script-capable format that must stay inline.
  */
 function offloadBase64(dataUrl: string, appHome: string): string | null {
   const m = DATA_URL_RE.exec(dataUrl);
   if (!m) return null;
   const mime = (m[1] ?? 'application/octet-stream').trim() || 'application/octet-stream';
+  // Never offload active content to a servable URL (XSS via the app origin).
+  if (isActiveFormat(mime)) return null;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return null;
 
@@ -201,6 +216,24 @@ type LooseNode = {
   tokenCount?: unknown;
   tokenCountSig?: unknown;
 } & Record<string, unknown>;
+
+/** Cheap read-only check: does any node hold an inline `data:` base64 image/file
+ *  DISPLAY part? Used to decide whether a migration/offload pass is worth running
+ *  (and to route it through the sanitize-first write path) WITHOUT writing any file. */
+export function hasInlineBase64DisplayMedia(tree: unknown): boolean {
+  if (!Array.isArray(tree)) return false;
+  for (const node of tree) {
+    const content = (node as LooseNode)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const raw of content) {
+      const p = raw as LoosePart;
+      if (!p || typeof p !== 'object') continue;
+      if (p.type === 'image' && typeof p.image === 'string' && p.image.startsWith('data:')) return true;
+      if (p.type === 'file' && typeof p.data === 'string' && p.data.startsWith('data:')) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Offload base64 display media across an entire message tree (array of nodes).
@@ -355,8 +388,21 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
           : part.type === 'file' && typeof part.data === 'string'
             ? (part.data as string)
             : null;
-      if (value === null || resolved.has(value)) continue; // dedup identical values (content-addressed)
+      if (value === null) continue;
       const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
+      // A repeated (content-addressed) value resolves to the same data URL, but pass 2
+      // substitutes it into EVERY occurrence — so it's sent N times and must be CHARGED
+      // N times against the cap (two refs to an 11 MiB image = 22 MiB on the wire). On a
+      // repeat, re-charge the already-known size; if that would exceed the budget, stop
+      // resolving (leave remaining/this occurrence as a URL) so the request stays bounded.
+      const already = resolved.get(value);
+      if (already !== undefined) {
+        const dupLen = already.length - (already.indexOf(',') + 1);
+        const dupBytes = Math.floor((dupLen * 3) / 4);
+        if (dupBytes > budget) break; // can't afford another copy → stop (older refs stay URLs)
+        budget -= dupBytes;
+        continue;
+      }
       // Pass the REMAINING budget so an over-budget file is rejected before it's read
       // into memory (the cap is enforced pre-allocation, not after).
       const data = rehydrateMediaUrl(value, appHome, mime, budget);
@@ -394,6 +440,47 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
           return { ...part, data };
         }
         return raw;
+      }
+      return raw;
+    });
+    if (!contentChanged) return rawMsg;
+    anyChanged = true;
+    return { ...msg, content };
+  });
+  return anyChanged ? out : messages;
+}
+
+/**
+ * Replace any REMAINING `kai-media://` display media parts (image/file) with an
+ * omission-text placeholder. Runs AFTER rehydrateModelMedia on a path with no
+ * separate media-fit gate (the plugin/automation stream): once rehydration's byte
+ * cap is spent, older attachments keep their kai-media:// URL, which a provider
+ * can't dereference — forwarding it fails the whole request. Swapping it for a note
+ * keeps the request valid (the model just loses that over-budget attachment) rather
+ * than erroring. Never mutates the input; clones only changed nodes. Leaves
+ * data:/http values (already model-usable) untouched.
+ */
+export function stripUnresolvedOffloadedMedia(messages: unknown[]): unknown[] {
+  if (!Array.isArray(messages)) return messages;
+  let anyChanged = false;
+  const out = messages.map((rawMsg) => {
+    const msg = rawMsg as { content?: unknown } & Record<string, unknown>;
+    if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) return rawMsg;
+    let contentChanged = false;
+    const content = (msg.content as LoosePart[]).map((raw) => {
+      const part = raw as LoosePart;
+      if (!part || typeof part !== 'object') return raw;
+      const value =
+        part.type === 'image' && typeof part.image === 'string'
+          ? part.image
+          : part.type === 'file' && typeof part.data === 'string'
+            ? (part.data as string)
+            : null;
+      if (value !== null && value.startsWith(MEDIA_PROTOCOL_PREFIX)) {
+        contentChanged = true;
+        const label = part.type === 'image' ? 'image' : 'file';
+        const name = typeof part.filename === 'string' && part.filename ? ` "${part.filename}"` : '';
+        return { type: 'text', text: `[${label}${name} omitted — exceeds this turn's media budget]` };
       }
       return raw;
     });
@@ -468,18 +555,31 @@ export function collectReferencedMediaPaths(value: unknown, into: Set<string> = 
 export function gcOrphanedMedia(appHome: string, removedRefs: Set<string>, survivingRefs: Set<string>): number {
   const mediaDir = join(appHome, 'media');
   let removed = 0;
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(mediaDir);
+  } catch {
+    return 0; // no media dir → nothing to GC
+  }
   for (const rel of removedRefs) {
     if (survivingRefs.has(rel)) continue; // still referenced elsewhere — keep
     const filePath = join(mediaDir, rel);
-    // Containment: never unlink outside mediaDir (a crafted path in a tree).
+    // Lexical containment first (cheap reject of `../` refs)...
     if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) continue;
     try {
-      // lstat (NOT stat) so a symlink is inspected as the link itself, never
-      // followed: only unlink a genuine regular file we could have written. A
-      // symlink/dir/special entry planted in mediaDir is skipped, so GC can't be
-      // tricked into removing (or traversing to) anything outside the media tree.
+      // The FINAL component must be a genuine regular file, inspected via lstat (NOT
+      // followed): a symlink there resolves elsewhere, and deleting its TARGET could
+      // remove a file still referenced under its real path — so skip any symlink/
+      // dir/special node and only ever unlink the real file we wrote.
       const st = lstatSync(filePath);
       if (!st.isFile()) continue;
+      // CANONICAL containment for ANCESTORS: a planted `media/images -> ~/.ssh`
+      // symlinked parent would pass the lexical check, so resolve the parent chain
+      // and confirm the real location is still inside the media root before unlinking.
+      const realPath = realpathSync(filePath);
+      if (realPath !== realRoot && !realPath.startsWith(realRoot + sep)) continue;
+      // Unlink the ORIGINAL path (a real file, ancestors verified in-root) — never
+      // realPath, which for a (already-excluded) symlink would be the target.
       rmSync(filePath, { force: true });
       removed++;
     } catch {
