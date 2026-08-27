@@ -3,7 +3,7 @@ import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
-import { offloadTreeDisplayMedia, hasInlineBase64DisplayMedia } from '../agent/offload-display-media.js';
+import { hasInlineBase64DisplayMedia } from '../agent/offload-display-media.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -975,7 +975,8 @@ export function registerConversationHandlers(
     }
     // Preferred path: route through writeConversation, which SANITIZES (dropping
     // malformed/dup nodes) BEFORE offloading — so no orphan file is written for a
-    // node that won't be persisted — then commits the URL-ized tree. Re-read the
+    // node that won't be persisted — AND commits the URL-ized tree so every file it
+    // writes is durably referenced (discoverable by deletion/rewrite GC). Re-read the
     // committed record so the returned value matches disk exactly.
     if (!isCompacting(id)) {
       try {
@@ -983,22 +984,18 @@ export function registerConversationHandlers(
         const reread = readConversation(appHome, id);
         if (reread) return reread as T;
       } catch {
-        /* fall through to a direct display-only offload for the return value */
+        /* write failed — fall through: return the record UNCHANGED (see below) */
       }
     }
-    // Compacting (or the write failed): can't safely persist, but still URL-ize the
-    // RETURNED record so the renderer doesn't receive the base64. Files written here
-    // for any invalid node are reclaimed by a later writeConversation's rewrite GC.
-    const treeOffload = offloadTreeDisplayMedia(conv.messageTree, appHome);
-    const msgOffload = Array.isArray(conv.messages)
-      ? offloadTreeDisplayMedia(conv.messages, appHome)
-      : { tree: conv.messages, rewritten: 0 };
-    if (treeOffload.rewritten === 0 && msgOffload.rewritten === 0) return conv;
-    return {
-      ...conv,
-      ...(Array.isArray(conv.messageTree) ? { messageTree: treeOffload.tree as unknown[] } : {}),
-      ...(Array.isArray(conv.messages) ? { messages: msgOffload.tree as unknown[] } : {}),
-    };
+    // Non-persisting path (compacting, or the write failed): return the record
+    // UNCHANGED with its base64 still inline. We deliberately DO NOT offload here —
+    // doing so would write media files WITHOUT a persisted record referencing them, so
+    // if the conversation were deleted before a later successful write, deletion GC
+    // (which only sees the still-base64 disk record) could never reclaim them → a
+    // permanent orphan/privacy leak. The base64 reaches the renderer for this one read
+    // (transient, bounded — compaction is brief, write failures rare); the NEXT
+    // non-compacting read migrates it properly through writeConversation.
+    return conv;
   };
 
   ipcMain.handle('conversations:get', (_event, id: string) => {

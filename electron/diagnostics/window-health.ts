@@ -630,13 +630,6 @@ export class WindowHealthMonitor {
 
     onContents('did-start-loading', () => {
       this.loadedWebContentsIds.delete(contents.id);
-      // A (re)load replaces the document — any prior capture's native op is on the gone
-      // document. Reset the single-flight fence + bump the generation so a genuinely-
-      // hung capture from the OLD document can't keep the fence latched (crash recovery
-      // reloads via webContents.reload(), not attachWindow, so this is the reset path
-      // for that case). A stale native settle then no-ops via the generation guard.
-      this.heapSnapshotInFlight = false;
-      this.heapSnapshotCaptureGen++;
       this.log('main-renderer-load-started', this.windowDetails(window));
     });
     onContents('did-finish-load', () => {
@@ -661,6 +654,14 @@ export class WindowHealthMonitor {
       // unrelated focus/display event. The loop-guard caps actual reloads.
       this.unloadedSince = this.now();
       this.armStallWatchdog();
+      // A MAIN-FRAME (re)load replaces the document, so any prior capture's native op
+      // is on the gone document — reset the single-flight fence + bump the generation
+      // (a stale native settle then no-ops via the generation guard). This is the fence
+      // reset for the crash-recovery reload path (webContents.reload() doesn't call
+      // attachWindow). Keyed on isMainFrame, NOT the aggregate did-start-loading, so an
+      // artifact/PDF <iframe> subframe load can't clear the fence mid-hung-capture.
+      this.heapSnapshotInFlight = false;
+      this.heapSnapshotCaptureGen++;
     });
     onContents('did-frame-finish-load', (...args: never[]) => {
       const isMainFrame = args[1] as boolean | undefined;
