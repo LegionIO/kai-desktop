@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   offloadTreeDisplayMedia,
   isCanonicalBase64,
+  canonicalBase64ToBuffer,
   rehydrateModelMedia,
   rehydrateMediaUrl,
   collectReferencedMediaPaths,
@@ -467,5 +468,19 @@ describe('isCanonicalBase64 (R8: regex + round-trip)', () => {
     } finally {
       rmSync(appHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('canonicalBase64ToBuffer size gate (R9)', () => {
+  it('rejects an over-cap payload by ENCODED length without decoding (bounded)', () => {
+    // A tiny explicit cap: a payload whose encoded length exceeds it returns null
+    // (the pre-decode gate), so no oversized buffer is allocated.
+    const b64 = Buffer.from('x'.repeat(1000)).toString('base64');
+    expect(canonicalBase64ToBuffer(b64, 100)).toBeNull(); // > 100-byte cap → rejected pre-decode
+    expect(canonicalBase64ToBuffer(b64, 10_000)).not.toBeNull(); // within cap → decodes
+  });
+
+  it('still rejects non-canonical even within the cap', () => {
+    expect(canonicalBase64ToBuffer('AB==', 10_000)).toBeNull();
   });
 });

@@ -19,7 +19,7 @@ import {
   isSanitizerRetainableMedia,
 } from './media-fit.js';
 import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
-import { extForMime, isCanonicalBase64 } from './offload-display-media.js';
+import { extForMime, canonicalBase64ToBuffer } from './offload-display-media.js';
 import { offloadedMediaSize, estimateNativeTokensFromSize, estimateOffloadedImageTokens } from './media-fit.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
@@ -84,16 +84,11 @@ function mediaIdentityToken(value: string): string {
     // → two DIFFERENT malformed inline values (which the offloader leaves inline)
     // collide and a same-id edit between them could reuse a stale compaction summary.
     // Non-canonical payloads fall through to the raw-string hash below (distinct).
-    if (payload.length > 0 && isCanonicalBase64(payload)) {
-      try {
-        const bytes = Buffer.from(payload, 'base64');
-        if (bytes.length > 0) {
-          const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
-          return `m:${digest}.${extForMime(mime)}`;
-        }
-      } catch {
-        /* fall through to raw-string hash */
-      }
+    // canonicalBase64ToBuffer validates + decodes in one pass (no double decode).
+    const bytes = payload.length > 0 ? canonicalBase64ToBuffer(payload) : null;
+    if (bytes && bytes.length > 0) {
+      const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+      return `m:${digest}.${extForMime(mime)}`;
     }
   }
   return 'h:' + createHash('sha1').update(value).digest('hex');

@@ -49,18 +49,31 @@ const DATA_URL_RE = /^data:([^;,]+)?(?:;[^,]*?)?;base64,([\s\S]*)$/;
  *  as the single source of truth for "cleanly, uniquely decodable". */
 const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
-/** True iff `payload` is CANONICAL base64: correct alphabet/padding AND it round-trips
- *  (decode → re-encode === input). The round-trip rejects non-canonical forms like
- *  `AB==` that the regex alone accepts but Buffer.from silently normalizes — so two
- *  distinct such values can't be treated as identical (offload / compaction-identity /
- *  eligibility all agree). Exported as the shared predicate. */
-export function isCanonicalBase64(payload: string): boolean {
-  if (payload.length === 0 || !STRICT_BASE64_RE.test(payload)) return false;
+/** Decode `payload` iff it is CANONICAL base64 (alphabet/padding regex AND round-trips
+ *  decode→re-encode === input) AND within the decoded-byte cap, returning the decoded
+ *  Buffer — or null otherwise. The ENCODED-length gate runs FIRST (before any decode),
+ *  so an oversized payload is rejected without allocating >1 GiB in the main process.
+ *  The round-trip rejects non-canonical forms (`AB==`) that the regex alone accepts but
+ *  Buffer.from silently normalizes. Returns the buffer so callers needing the bytes
+ *  don't decode twice. `maxBytes` defaults to the media cap. */
+export function canonicalBase64ToBuffer(payload: string, maxBytes: number = MAX_MEDIA_BYTES): Buffer | null {
+  if (payload.length === 0 || !STRICT_BASE64_RE.test(payload)) return null;
+  // Reject over-cap by ENCODED length before decoding (4 base64 chars ≈ 3 bytes).
+  if (Math.floor((payload.length * 3) / 4) > maxBytes) return null;
   try {
-    return Buffer.from(payload, 'base64').toString('base64') === payload;
+    const buf = Buffer.from(payload, 'base64');
+    if (buf.length > maxBytes) return null;
+    return buf.toString('base64') === payload ? buf : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** Boolean form of {@link canonicalBase64ToBuffer} — the shared "cleanly, uniquely
+ *  decodable" predicate used by offload / compaction-identity / eligibility so they
+ *  all agree. Bound the ENCODED length before calling on untrusted-size input. */
+export function isCanonicalBase64(payload: string): boolean {
+  return canonicalBase64ToBuffer(payload) !== null;
 }
 
 /** Map a decoded mime type to a media subdir + file extension. Non-media
@@ -142,23 +155,18 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   if (isActiveFormat(mime)) return null;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return null;
+  // Pre-decode size gate FIRST (cheap): 4 base64 chars ≈ 3 bytes. Reject an over-cap
+  // payload from its ENCODED length BEFORE any decode, so a pathological/oversized
+  // attachment can't allocate the decoded buffer (>1 GiB) in the main process just to
+  // be rejected. Only then pay for canonical validation, which must decode.
+  if (Math.floor((base64.length * 3) / 4) > MAX_MEDIA_BYTES) return null;
   // CANONICAL base64 only: Buffer.from silently drops invalid chars AND normalizes
   // non-canonical padding (`QUJD!!!!` truncates, `AB==` re-encodes differently), which
-  // would persist a corrupted/ambiguous attachment while replacing the original. The
-  // contract is that any non-canonical data URL stays inline, so validate up front
-  // (regex + round-trip). Whitespace isn't expected (DATA_URL_RE split the payload).
-  if (!isCanonicalBase64(base64)) return null;
-  // Pre-decode size gate: 4 base64 chars ≈ 3 bytes. Reject an over-cap payload from
-  // its ENCODED length BEFORE allocating the decoded buffer, so a pathological
-  // attachment can't spike main just to be rejected.
-  if (Math.floor((base64.length * 3) / 4) > MAX_MEDIA_BYTES) return null;
-
-  let buf: Buffer;
-  try {
-    buf = Buffer.from(base64, 'base64');
-  } catch {
-    return null;
-  }
+  // would persist a corrupted/ambiguous attachment while replacing the original — so a
+  // non-canonical data URL stays inline. Decode + validate in one pass, reusing the
+  // buffer below (no second decode).
+  const buf = canonicalBase64ToBuffer(base64);
+  if (!buf) return null;
   if (buf.length === 0 || buf.length > MAX_MEDIA_BYTES) return null;
 
   const { type, ext } = mediaTarget(mime);
@@ -275,8 +283,10 @@ function isOffloadableDataUrl(value: string): boolean {
   if (isActiveFormat(mime)) return false;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return false;
-  if (!isCanonicalBase64(base64)) return false; // non-canonical → stays inline (matches offloadBase64)
-  return Math.floor((base64.length * 3) / 4) <= MAX_MEDIA_BYTES;
+  // Size gate FIRST (cheap, pre-decode) so an oversized payload isn't decoded by the
+  // canonical check just to be rejected — then canonical validation (matches offloadBase64).
+  if (Math.floor((base64.length * 3) / 4) > MAX_MEDIA_BYTES) return false;
+  return isCanonicalBase64(base64); // non-canonical → stays inline (matches offloadBase64)
 }
 
 /** Cheap read-only check: does any node hold an inline base64 image/file DISPLAY
@@ -438,13 +448,15 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
   if (!Array.isArray(messages)) return messages;
 
   // Pass 1 (newest-first): decide which specific OCCURRENCES to materialize within
-  // budget. Keyed by `mi:pi` (message index : part index), NOT by URL — pass 2 must
-  // substitute ONLY the occurrences pass 1 could afford. A repeated content-addressed
-  // URL resolves to the same data URL (cached in `resolvedData` to avoid re-reading
-  // the file), but each occurrence is CHARGED and SELECTED independently, so the Nth
-  // copy of an 11 MiB image is left as a URL once the cap can't fit it — no bypass.
+  // budget. `selected` keys by `mi:pi` (message index : part index) — pass 2 must
+  // substitute ONLY the occurrences pass 1 could afford. `resolvedData` caches the
+  // produced data URL keyed by VALUE+MIME (not value alone): the same content-
+  // addressed URL can appear with different declared mimeTypes across parts, and
+  // rehydrateMediaUrl gives the part's mimeType precedence in the data: header — so
+  // reusing a first-resolved URL for a differently-typed occurrence would mislabel it.
   const selected = new Set<string>(); // "mi:pi"
-  const resolvedData = new Map<string, string>(); // value → data: URL (dedup file reads)
+  const resolvedData = new Map<string, string>(); // `${value}\x00${mime}` → data: URL
+  const cacheKey = (value: string, mime: string | undefined): string => `${value}\x00${mime ?? ''}`;
   let budget = maxTotalBytes;
   for (let mi = messages.length - 1; mi >= 0 && budget > 0; mi--) {
     const msg = messages[mi] as { content?: unknown };
@@ -462,14 +474,15 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
             : null;
       if (value === null) continue;
       const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
+      const key = cacheKey(value, mime);
       // Resolve (or reuse) the data URL. Pass the REMAINING budget so an over-budget
       // file is rejected before it's read into memory (cap enforced pre-allocation).
-      let data = resolvedData.get(value);
+      let data = resolvedData.get(key);
       if (data === undefined) {
         const r = rehydrateMediaUrl(value, appHome, mime, budget);
         if (!r) continue; // not resolvable (missing / over-budget / not kai-media) — leave as URL
         data = r;
-        resolvedData.set(value, r);
+        resolvedData.set(key, r);
       }
       const payloadLen = data.length - (data.indexOf(',') + 1);
       const bytes = Math.floor((payloadLen * 3) / 4);
@@ -489,8 +502,9 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
     const content = (msg.content as LoosePart[]).map((raw, pi) => {
       const part = raw as LoosePart;
       if (!part || typeof part !== 'object' || !selected.has(`${mi}:${pi}`)) return raw;
+      const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
       if (part.type === 'image' && typeof part.image === 'string') {
-        const data = resolvedData.get(part.image);
+        const data = resolvedData.get(cacheKey(part.image, mime));
         if (data) {
           contentChanged = true;
           return { ...part, image: data };
@@ -498,7 +512,7 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
         return raw;
       }
       if (part.type === 'file' && typeof part.data === 'string') {
-        const data = resolvedData.get(part.data);
+        const data = resolvedData.get(cacheKey(part.data, mime));
         if (data) {
           contentChanged = true;
           return { ...part, data };
