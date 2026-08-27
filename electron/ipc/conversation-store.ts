@@ -1450,9 +1450,13 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   // put — the renderer keeps sending a count-less tree, so without this the write
   // path would re-run tiktoken each time.
   let priorTree: unknown[] | null = null;
+  let priorMessages: unknown[] | null = null;
   try {
     const prior = readConversation(appHome, conv.id);
     priorTree = prior && Array.isArray(prior.messageTree) ? prior.messageTree : null;
+    // Also capture the prior LINEAR mirror: a legacy record has media only in
+    // `messages` (no messageTree), so the rewrite-GC diff below must see it too.
+    priorMessages = prior && Array.isArray(prior.messages) ? prior.messages : null;
   } catch {
     /* best-effort — fall back to fresh backfill */
   }
@@ -1513,6 +1517,7 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   if (appHome) {
     try {
       const priorRefs = collectReferencedMediaPaths(priorTree);
+      collectReferencedMediaPaths(priorMessages, priorRefs); // legacy messages-only records
       if (priorRefs.size > 0) {
         const newRefs = collectReferencedMediaPaths(sanitized.messageTree);
         collectReferencedMediaPaths(sanitized.messages, newRefs);

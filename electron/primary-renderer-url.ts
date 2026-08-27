@@ -29,10 +29,28 @@ function isPdfDataUrl(candidate: string): boolean {
   return mediaType === 'application/pdf';
 }
 
+/** A `kai-media://…/<name>.pdf` URL for the offloaded-PDF preview subframe. Offload
+ *  stores PDFs under files/ with a real `.pdf` extension, and the media protocol
+ *  handler serves them inert (application/pdf) with realpath containment inside the
+ *  media dir. Allowing this ONLY in a sandboxed subframe (never the top-level
+ *  renderer) is equivalent to the existing PDF data:-URL allowance — the same native
+ *  viewer, just sourced from disk instead of an inline base64 blob. Validated
+ *  narrowly: exact scheme + a `.pdf` path with no traversal-looking segments. */
+function isMediaPdfUrl(candidate: string): boolean {
+  const prefix = __BRAND_MEDIA_PROTOCOL + '://';
+  if (!candidate.startsWith(prefix)) return false;
+  const path = candidate.slice(prefix.length).split(/[?#]/, 1)[0];
+  if (!/\.pdf$/i.test(path)) return false;
+  // No traversal / empty segments — the protocol handler is authoritative on
+  // containment, but keep this allow-check conservative too.
+  return !path.split('/').some((seg) => seg === '' || seg === '.' || seg === '..');
+}
+
 /** Navigation policy for the privileged Kai renderer and its sandboxed preview
- * frames. Subframes need exact about documents for srcdoc/bootstrap content and
- * PDF data URLs for the existing attachment preview. Other data/about URLs stay
- * blocked, and no data URL may replace the top-level privileged renderer. */
+ * frames. Subframes need exact about documents for srcdoc/bootstrap content, PDF
+ * data URLs for inline attachment previews, and kai-media:// PDF URLs for OFFLOADED
+ * attachment previews. Other data/about URLs stay blocked, and no data/media URL may
+ * replace the top-level privileged renderer. */
 export function isAllowedPrimaryRendererFrameNavigation(
   candidate: string,
   canonicalUrl: string,
@@ -41,7 +59,7 @@ export function isAllowedPrimaryRendererFrameNavigation(
   if (isCanonicalPrimaryRendererUrl(candidate, canonicalUrl)) return true;
   if (isMainFrame) return false;
   if (candidate === 'about:blank' || candidate === 'about:srcdoc') return true;
-  return isPdfDataUrl(candidate);
+  return isPdfDataUrl(candidate) || isMediaPdfUrl(candidate);
 }
 
 export type PrimaryRendererFrameNavigationDisposition = 'allow' | 'block' | 'external';

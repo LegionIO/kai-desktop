@@ -69,6 +69,9 @@ let outstandingSummarizerGenerates = 0;
  * is a transient allocation of an already-resident payload, and only occurs for a
  * not-yet-offloaded in-memory tree — a persisted tree signs the cheap URL form.
  */
+/** Canonical base64 (alphabet + valid padding) — mirrors the offloader's strict
+ *  check so the identity digest is only taken for cleanly-decodable payloads. */
+const CANONICAL_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 function mediaIdentityToken(value: string): string {
   const MEDIA_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
   if (value.startsWith(MEDIA_PREFIX)) {
@@ -79,11 +82,14 @@ function mediaIdentityToken(value: string): string {
   if (base64Match) {
     const mime = base64Match[1] ?? '';
     const payload = base64Match[2] ?? '';
-    if (payload.length > 0) {
+    // ONLY take the decode-based content digest for CANONICAL base64. Buffer.from
+    // silently drops invalid chars, so `QUJD!!!!` would digest identically to `QUJD`
+    // → two DIFFERENT malformed inline values (which the offloader leaves inline)
+    // collide and a same-id edit between them could reuse a stale compaction summary.
+    // Non-canonical payloads fall through to the raw-string hash below (distinct).
+    if (payload.length > 0 && CANONICAL_BASE64_RE.test(payload)) {
       try {
         const bytes = Buffer.from(payload, 'base64');
-        // Reject an empty/undecodable payload (matches the offload's own guard) so two
-        // distinct malformed values don't collide on a zero-byte digest.
         if (bytes.length > 0) {
           const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
           return `m:${digest}.${extForMime(mime)}`;

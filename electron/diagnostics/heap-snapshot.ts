@@ -199,6 +199,20 @@ export async function captureHeapSnapshot(
   const dir = heapSnapshotDir(logsDir);
   mkdirSync(dir, { recursive: true });
 
+  // Native promises from every bounded attempt (initial + eviction/retry). The fence
+  // release (onNativeSettled) waits for ALL of them so a retry can't overlap.
+  const abandonedNatives: Array<Promise<unknown>> = [];
+  // Fire onNativeSettled exactly once, after this function's flow completes AND every
+  // native attempt has settled — so the single-flight fence is held for the WHOLE
+  // capture (incl. the ENOSPC evict/retry loop and any abandoned post-timeout native
+  // op), never released mid-retry.
+  let settledNotified = false;
+  const notifyWhenAllNativesSettle = (): void => {
+    if (settledNotified || !onNativeSettled) return;
+    settledNotified = true;
+    void Promise.allSettled(abandonedNatives).then(() => onNativeSettled());
+  };
+
   // Bound each capture attempt. A hung takeHeapSnapshot must reject, not hang.
   const takeBounded =
     timeoutMs > 0
@@ -237,18 +251,12 @@ export async function captureHeapSnapshot(
               /* best-effort late cleanup */
             }
           };
-          // Notify the caller when the NATIVE op truly settles (either outcome),
-          // including a late settle after the timeout won — plus clean up a late file.
-          native.then(
-            () => {
-              cleanupLate();
-              onNativeSettled?.();
-            },
-            () => {
-              cleanupLate();
-              onNativeSettled?.();
-            },
-          );
+          // Track this attempt's native promise so the caller's fence is released only
+          // after EVERY native attempt (initial + eviction/retry) has settled — not
+          // per-attempt (which would clear the fence while the retry loop still runs a
+          // capture on the same webContents). Also clean up a late-written file.
+          const settled = native.then(cleanupLate, cleanupLate);
+          abandonedNatives.push(settled);
           // Whichever settles first wins; clear the timer in finally so a resolved
           // capture leaves no dangling handle.
           return Promise.race([native, timeout]).finally(() => {
@@ -273,71 +281,77 @@ export async function captureHeapSnapshot(
   let captured = false;
   let firstErr: unknown;
   try {
-    await takeBounded(path);
-    captured = true;
-  } catch (err) {
-    firstErr = err;
-  }
-  if (!captured) {
-    // Remove the failed attempt's partial.
     try {
-      rmSync(path, { force: true });
-    } catch {
-      /* best-effort */
-    }
-    // ONLY evict-and-retry for a DISK-SPACE failure — eviction can't help a destroyed
-    // renderer / unsupported-snapshot / permission error, and would pointlessly delete valid
-    // diagnostics. Surface a non-space error immediately (the old snapshots are preserved).
-    if (!isDiskSpaceError(firstErr)) {
-      throw firstErr;
-    }
-    let guard = 0;
-    while (!captured && guard < 64) {
-      guard++;
-      // Evict the OLDEST snapshot to free space — but stop before the last one (keep ≥1).
-      const existing = listSnapshots(dir); // oldest-first
-      if (existing.length <= 1) break; // don't delete the sole remaining valid snapshot
-      const victim = existing[0];
-      try {
-        rmSync(victim.path, { force: true });
-        evictedForRetry.push(victim.name);
-      } catch {
-        break; // can't free the oldest (e.g. permission) — stop rather than spin
-      }
-      try {
-        await takeBounded(path);
-        captured = true;
-      } catch (retryErr) {
-        try {
-          rmSync(path, { force: true }); // drop this retry's partial before the next evict
-        } catch {
-          /* best-effort */
-        }
-        // If the retry now fails for a NON-space reason, stop evicting — more eviction won't help.
-        if (!isDiskSpaceError(retryErr)) {
-          throw retryErr;
-        }
-      }
+      await takeBounded(path);
+      captured = true;
+    } catch (err) {
+      firstErr = err;
     }
     if (!captured) {
+      // Remove the failed attempt's partial.
       try {
         rmSync(path, { force: true });
       } catch {
         /* best-effort */
       }
-      throw new Error('heap snapshot capture failed (out of space after evicting all but the last snapshot)');
+      // ONLY evict-and-retry for a DISK-SPACE failure — eviction can't help a destroyed
+      // renderer / unsupported-snapshot / permission error, and would pointlessly delete valid
+      // diagnostics. Surface a non-space error immediately (the old snapshots are preserved).
+      if (!isDiskSpaceError(firstErr)) {
+        throw firstErr;
+      }
+      let guard = 0;
+      while (!captured && guard < 64) {
+        guard++;
+        // Evict the OLDEST snapshot to free space — but stop before the last one (keep ≥1).
+        const existing = listSnapshots(dir); // oldest-first
+        if (existing.length <= 1) break; // don't delete the sole remaining valid snapshot
+        const victim = existing[0];
+        try {
+          rmSync(victim.path, { force: true });
+          evictedForRetry.push(victim.name);
+        } catch {
+          break; // can't free the oldest (e.g. permission) — stop rather than spin
+        }
+        try {
+          await takeBounded(path);
+          captured = true;
+        } catch (retryErr) {
+          try {
+            rmSync(path, { force: true }); // drop this retry's partial before the next evict
+          } catch {
+            /* best-effort */
+          }
+          // If the retry now fails for a NON-space reason, stop evicting — more eviction won't help.
+          if (!isDiskSpaceError(retryErr)) {
+            throw retryErr;
+          }
+        }
+      }
+      if (!captured) {
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          /* best-effort */
+        }
+        throw new Error('heap snapshot capture failed (out of space after evicting all but the last snapshot)');
+      }
     }
-  }
 
-  let bytes = 0;
-  try {
-    bytes = statSync(path).size;
-  } catch {
-    /* stat best-effort */
-  }
+    let bytes = 0;
+    try {
+      bytes = statSync(path).size;
+    } catch {
+      /* stat best-effort */
+    }
 
-  const evicted = enforceHeapSnapshotRetention(dir, retention);
-  // Report everything evicted across the retry + final passes (dedup).
-  const allEvicted = evictedForRetry.length > 0 ? [...new Set([...evictedForRetry, ...evicted])] : evicted;
-  return { path, bytes, evicted: allEvicted };
+    const evicted = enforceHeapSnapshotRetention(dir, retention);
+    // Report everything evicted across the retry + final passes (dedup).
+    const allEvicted = evictedForRetry.length > 0 ? [...new Set([...evictedForRetry, ...evicted])] : evicted;
+    return { path, bytes, evicted: allEvicted };
+  } finally {
+    // Release the caller's single-flight fence only after the WHOLE capture (all
+    // native attempts, incl. the evict/retry loop) has settled — never mid-retry.
+    notifyWhenAllNativesSettle();
+  }
 }

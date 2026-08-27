@@ -47,6 +47,13 @@ describe('primary renderer URL authority', () => {
     expect(allowed('data:application/pdf;base64,JVBERi0xLjQ=', true)).toBe(false);
     expect(allowed('data:text/html,<script>location="https://attacker.example"</script>')).toBe(false);
     expect(allowed('data:application/pdfx,not-a-pdf')).toBe(false);
+    // Offloaded-PDF preview subframe: a kai-media:// *.pdf URL is allowed in a
+    // subframe (equivalent to the PDF data: allowance) but never in the main frame,
+    // and only for a real .pdf path with no traversal.
+    expect(allowed(`${__BRAND_MEDIA_PROTOCOL}://files/0123456789abcdef.pdf`)).toBe(true);
+    expect(allowed(`${__BRAND_MEDIA_PROTOCOL}://files/0123456789abcdef.pdf`, true)).toBe(false);
+    expect(allowed(`${__BRAND_MEDIA_PROTOCOL}://images/x.png`)).toBe(false); // not a pdf
+    expect(allowed(`${__BRAND_MEDIA_PROTOCOL}://files/../../etc/x.pdf`)).toBe(false); // traversal
     expect(allowed('https://attacker.example/')).toBe(false);
   });
 

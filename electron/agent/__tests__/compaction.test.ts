@@ -74,6 +74,17 @@ describe('messageContentSignature (prefix-free — no structural collisions)', (
     ];
     expect(userSig(asUrl)).not.toBe(userSig(asUrlDifferentText));
   });
+
+  it('does not collide two DIFFERENT malformed base64 media values (R7-S2)', () => {
+    // Buffer.from silently drops invalid chars, so `QUJD` and `QUJD!!!!` would decode
+    // identically. Malformed values stay INLINE (offloader rejects them), so their
+    // signatures must differ — else a same-id edit between them reuses a stale summary.
+    const userSig = (content: unknown) =>
+      messageContentSignature({ id: 'u', role: 'user', content } as Parameters<typeof messageContentSignature>[0]);
+    const a = [{ type: 'image', image: 'data:image/png;base64,QUJD', mimeType: 'image/png' }];
+    const b = [{ type: 'image', image: 'data:image/png;base64,QUJD!!!!', mimeType: 'image/png' }];
+    expect(userSig(a)).not.toBe(userSig(b));
+  });
 });
 
 describe('shouldCompact (cheap pre-check gate + exact count)', () => {
