@@ -7032,13 +7032,18 @@ export function RuntimeProvider({
       } catch {
         /* ignore */
       }
-      persistConversation(convId, newTree, newHead, {
+      const cancelPersist = persistConversation(convId, newTree, newHead, {
         runStatus: 'idle',
         // Preserve a summary the reactive-recovery path already paid for this turn
         // (staged in acc.pendingCompaction). Omitting it on cancel makes the next turn
         // reload the original branch and re-compact — mirrors the done/error paths.
         ...(acc?.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
       });
+      // Cancellation is a terminal path too: if the branch had inline base64 the persist
+      // just offloaded, adopt the URL tree from disk so the cancelled turn's base64
+      // doesn't linger in renderer state (the tail-diff listener won't catch an
+      // earlier-node rewrite). Same guard/sequencing as done/error/max-turns.
+      adoptOffloadedTreeAfterPersist(convId, newTree, cancelPersist);
       return;
     }
 
@@ -7051,11 +7056,12 @@ export function RuntimeProvider({
     } catch (err) {
       console.error('[Runtime] Cancel failed:', err);
     }
-    persistConversation(convId, latestTree, latestHead, {
+    const cancelPersist2 = persistConversation(convId, latestTree, latestHead, {
       runStatus: 'idle',
       ...(acc?.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
     });
-  }, []);
+    adoptOffloadedTreeAfterPersist(convId, latestTree, cancelPersist2);
+  }, [adoptOffloadedTreeAfterPersist]);
 
   // Branch navigation
   const goToBranch = useCallback(

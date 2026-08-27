@@ -644,7 +644,7 @@ export class WindowHealthMonitor {
     // healthy main renderer after 30s and discard UI state). did-start-navigation
     // and did-frame-finish-load carry isMainFrame; use them for the stall clock.
     onContents('did-start-navigation', (...args: never[]) => {
-      const details = args[0] as { isMainFrame?: boolean } | undefined;
+      const details = args[0] as { isMainFrame?: boolean; isSameDocument?: boolean } | undefined;
       if (!details?.isMainFrame) return;
       // Main frame started (re)navigating → renderer is unloaded until
       // did-frame-finish-load. Arm the stall watchdog for EVERY main-frame
@@ -654,14 +654,18 @@ export class WindowHealthMonitor {
       // unrelated focus/display event. The loop-guard caps actual reloads.
       this.unloadedSince = this.now();
       this.armStallWatchdog();
-      // A MAIN-FRAME (re)load replaces the document, so any prior capture's native op
-      // is on the gone document — reset the single-flight fence + bump the generation
-      // (a stale native settle then no-ops via the generation guard). This is the fence
-      // reset for the crash-recovery reload path (webContents.reload() doesn't call
-      // attachWindow). Keyed on isMainFrame, NOT the aggregate did-start-loading, so an
-      // artifact/PDF <iframe> subframe load can't clear the fence mid-hung-capture.
-      this.heapSnapshotInFlight = false;
-      this.heapSnapshotCaptureGen++;
+      // Reset the single-flight snapshot fence ONLY on a real DOCUMENT REPLACEMENT — a
+      // cross-document main-frame (re)load, where any prior capture's native op is on
+      // the gone document. Electron also fires did-start-navigation for SAME-document
+      // main-frame navs (hash / history.pushState, isSameDocument:true), which Kai
+      // permits and which do NOT replace the document — resetting there would clear the
+      // fence while the original native capture still runs → overlapping retry. So
+      // require !isSameDocument. (The stall watchdog above still arms on every main-frame
+      // nav.) Bumps the generation so a stale native settle no-ops via the guard.
+      if (!details.isSameDocument) {
+        this.heapSnapshotInFlight = false;
+        this.heapSnapshotCaptureGen++;
+      }
     });
     onContents('did-frame-finish-load', (...args: never[]) => {
       const isMainFrame = args[1] as boolean | undefined;
