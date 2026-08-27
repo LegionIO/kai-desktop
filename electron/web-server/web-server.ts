@@ -279,10 +279,21 @@ const MIME_TYPES: Record<string, string> = {
   '.flac': 'audio/flac',
   '.opus': 'audio/opus',
   '.ogg': 'audio/ogg',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
 };
 
-/** Base directory where generated media files are stored. */
-const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
+/** Base directory where generated + offloaded media files are stored. Honors the
+ *  `KAI_USER_DATA` app-home override (matches main.ts resolveUserDataDir): offload
+ *  writes under the CONFIGURED appHome/media, so an isolated/custom home would 404
+ *  every kai-media rewrite if this served the hard-coded ~/.<slug>/media. */
+const APP_HOME_DIR =
+  process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0
+    ? process.env.KAI_USER_DATA
+    : join(homedir(), '.' + __BRAND_APP_SLUG);
+const MEDIA_DIR = join(APP_HOME_DIR, 'media');
 
 /** decodeURIComponent that returns null instead of THROWING on a malformed percent-escape (R170 f-7):
  *  a bare `%` or `%zz` in a request path throws URIError, which — if uncaught in the request handler —

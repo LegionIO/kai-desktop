@@ -1,6 +1,7 @@
 import type { BrowserWindow, NativeImage, ProcessMetric, WebContents } from 'electron';
 import { appendBoundedLog } from './main-diagnostics.js';
 import { traceDiagnostic } from './debug-trace.js';
+import { HeapSnapshotTimeoutError } from './heap-snapshot.js';
 
 const HEALTH_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 2_500;
@@ -528,17 +529,24 @@ export class WindowHealthMonitor {
     });
     // Arm a retry window: if the capture rejects/throws, re-arm after this cooldown so a
     // still-high heap gets another attempt rather than being latched off indefinitely.
-    const armRetry = (): void => {
+    // EXCEPT on a capture TIMEOUT: the native takeHeapSnapshot may still be running after
+    // the race abandoned it, so retrying on the SAME renderer risks two overlapping
+    // captures (and the abandoned one recreating an untracked file). A renderer whose
+    // heap-snapshot timed out is at/over the limit and is being reloaded by crash
+    // recovery anyway; a fresh renderer re-arms cleanly via attachWindow. So on timeout,
+    // stay latched (no retry) rather than overlap.
+    const armRetry = (error: unknown): void => {
+      if (error instanceof HeapSnapshotTimeoutError) return;
       this.heapSnapshotRetryAfter = Date.now() + SNAPSHOT_RETRY_COOLDOWN_MS;
     };
     try {
       void Promise.resolve(trigger(window, sample)).catch((error) => {
         this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
-        armRetry();
+        armRetry(error);
       });
     } catch (error) {
       this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
-      armRetry();
+      armRetry(error);
     }
   }
 

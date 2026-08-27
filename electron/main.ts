@@ -2918,6 +2918,12 @@ if (gotSingleInstanceLock) {
         flac: 'audio/flac',
         opus: 'audio/opus',
         ogg: 'audio/ogg',
+        pdf: 'application/pdf',
+        json: 'application/json',
+        txt: 'text/plain; charset=utf-8',
+        md: 'text/markdown; charset=utf-8',
+        csv: 'text/csv; charset=utf-8',
+        html: 'text/html; charset=utf-8',
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 

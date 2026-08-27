@@ -17,7 +17,31 @@
  */
 
 import type SharpNs from 'sharp';
+import { join, sep } from 'path';
 import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
+import { safeReadRangeWithin } from '../utils/safe-file-read.js';
+
+/** Bounded, symlink-safe byte size of an offloaded `kai-media://` value's file,
+ *  or null (unknown / outside media dir / missing). Used so token+byte accounting
+ *  attributes an offloaded attachment its REAL size instead of the ~40-char URL
+ *  string — otherwise /compact and the media budget under-count it. A 1-byte
+ *  ranged read yields the total size without buffering the file. */
+function offloadedMediaSize(value: string, appHome: string): number | null {
+  const prefix = __BRAND_MEDIA_PROTOCOL + '://';
+  if (!value.startsWith(prefix)) return null;
+  const mediaDir = join(appHome, 'media');
+  const rel = value.slice(prefix.length).split('?')[0];
+  let rp: string;
+  try {
+    rp = decodeURIComponent(rel);
+  } catch {
+    return null;
+  }
+  const filePath = join(mediaDir, rp);
+  if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) return null;
+  const probe = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+  return probe ? probe.size : null;
+}
 
 /** Media-fit settings, mirroring the `compaction.media` config section. */
 export type MediaFitConfig = {
@@ -229,6 +253,17 @@ export function estimateFileTokensFromBytes(base64: string, mediaType?: string):
   return isDoc ? bytes * DOCUMENT_EXPANSION_MULTIPLIER : bytes;
 }
 
+/** Native token estimate from a KNOWN decoded byte count (for an offloaded
+ *  kai-media:// attachment whose bytes we don't read — only its file size). Mirrors
+ *  estimateImageTokensFromBytes / estimateFileTokensFromBytes but takes raw bytes,
+ *  and (having no data-URL) relies solely on the declared mediaType for the
+ *  document check. */
+export function estimateNativeTokensFromSize(bytes: number, isImage: boolean, mediaType?: string): number {
+  if (bytes <= 0) return 0;
+  if (isImage) return Math.ceil(bytes / 2);
+  return isDocumentMediaType(mediaType) ? bytes * DOCUMENT_EXPANSION_MULTIPLIER : bytes;
+}
+
 /** LRU cache of native token estimates keyed by a fast hash of the bare base64.
  *  A payload's dimensions are immutable, and the branch-sum path re-probes the
  *  SAME historical media on every tool result of a turn — caching turns that from
@@ -345,6 +380,7 @@ export function isSanitizerRetainableMedia(p: {
 export async function stripBranchMediaForCount(
   messages: readonly unknown[],
   signal?: AbortSignal,
+  appHome?: string,
 ): Promise<{ stripped: unknown[]; nativeMediaTokens: number; retainedMediaBytes: number }> {
   // Mirror extractModelContent's per-tool-result retention so we count ONLY the media
   // the sanitizer actually forwards to the provider — a historical result with four
@@ -356,6 +392,10 @@ export async function stripBranchMediaForCount(
   const SANITIZER_MAX_PARTS = 64;
   const mediaToEstimate: Array<{ data: string; isImage: boolean; mediaType?: string }> = [];
   let retainedMediaBytes = 0;
+  // Native token estimates for offloaded (kai-media://) attachments resolved by file
+  // size above — folded into nativeMediaTokens at the end (they're not in
+  // mediaToEstimate, which holds base64 payloads probed via sharp).
+  let preResolvedNativeTokens = 0;
   // Consume a `_modelContent` group applying the sanitizer's per-RESULT limits: walk
   // in order up to MAX_PARTS; a media part is retained only if it's under the per-part
   // cap AND keeps the running per-result total under the total cap — otherwise the
@@ -407,18 +447,28 @@ export async function stripBranchMediaForCount(
       const p = part as Record<string, unknown>;
       if ((p.type === 'image' || p.type === 'file') && typeof (p.data ?? p.image) === 'string') {
         const data = (p.data ?? p.image) as string;
-        // A kai-media:// (or any scheme://) URL here means display-media offload
-        // happened but the value was NOT rehydrated to a data URL before the model
-        // boundary (see rehydrateModelMedia — streamHandler runs it before this
-        // count). Counting a ~40-char URL as base64 would massively UNDER-count the
-        // attachment's real bytes/tokens and inflate the media budget. We can't read
-        // the file here (no appHome), and this branch shouldn't be reachable on a
-        // rehydrated path, so leave the part UNTOUCHED (its stored tokenCount, if any,
-        // is trusted) rather than strip + mis-count it. NB: only a scheme URL is
-        // skipped — a BARE base64 payload (no `data:` prefix, no `://`) is legitimate
-        // attachment data and must still be counted.
+        // A scheme:// URL is an OFFLOADED (or remote) attachment, not inline base64.
+        // For a local kai-media:// value, attribute its REAL bytes/tokens via a bounded
+        // symlink-safe size lookup (else counting the ~40-char URL as base64 under-counts
+        // the attachment — inflating the media budget and letting /compact wrongly report
+        // a protected suffix as safe). Estimate tokens from the byte SIZE (we don't read
+        // the bytes here). If the size can't be resolved (missing/outside mediaDir, or no
+        // appHome), leave the part UNTOUCHED so its stored tokenCount (if any) is trusted
+        // rather than mis-counted. A BARE base64 payload (no scheme) still counts normally.
         if (/^[a-z][a-z0-9+.-]*:\/\//i.test(data)) {
-          return part;
+          const size = appHome ? offloadedMediaSize(data, appHome) : null;
+          if (size === null) return part; // unresolvable → leave untouched
+          retainedMediaBytes += size;
+          const mediaType = (p.mimeType ?? p.mediaType) as string | undefined;
+          // Size-based native token estimate (no bytes needed). estimateImageTokensFromBytes
+          // / estimateFileTokensFromBytes accept the DECODED byte count via a fake-length
+          // base64 string is unnecessary — use the dimensions-agnostic byte estimators.
+          preResolvedNativeTokens += estimateNativeTokensFromSize(size, p.type === 'image', mediaType);
+          touched = true;
+          const { data: _du, image: _iu, ...restU } = p;
+          void _du;
+          void _iu;
+          return { ...restU, _mediaStripped: true };
         }
         // TOP-LEVEL user attachment (renderer image/file) — NOT routed through the
         // `_modelContent` sanitizer, so its 5 MiB per-part cap does NOT apply: the
@@ -476,7 +526,7 @@ export async function stripBranchMediaForCount(
     return { ...recNoCache, content: cleaned };
   });
 
-  let nativeMediaTokens = 0;
+  let nativeMediaTokens = preResolvedNativeTokens;
   const MEDIA_ESTIMATE_CONCURRENCY = 4;
   const MEDIA_ESTIMATE_MAX = 128;
   const toProbe = mediaToEstimate.slice(0, MEDIA_ESTIMATE_MAX);

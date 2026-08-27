@@ -483,14 +483,20 @@ export function resolveInjectedTextFromGatedPayload(
 async function splitBranchMediaForTokenSum(
   messages: unknown[],
   signal?: AbortSignal,
+  appHome?: string,
 ): Promise<{ messages: unknown[]; nativeMediaTokens: number; branchMediaBytes: number }> {
   // Delegate to the shared, sanitizer-aware stripper so the token estimate AND the
   // whole-request byte seed both count ONLY media the downstream sanitizer forwards
   // (mirrors extractModelContent's validity + 5 MiB per-part / 12 MiB per-result /
   // 64-part limits) and strip UI-only backups (originalResult/compactionMeta). This is
   // the single source of truth — a divergent inline copy previously over-counted
-  // over-size / sanitizer-dropped media and wrongly shrank the media budget.
-  const { stripped, nativeMediaTokens, retainedMediaBytes } = await stripBranchMediaForCount(messages, signal);
+  // over-size / sanitizer-dropped media and wrongly shrank the media budget. appHome
+  // lets it attribute an offloaded kai-media:// attachment its real size (else 0).
+  const { stripped, nativeMediaTokens, retainedMediaBytes } = await stripBranchMediaForCount(
+    messages,
+    signal,
+    appHome,
+  );
   return { messages: stripped, nativeMediaTokens, branchMediaBytes: retainedMediaBytes };
 }
 
@@ -5805,6 +5811,7 @@ export function registerAgentHandlers(
             const { messages: branchForSum0, nativeMediaTokens: nmt0 } = await splitBranchMediaForTokenSum(
               messages as unknown[],
               controller.signal,
+              appHome,
             );
             const branchTokens0 =
               (t.encoding && !t.isFallbackEncoding
@@ -5877,7 +5884,7 @@ export function registerAgentHandlers(
           messages: branchForSum,
           nativeMediaTokens,
           branchMediaBytes,
-        } = await splitBranchMediaForTokenSum(messages as unknown[], controller.signal);
+        } = await splitBranchMediaForTokenSum(messages as unknown[], controller.signal, appHome);
         let remaining = Infinity;
         for (const entry of eligibleModels) {
           const t = resolveConversationTokenization(
@@ -6957,7 +6964,7 @@ export function registerAgentHandlers(
                 messages: candidateForSum,
                 nativeMediaTokens: candidateMediaTokens,
                 branchMediaBytes: candidateMediaBytes,
-              } = await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal);
+              } = await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal, appHome);
               const reuseCheck = await shouldCompactAsync(
                 candidateForSum as Parameters<typeof shouldCompactAsync>[0],
                 modelEntry.modelConfig.modelName,
@@ -7063,7 +7070,7 @@ export function registerAgentHandlers(
                   messages: branchForCheck,
                   nativeMediaTokens: checkMediaTokens,
                   branchMediaBytes,
-                } = await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal);
+                } = await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal, appHome);
                 const gate = await shouldCompactAsync(
                   branchForCheck as Parameters<typeof shouldCompactAsync>[0],
                   modelEntry.modelConfig.modelName,
@@ -7278,6 +7285,7 @@ export function registerAgentHandlers(
             const { branchMediaBytes: outgoingMediaBytes } = await splitBranchMediaForTokenSum(
               messages as unknown[],
               controller.signal,
+              appHome,
             );
             if (!controller.signal.aborted && outgoingMediaBytes > DEFAULT_MAX_TOTAL_MEDIA_BYTES) {
               const mb = (DEFAULT_MAX_TOTAL_MEDIA_BYTES / (1024 * 1024)).toFixed(0);

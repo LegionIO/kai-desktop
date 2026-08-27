@@ -199,8 +199,12 @@ export async function captureHeapSnapshot(
     timeoutMs > 0
       ? (filePath: string): Promise<void> => {
           let timer: ReturnType<typeof setTimeout> | undefined;
+          let timedOut = false;
           const timeout = new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new HeapSnapshotTimeoutError(timeoutMs)), timeoutMs);
+            timer = setTimeout(() => {
+              timedOut = true;
+              reject(new HeapSnapshotTimeoutError(timeoutMs));
+            }, timeoutMs);
             // Never let the timeout timer hold the process open on its own.
             (timer as { unref?: () => void }).unref?.();
           });
@@ -208,9 +212,30 @@ export async function captureHeapSnapshot(
           // (e.g. takeHeapSnapshot on an already-destroyed WebContents) becomes a
           // rejection of the raced promise rather than escaping this function — which
           // would leave `timeout` unhandled (its timer still armed) to reject later as
-          // a spurious unhandled rejection. Whichever settles first wins; clear the
-          // timer in finally so a resolved capture leaves no dangling handle.
-          return Promise.race([Promise.resolve().then(() => take(filePath)), timeout]).finally(() => {
+          // a spurious unhandled rejection.
+          const native = Promise.resolve().then(() => take(filePath));
+          // The Promise.race abandons `native` on timeout, but the NATIVE capture keeps
+          // running and may finish AFTER we've rejected + removed the partial — leaving
+          // an untracked file at `filePath` outside retention. So when the timeout wins,
+          // attach a late settler that removes whatever the abandoned capture eventually
+          // wrote. Swallow its rejection so it never surfaces unhandled.
+          native.then(
+            () => {
+              if (timedOut) {
+                try {
+                  rmSync(filePath, { force: true });
+                } catch {
+                  /* best-effort late cleanup */
+                }
+              }
+            },
+            () => {
+              /* abandoned capture failed on its own — nothing to clean */
+            },
+          );
+          // Whichever settles first wins; clear the timer in finally so a resolved
+          // capture leaves no dangling handle.
+          return Promise.race([native, timeout]).finally(() => {
             if (timer) clearTimeout(timer);
           });
         }

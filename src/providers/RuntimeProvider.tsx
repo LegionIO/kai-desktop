@@ -5661,15 +5661,26 @@ export function RuntimeProvider({
             // no-attachment turn skips the extra conversations:get. skipInFlightSeed
             // avoids re-seeding a stuck accumulator (mirrors the mainOwned branches).
             if (hadInlineMedia) {
+              // Capture the load generation NOW (persist start). A chat switch or any
+              // other load bumps loadSeqRef, so if it advances before our reload fires
+              // the user has moved on and we must NOT drive a load for this (now stale)
+              // conversation over the newer selection — checking only activeIdRef is
+              // insufficient (an A→B→A flip leaves activeIdRef==A==convId while B's load
+              // is the current one). loadConversationState also self-supersedes via
+              // loadSeqRef, but gating here avoids even starting the stale load.
+              const seqAtPersist = loadSeqRef.current;
               void donePersist.then((res) => {
                 // Adopt the offloaded URL tree from disk ONLY when the write actually
                 // COMMITTED (res.persisted). A failed ({}) or superseded persist did
                 // not update disk, so reloading would replace the just-finalized reply
-                // with stale/older content. Also re-check the conversation is STILL
-                // active: `isActiveConv` was captured before this await, so a chat
-                // switch during the pending persist must not let the old conversation
-                // drive a load over the newly-selected one.
-                if (res?.persisted === true && activeIdRef.current === convId) {
+                // with stale/older content. AND only if no newer load/selection has
+                // happened since the persist began (generation unchanged) and this
+                // conversation is still active.
+                if (
+                  res?.persisted === true &&
+                  activeIdRef.current === convId &&
+                  loadSeqRef.current === seqAtPersist
+                ) {
                   void loadConversationState(convId, { skipInFlightSeed: true });
                   // The finalized-branch bridge holds a shallow copy of the full tree
                   // INCLUDING the base64 we just offloaded; its 15s TTL would otherwise

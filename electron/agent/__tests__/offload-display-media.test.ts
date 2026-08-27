@@ -293,3 +293,28 @@ describe('media GC (collectReferencedMediaPaths / gcOrphanedMedia)', () => {
     expect(removed).toBe(0);
   });
 });
+
+describe('rehydrateModelMedia byte cap (R2-4)', () => {
+  let appHome: string;
+  beforeEach(() => { appHome = mkdtempSync(join(tmpdir(), 'kai-rehy-cap-')); });
+  afterEach(() => rmSync(appHome, { recursive: true, force: true }));
+
+  it('stops rehydrating once the total-bytes cap is exceeded (leaves later URLs as URLs)', () => {
+    // Offload two ~4KB images, then rehydrate with a tiny cap that fits only the first.
+    const big = (seed: string) => 'data:image/png;base64,' + Buffer.alloc(4096, seed.charCodeAt(0)).toString('base64');
+    const a = offloadTreeDisplayMedia([imageMsg('a', big('A'))], appHome);
+    const b = offloadTreeDisplayMedia([imageMsg('b', big('B'))], appHome);
+    const aUrl = ((a.tree as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>)[1].image;
+    const bUrl = ((b.tree as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>)[1].image;
+    const branch = [
+      { id: 'a', role: 'user', parentId: null, content: [{ type: 'image', image: aUrl }] },
+      { id: 'b', role: 'user', parentId: null, content: [{ type: 'image', image: bUrl }] },
+    ];
+    const out = rehydrateModelMedia(branch, appHome, 5000); // room for one 4KB image only
+    const first = (out[0] as { content: Array<Record<string, unknown>> }).content[0].image as string;
+    const second = (out[1] as { content: Array<Record<string, unknown>> }).content[0].image as string;
+    expect(first.startsWith('data:')).toBe(true); // first rehydrated (within cap)
+    expect(second.startsWith('data:')).toBe(false); // second left as a URL (cap exhausted)
+    expect(second).toBe(bUrl);
+  });
+});

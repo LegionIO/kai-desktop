@@ -43,6 +43,44 @@ let outstandingSummarizerGenerates = 0;
 // concatenating raw content for a media-heavy branch would allocate history-sized
 // strings and risk OOMing the main process. Lives here (not stream-persistence) so the
 // agent, conversations, and stream-persistence layers can all import it without a cycle.
+
+/**
+ * A representation-invariant identity for a media part's value, used by
+ * messageContentSignature so the inline-base64 and offloaded-`kai-media://` forms
+ * of the SAME bytes sign identically (no false compaction drift after offload),
+ * while DIFFERENT bytes still differ (a same-id attachment swap is real drift).
+ *
+ * Both forms must map to the SAME token for the same bytes. Display-media offload
+ * names files `sha256(decodedBytes).slice(0,16).<ext>`, so:
+ * - `kai-media://<type>/<hash>.<ext>`: the hash IS the byte identity → use it.
+ * - `data:...;base64,<payload>`: decode and take the same sha256 prefix, so it
+ *   equals the URL form's hash for identical bytes.
+ * - anything else (http URL, bare base64, undecodable): fall back to a hash of the
+ *   raw string (stable, though not cross-form — those never undergo the transform).
+ */
+function mediaIdentityToken(value: string): string {
+  const MEDIA_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
+  if (value.startsWith(MEDIA_PREFIX)) {
+    // e.g. images/<hash>.png → the basename minus extension is the content hash.
+    const rel = value.slice(MEDIA_PREFIX.length).split('?')[0];
+    const base = rel.split('/').pop() ?? rel;
+    const hash = base.replace(/\.[a-z0-9]+$/i, '');
+    return 'm:' + hash;
+  }
+  const base64Match = /^data:[^;,]*(?:;[^,]*)?;base64,([\s\S]*)$/.exec(value);
+  if (base64Match) {
+    try {
+      const bytes = Buffer.from(base64Match[1], 'base64');
+      // Same digest + prefix length the offload filename uses, so data-URL and
+      // kai-media:// identities coincide for identical bytes.
+      return 'm:' + createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+    } catch {
+      /* fall through to raw-string hash */
+    }
+  }
+  return 'h:' + createHash('sha1').update(value).digest('hex');
+}
+
 export function messageContentSignature(
   m: { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown } | null | undefined,
 ): string {
@@ -70,12 +108,14 @@ export function messageContentSignature(
   // URL to the SAME bytes (a lossless, content-addressed transform). The producer
   // may sign one form and the persistence consumer the other (e.g. a compaction
   // record created pre-offload, then the conversation lazily migrated to URLs), so
-  // hashing the volatile value string would spuriously flag drift and re-summarize
-  // a still-valid summary. Normalize each media part's value to a stable token
-  // (type + mimeType + filename, minus the data/image/url payload) so the signature
-  // is identical across the offload transform. A genuine media SWAP changes the
-  // surrounding structure (a different attachment is a different part/turn) which
-  // the rest of the signature still captures. Mirrors the displayOnly precedent.
+  // hashing the volatile value string verbatim would spuriously flag drift and
+  // re-summarize a still-valid summary. Normalize each media value to a CONTENT
+  // IDENTITY token so the two representations of the same bytes hash equal — but a
+  // genuine attachment SWAP (different bytes under the same id/type/mime/filename)
+  // still changes the token, so drift is correctly detected. The offloaded URL is
+  // content-addressed (filename == sha of the bytes), so its path IS the identity;
+  // an inline data URL's identity is a hash of its payload. Both map the same bytes
+  // to the same token. Mirrors the displayOnly precedent above.
   if (Array.isArray(content)) {
     let mediaNormalized = false;
     const norm = (content as Array<Record<string, unknown> | null | undefined>).map((p) => {
@@ -84,11 +124,11 @@ export function messageContentSignature(
       const isFile = p.type === 'file' && typeof p.data === 'string';
       if (!isImage && !isFile) return p;
       mediaNormalized = true;
+      const raw = (isImage ? (p as { image: string }).image : (p as { data: string }).data) as string;
       const { image: _img, data: _data, ...rest } = p as Record<string, unknown>;
       void _img;
       void _data;
-      // Sign a fixed sentinel in place of the payload so base64 and kai-media:// forms hash equal.
-      return { ...rest, _mediaRef: true };
+      return { ...rest, _mediaId: mediaIdentityToken(raw) };
     });
     if (mediaNormalized) content = norm;
   }

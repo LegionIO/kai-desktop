@@ -1058,30 +1058,6 @@ export function sanitizeConversationTree(
 ): ConversationRecord {
   let rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
   if (!rawTree || rawTree.length === 0) return conv;
-  // Offload inline base64 DISPLAY media (user attachments) to disk-backed
-  // kai-media:// URLs BEFORE sanitize/backfill, so the persisted tree stores
-  // tiny URLs (not megabytes of base64), the token backfill counts the URL
-  // content, and `messages` is re-derived from the offloaded tree below. This is
-  // the single low-level write chokepoint (conversations:put AND the main-owned
-  // stream-persistence path both funnel through writeConversation → here).
-  // Model-visible `_modelContent` is never touched. No-op (original reference)
-  // when there's nothing to offload, so debounced metadata puts stay cheap.
-  // appHome is optional so existing callers/tests that only exercise structural
-  // sanitize keep working; media offload simply doesn't run without it.
-  if (appHome) {
-    const offloaded = offloadTreeDisplayMedia(rawTree, appHome);
-    if (offloaded.rewritten > 0) {
-      rawTree = offloaded.tree as unknown[];
-      // Also offload the linear `messages` mirror: the backfill-only path below
-      // maps it from `conv.messages` (not re-derived from the tree), so without
-      // this the mirror would keep the base64 the tree just shed. Content-
-      // addressed, so identical bytes resolve to the same URL on both arrays.
-      const messagesOffloaded = Array.isArray(conv.messages)
-        ? offloadTreeDisplayMedia(conv.messages, appHome)
-        : { tree: conv.messages, rewritten: 0 };
-      conv = { ...conv, messageTree: rawTree, messages: messagesOffloaded.tree as unknown[] };
-    }
-  }
   // Cached counts from the PREVIOUSLY-persisted tree, keyed by id, each carrying the
   // content signature the count was computed against. The backfill reuses one of
   // these (instead of re-encoding) when the incoming node's current content matches
@@ -1116,7 +1092,31 @@ export function sanitizeConversationTree(
       }
     }
   }
-  const { tree, headId, report } = sanitizeMessageTree(rawTree, headInput);
+  const { tree: sanitizedTree, headId, report } = sanitizeMessageTree(rawTree, headInput);
+  // Offload inline base64 DISPLAY media (user attachments) to disk-backed
+  // kai-media:// URLs — AFTER sanitizeMessageTree has dropped malformed/duplicate/
+  // id-less nodes, so a node that won't be persisted never materializes an orphan
+  // media file (which deletion GC could then never reclaim). Runs BEFORE the token
+  // backfill so counts reflect the tiny URL content, not the base64. This is the
+  // single low-level write chokepoint (conversations:put AND the main-owned
+  // stream-persistence path both funnel through writeConversation → here). Model-
+  // visible `_modelContent` is never touched. No-op (original reference) when there
+  // is nothing to offload. appHome is optional so structural-only test callers skip
+  // media offload entirely.
+  let tree = sanitizedTree;
+  if (appHome) {
+    const offloaded = offloadTreeDisplayMedia(sanitizedTree, appHome);
+    if (offloaded.rewritten > 0) {
+      tree = offloaded.tree as typeof sanitizedTree;
+      // Also offload the linear `messages` mirror: the backfill-only path below maps
+      // it from `conv.messages` (not re-derived from the tree), so without this the
+      // mirror keeps the base64 the tree just shed. Content-addressed → identical
+      // bytes resolve to the same URL on both arrays.
+      if (Array.isArray(conv.messages)) {
+        conv = { ...conv, messages: offloadTreeDisplayMedia(conv.messages, appHome).tree as unknown[] };
+      }
+    }
+  }
 
   // Backfill/refresh per-message tokenCount. A count is refreshed when it's MISSING
   // or its stored signature no longer matches the node's current content (a same-id
@@ -1514,36 +1514,46 @@ export function consumeWriteWasSuppressed(id: string): boolean {
 /**
  * Reclaim media files that were referenced ONLY by now-deleted conversations.
  * `removedRefs` is the union of media paths across the deleted conversations'
- * trees (collected BEFORE their files were removed). This scans every SURVIVING
+ * trees (collected BEFORE their files were removed). Scans every SURVIVING
  * conversation file to build the still-referenced set, then unlinks any removed
- * ref no survivor references. Best-effort + throw-safe: GC never blocks or fails a
- * delete. Skips entirely when nothing was referenced (the overwhelmingly common
- * media-free conversation), so a normal delete pays no scan cost.
+ * ref no survivor references.
+ *
+ * DEFERRED off the delete's critical path (setImmediate): the survivor scan is
+ * O(store size) — readFile + JSON.parse over every conversation — so running it
+ * synchronously would stall the main thread (and delay the delete's IPC return +
+ * broadcast) on a large/legacy store. The delete has already committed (file gone,
+ * index updated) by the time this runs; a crash before it merely leaves reclaimable
+ * media that the next delete's sweep collects. Best-effort + throw-safe throughout.
+ * The scan reads WHOLE strings deeply, so a kai-media:// URL embedded in markdown
+ * text (not just a display part) is correctly counted as a surviving reference and
+ * never wrongly deleted. Skips entirely when nothing was referenced.
  */
 function gcMediaAfterDelete(appHome: string, removedRefs: Set<string>): void {
   if (removedRefs.size === 0) return;
-  try {
-    const surviving = new Set<string>();
-    const dir = conversationsDir(appHome);
-    if (existsSync(dir)) {
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith('.json')) continue;
-        try {
-          const conv = JSON.parse(readFileSync(join(dir, name), 'utf-8')) as ConversationRecord;
-          collectReferencedMediaPaths(conv?.messageTree, surviving);
-          collectReferencedMediaPaths(conv?.messages, surviving);
-        } catch {
-          // A corrupt/unreadable survivor: FAIL SAFE — abort the whole GC for this
-          // batch rather than risk unlinking media a survivor we couldn't parse still
-          // uses. Nothing is deleted; a later delete re-attempts the sweep.
-          return;
+  setImmediate(() => {
+    try {
+      const surviving = new Set<string>();
+      const dir = conversationsDir(appHome);
+      if (existsSync(dir)) {
+        for (const name of readdirSync(dir)) {
+          if (!name.endsWith('.json')) continue;
+          try {
+            const conv = JSON.parse(readFileSync(join(dir, name), 'utf-8')) as ConversationRecord;
+            collectReferencedMediaPaths(conv?.messageTree, surviving);
+            collectReferencedMediaPaths(conv?.messages, surviving);
+          } catch {
+            // A corrupt/unreadable survivor: FAIL SAFE — abort the whole GC for this
+            // batch rather than risk unlinking media a survivor we couldn't parse still
+            // uses. Nothing is deleted; a later delete re-attempts the sweep.
+            return;
+          }
         }
       }
+      gcOrphanedMedia(appHome, removedRefs, surviving);
+    } catch {
+      /* GC is best-effort cleanup — never surface a failure */
     }
-    gcOrphanedMedia(appHome, removedRefs, surviving);
-  } catch {
-    /* GC is best-effort cleanup — never surface a failure to the delete caller */
-  }
+  });
 }
 
 export function deleteConversation(appHome: string, id: string): boolean {

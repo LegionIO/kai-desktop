@@ -25,23 +25,33 @@
  * left untouched rather than throwing (a persist must never fail on bad media).
  */
 import { createHash } from 'crypto';
-import { mkdirSync, statSync, readFileSync, rmSync } from 'fs';
+import { mkdirSync, statSync, lstatSync, rmSync } from 'fs';
 import { join, sep } from 'path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { safeReadRangeWithin } from '../utils/safe-file-read.js';
 import { filePathToUrl, MAX_MEDIA_BYTES } from '../tools/media-gen-utils.js';
+
+/** Ceiling on TOTAL decoded bytes rehydrateModelMedia will materialize into base64
+ *  in one pass — a safety bound so a pathological deep history of attachments can't
+ *  OOM the main process. 64 MiB is far above any realistic single-turn attachment
+ *  set (the whole-request media ceiling is a few MiB) yet nowhere near a main-heap
+ *  risk. Not a per-turn budget (that's media-fit's job) — a backstop against abuse. */
+const REHYDRATE_TOTAL_CAP = 64 * 1024 * 1024;
 
 /** `data:<mime>;base64,<payload>` — capture the mime and the base64 body. Also
  *  tolerates a missing/again-declared charset segment. We only offload base64
  *  data URLs (the heavy ones); a `data:...;utf8,` text URL is left as-is. */
 const DATA_URL_RE = /^data:([^;,]+)?(?:;[^,]*?)?;base64,([\s\S]*)$/;
 
-/** Map a decoded mime type to a media subdir + file extension. Unknown types
- *  fall back to a generic binary file under images/ (the protocol serves it with
- *  an octet-stream content type; the renderer still gets a working URL). */
-function mediaTarget(mime: string): { type: 'images' | 'videos' | 'audio'; ext: string } {
-  const m = mime.toLowerCase();
-  const map: Record<string, { type: 'images' | 'videos' | 'audio'; ext: string }> = {
+/** Map a decoded mime type to a media subdir + file extension. Non-media
+ *  documents (PDF, text, JSON, …) go under `files/` with a type-appropriate
+ *  extension so the media protocol + web route serve them with the correct
+ *  Content-Type (and previews key off it) rather than octet-stream. A truly
+ *  unknown type keeps its bytes under `files/` as `.bin`. */
+function mediaTarget(mime: string): { type: 'images' | 'videos' | 'audio' | 'files'; ext: string } {
+  const m = mime.toLowerCase().split(';')[0].trim();
+  const map: Record<string, { type: 'images' | 'videos' | 'audio' | 'files'; ext: string }> = {
     'image/png': { type: 'images', ext: 'png' },
     'image/jpeg': { type: 'images', ext: 'jpg' },
     'image/jpg': { type: 'images', ext: 'jpg' },
@@ -56,8 +66,18 @@ function mediaTarget(mime: string): { type: 'images' | 'videos' | 'audio'; ext: 
     'audio/flac': { type: 'audio', ext: 'flac' },
     'audio/opus': { type: 'audio', ext: 'opus' },
     'audio/ogg': { type: 'audio', ext: 'ogg' },
+    'application/pdf': { type: 'files', ext: 'pdf' },
+    'application/json': { type: 'files', ext: 'json' },
+    'text/plain': { type: 'files', ext: 'txt' },
+    'text/markdown': { type: 'files', ext: 'md' },
+    'text/csv': { type: 'files', ext: 'csv' },
+    'text/html': { type: 'files', ext: 'html' },
   };
-  return map[m] ?? { type: 'images', ext: 'bin' };
+  if (map[m]) return map[m];
+  // Unknown MIME: keep bytes under files/ (never guess an image ext). A generic
+  // text/* is stored .txt so it previews as text; everything else is .bin.
+  if (m.startsWith('text/')) return { type: 'files', ext: 'txt' };
+  return { type: 'files', ext: 'bin' };
 }
 
 /** True when a string is already a servable URL (offloaded or remote) — leave it. */
@@ -228,6 +248,12 @@ function mimeForExt(ext: string): string {
     flac: 'audio/flac',
     opus: 'audio/opus',
     ogg: 'audio/ogg',
+    pdf: 'application/pdf',
+    json: 'application/json',
+    txt: 'text/plain',
+    md: 'text/markdown',
+    csv: 'text/csv',
+    html: 'text/html',
   };
   return map[ext.toLowerCase()] ?? 'application/octet-stream';
 }
@@ -252,33 +278,56 @@ export function rehydrateMediaUrl(value: string, appHome: string, mimeType?: str
     return null;
   }
   const filePath = join(mediaDir, rel);
-  // Lexical containment: the resolved path must stay under mediaDir.
+  // Lexical containment (cheap first pass); the symlink/TOCTOU-safe read below is
+  // authoritative. A bare statSync/readFileSync would FOLLOW a symlink planted
+  // inside mediaDir (by a crafted conversation/plugin tree) and read an arbitrary
+  // file, then send it to the model — so use the same realpath + O_NOFOLLOW helper
+  // the media protocol handler uses. A ranged read caps the size (a media file is
+  // ≤ MAX_MEDIA_BYTES; a larger/symlinked target is rejected via `size`).
   if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) return null;
-  let buf: Buffer;
-  try {
-    const st = statSync(filePath);
-    if (!st.isFile() || st.size === 0 || st.size > MAX_MEDIA_BYTES) return null;
-    buf = readFileSync(filePath);
-  } catch {
-    return null;
-  }
+  const ranged = safeReadRangeWithin(mediaDir, filePath, 0, MAX_MEDIA_BYTES - 1);
+  if (!ranged || ranged.size === 0 || ranged.size > MAX_MEDIA_BYTES) return null;
+  const buf = ranged.data;
   const ext = filePath.split('.').pop() ?? '';
   const mime = mimeType && typeof mimeType === 'string' ? mimeType : mimeForExt(ext);
   return `data:${mime};base64,${buf.toString('base64')}`;
 }
 
 /**
- * Return a NEW messages array with every `kai-media://` display media value
- * rehydrated to a data: URL, for the model boundary. Never mutates the input
- * (branch objects are shared with persisted/renderer state) — nodes and their
- * content arrays are cloned only when a part actually changes. Non-array content
- * and non-media parts pass through by reference. Leaves a part unchanged if its
- * URL can't be resolved. NEVER descends into tool-result `result`/`_modelContent`
- * (those carry their own model media via a separate path).
+ * Return a NEW messages array with `kai-media://` display media values rehydrated
+ * to data: URLs, for the model boundary. Never mutates the input (branch objects
+ * are shared with persisted/renderer state) — nodes and content arrays are cloned
+ * only when a part changes. Non-array content and non-media parts pass by reference.
+ * Leaves a part unchanged if its URL can't be resolved. NEVER descends into
+ * tool-result `result`/`_modelContent` (those carry their own model media).
+ *
+ * BOUNDED: rehydration base64-encodes files into memory, so an unbounded history of
+ * attachments could spike the MAIN process (the very OOM we're preventing in the
+ * renderer). We rehydrate in branch order until `maxTotalBytes` of decoded media has
+ * been materialized, then leave further URLs un-rehydrated. The whole-request media
+ * ceiling means the provider can't accept more than that anyway; the most-recent
+ * turn's attachments (end of the branch) are what matter and comfortably fit, while
+ * a pathological deep-history media pile can't OOM main. Default cap is generous
+ * (4× the per-result media total) — enough for any realistic turn.
  */
-export function rehydrateModelMedia(messages: unknown[], appHome: string): unknown[] {
+export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTotalBytes = REHYDRATE_TOTAL_CAP): unknown[] {
   if (!Array.isArray(messages)) return messages;
   let anyChanged = false;
+  let budget = maxTotalBytes;
+  // Resolve a value within the remaining byte budget; decrements budget by the
+  // materialized size. Returns null (leave as-is) when unresolvable OR the budget
+  // is exhausted / this file alone would blow it.
+  const resolve = (value: string, mimeType?: string): string | null => {
+    if (budget <= 0) return null;
+    const data = rehydrateMediaUrl(value, appHome, mimeType);
+    if (!data) return null;
+    // Approx decoded bytes from the produced data: URL (payload len * 3/4).
+    const payloadLen = data.length - (data.indexOf(',') + 1);
+    const bytes = Math.floor((payloadLen * 3) / 4);
+    if (bytes > budget) return null; // would exceed the cap → leave the URL
+    budget -= bytes;
+    return data;
+  };
   const out = messages.map((rawMsg) => {
     const msg = rawMsg as { content?: unknown } & Record<string, unknown>;
     if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) return rawMsg;
@@ -286,8 +335,9 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string): unkno
     const content = (msg.content as LoosePart[]).map((raw) => {
       const part = raw as LoosePart;
       if (!part || typeof part !== 'object') return raw;
+      const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
       if (part.type === 'image' && typeof part.image === 'string') {
-        const data = rehydrateMediaUrl(part.image, appHome, typeof part.mimeType === 'string' ? part.mimeType : undefined);
+        const data = resolve(part.image, mime);
         if (data) {
           contentChanged = true;
           return { ...part, image: data };
@@ -295,7 +345,7 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string): unkno
         return raw;
       }
       if (part.type === 'file' && typeof part.data === 'string') {
-        const data = rehydrateMediaUrl(part.data, appHome, typeof part.mimeType === 'string' ? part.mimeType : undefined);
+        const data = resolve(part.data, mime);
         if (data) {
           contentChanged = true;
           return { ...part, data };
@@ -367,8 +417,12 @@ export function gcOrphanedMedia(appHome: string, removedRefs: Set<string>, survi
     // Containment: never unlink outside mediaDir (a crafted path in a tree).
     if (filePath !== mediaDir && !filePath.startsWith(mediaDir + sep)) continue;
     try {
-      const st = statSync(filePath);
-      if (!st.isFile()) continue; // never rmdir; only regular media files
+      // lstat (NOT stat) so a symlink is inspected as the link itself, never
+      // followed: only unlink a genuine regular file we could have written. A
+      // symlink/dir/special entry planted in mediaDir is skipped, so GC can't be
+      // tricked into removing (or traversing to) anything outside the media tree.
+      const st = lstatSync(filePath);
+      if (!st.isFile()) continue;
       rmSync(filePath, { force: true });
       removed++;
     } catch {

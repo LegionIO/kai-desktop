@@ -957,25 +957,23 @@ export function registerConversationHandlers(
     return results;
   });
 
-  ipcMain.handle('conversations:get', (_event, id: string) => {
-    const conv = readConversation(appHome, id) ?? null;
-    if (!conv) return null;
-    // Lazy migration (A4): a conversation persisted before display-media offload
-    // still carries inline base64 attachments (multi-MiB) that would land in the
-    // renderer heap on load. Offload them to kai-media:// URLs NOW so the returned
-    // record is already URL-ized, and re-persist so the on-disk file shrinks
-    // permanently (idempotent + content-addressed → one-time cost per conversation;
-    // subsequent gets rewrite nothing). Skip the re-persist while compacting to
-    // avoid racing the summarizer's out-of-band write — the returned record is
-    // still URL-ized, and the file re-persists on the next non-compacting get.
-    // writeConversation applies its own tombstone/merge guards, so a stale
-    // re-persist can't corrupt the tree.
+  // Lazy media migration shared by conversations:get AND get-for-restore. A
+  // conversation persisted before display-media offload carries inline base64
+  // attachments (multi-MiB) that would land in the renderer heap on load — the
+  // exact startup OOM this work prevents. Offload them to kai-media:// URLs so the
+  // RETURNED record is URL-ized (renderer never sees the base64), and re-persist so
+  // the on-disk file shrinks permanently (idempotent + content-addressed → one-time
+  // cost per conversation). Skip the re-persist while compacting to avoid racing the
+  // summarizer's out-of-band write (the returned record is still URL-ized; the file
+  // re-persists on the next non-compacting read). writeConversation applies its own
+  // tombstone/merge guards, so a stale re-persist can't corrupt the tree.
+  const migrateConversationMedia = <T extends ConversationRecord>(conv: T, id: string): T => {
     const treeOffload = offloadTreeDisplayMedia(conv.messageTree, appHome);
     const msgOffload = Array.isArray(conv.messages)
       ? offloadTreeDisplayMedia(conv.messages, appHome)
       : { tree: conv.messages, rewritten: 0 };
     if (treeOffload.rewritten === 0 && msgOffload.rewritten === 0) return conv;
-    const migrated: ConversationRecord = {
+    const migrated: T = {
       ...conv,
       ...(Array.isArray(conv.messageTree) ? { messageTree: treeOffload.tree as unknown[] } : {}),
       ...(Array.isArray(conv.messages) ? { messages: msgOffload.tree as unknown[] } : {}),
@@ -984,17 +982,28 @@ export function registerConversationHandlers(
       try {
         writeConversation(appHome, migrated);
       } catch {
-        /* best-effort migration; the media files are already written, and a later
-           write (or the next get) re-persists the URL tree. */
+        /* best-effort migration; media files are already written, and a later write
+           (or the next read) re-persists the URL tree. */
       }
     }
     return migrated;
+  };
+
+  ipcMain.handle('conversations:get', (_event, id: string) => {
+    const conv = readConversation(appHome, id) ?? null;
+    if (!conv) return null;
+    return migrateConversationMedia(conv, id);
   });
 
   ipcMain.handle('conversations:get-for-restore', (_event, id: string) => {
     try {
       const conversation = readConversationStrict(appHome, id);
-      return conversation ? { status: 'found' as const, conversation } : { status: 'missing' as const };
+      if (!conversation) return { status: 'missing' as const };
+      // Restore path (workspace/active reopen at startup) reads the record BEFORE the
+      // normal conversations:get load, so it must offload legacy base64 too — else a
+      // media-heavy legacy conversation is structured-cloned into the renderer and can
+      // trigger the very startup OOM this work prevents.
+      return { status: 'found' as const, conversation: migrateConversationMedia(conversation, id) };
     } catch {
       return { status: 'unavailable' as const };
     }
@@ -2404,7 +2413,7 @@ export function registerConversationHandlers(
       // (the gate that enforces the ceiling). Checked ONCE (bytes don't vary by model).
       if ((config.compaction.media as { enabled?: boolean } | undefined)?.enabled) {
         try {
-          const { retainedMediaBytes } = await stripBranchMediaForCount(candidate as unknown[], signal);
+          const { retainedMediaBytes } = await stripBranchMediaForCount(candidate as unknown[], signal, appHome);
           if (retainedMediaBytes > DEFAULT_MAX_TOTAL_MEDIA_BYTES) return false;
         } catch {
           /* best-effort — fall through to the per-model token checks */

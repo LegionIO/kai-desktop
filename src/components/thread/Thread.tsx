@@ -857,13 +857,32 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
   const [fetchError, setFetchError] = useState(false);
   useEffect(() => {
     if (!previewOpen || !isText || !isOffloadedUrl) return;
+    const controller = new AbortController();
     let cancelled = false;
     setFetchedText(null);
     setFetchError(false);
     void (async () => {
       try {
-        const resp = await fetch(resolvedSrc);
-        if (!resp.ok) throw new Error(`status ${resp.status}`);
+        // Bounded range request: fetch at most the preview limit + 1 byte so a huge
+        // text attachment is never fully buffered into main + renderer. If the server
+        // honors the Range (206) we get only the head; if not (200), we cap manually.
+        const resp = await fetch(resolvedSrc, {
+          signal: controller.signal,
+          headers: { Range: `bytes=0-${Math.ceil(TEXT_PREVIEW_MAX_BYTES * 1.4)}` },
+        });
+        if (!resp.ok && resp.status !== 206) throw new Error(`status ${resp.status}`);
+        // Prefer the declared total size when present (206 Content-Range or 200
+        // Content-Length) so we can report "too large" without reading the body.
+        const totalSize = (() => {
+          const cr = resp.headers.get('Content-Range'); // e.g. "bytes 0-N/TOTAL"
+          const total = cr ? Number(cr.split('/')[1]) : Number(resp.headers.get('Content-Length'));
+          return Number.isFinite(total) ? total : null;
+        })();
+        if (totalSize !== null && totalSize > TEXT_PREVIEW_MAX_BYTES * 1.4) {
+          if (!cancelled)
+            setFetchedText(`(${filename} is too large to preview inline — ${(totalSize / 1024 / 1024).toFixed(1)} MB.)`);
+          return;
+        }
         const blob = await resp.blob();
         if (blob.size > TEXT_PREVIEW_MAX_BYTES * 1.4) {
           if (!cancelled)
@@ -879,12 +898,14 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
           }
         }
         if (!cancelled) setFetchedText(decoded);
-      } catch {
-        if (!cancelled) setFetchError(true);
+      } catch (err) {
+        // An abort (modal closed / deps changed) is not an error to surface.
+        if (!cancelled && (err as { name?: string } | null)?.name !== 'AbortError') setFetchError(true);
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort(); // stop an in-flight fetch when the modal closes or deps change
     };
   }, [previewOpen, isText, isOffloadedUrl, resolvedSrc, filename, mimeType]);
 
@@ -1019,7 +1040,15 @@ const FilePreviewModal: FC<{
             </pre>
           </div>
         ) : mimeType === 'application/pdf' || src.startsWith('data:application/pdf') ? (
-          <iframe src={src} className="w-[80vw] h-[85vh] rounded-lg bg-white" title="PDF preview" />
+          // sandbox with NO allow-scripts: the native PDF viewer still renders, but a
+          // file whose real bytes are script-bearing (e.g. an SVG mislabeled PDF, or a
+          // MIME/extension mismatch) cannot execute in this same-origin-served frame.
+          <iframe
+            src={src}
+            sandbox=""
+            className="w-[80vw] h-[85vh] rounded-lg bg-white"
+            title="PDF preview"
+          />
         ) : (
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />
         )}

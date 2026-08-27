@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   estimateImageTokensFromDimensions,
@@ -855,6 +858,44 @@ describe('stripBranchMediaForCount (sanitizer-aware retention for the whole-requ
     expect(part.image).toBe("kai-media://images/deadbeef00000000.png");
     expect(part._mediaStripped).toBeUndefined();
     expect(retainedMediaBytes).toBe(0);
+  });
+
+  it("counts an offloaded kai-media:// attachment by its REAL file size when appHome is provided (R2-7)", async () => {
+    const appHome = mkdtempSync(join(tmpdir(), "kai-mediafit-count-"));
+    try {
+      // Create a real media file so the bounded stat resolves its size.
+      const bytes = 4096;
+      mkdirSync(join(appHome, "media", "images"), { recursive: true });
+      writeFileSync(join(appHome, "media", "images", "cafebabe00000000.png"), Buffer.alloc(bytes, 7));
+      const branch = [
+        {
+          role: "user",
+          content: [{ type: "image", image: "kai-media://images/cafebabe00000000.png", mimeType: "image/png" }],
+        },
+      ];
+      const { stripped, retainedMediaBytes } = await stripBranchMediaForCount(branch, undefined, appHome);
+      // Now the URL part IS accounted (stripped placeholder) and counts its real bytes.
+      const part = (stripped[0] as { content: Array<Record<string, unknown>> }).content[0];
+      expect(part._mediaStripped).toBe(true);
+      expect(retainedMediaBytes).toBe(bytes);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves an offloaded URL untouched when its file is MISSING (unresolvable size)", async () => {
+    const appHome = mkdtempSync(join(tmpdir(), "kai-mediafit-missing-"));
+    try {
+      const branch = [
+        { role: "user", content: [{ type: "image", image: "kai-media://images/absent0000000000.png" }] },
+      ];
+      const { stripped, retainedMediaBytes } = await stripBranchMediaForCount(branch, undefined, appHome);
+      const part = (stripped[0] as { content: Array<Record<string, unknown>> }).content[0];
+      expect(part.image).toBe("kai-media://images/absent0000000000.png");
+      expect(retainedMediaBytes).toBe(0);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
   });
 
   it("does NOT count sanitizer-INVALID _modelContent media (missing mediaType)", async () => {
