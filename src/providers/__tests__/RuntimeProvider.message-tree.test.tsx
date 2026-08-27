@@ -28,6 +28,7 @@ import {
   reorderPrefixBeforeInjectedUserChain,
   persistAdmissionRejectionMessage,
   streamAdmissionRejectionMessage,
+  branchHasInlineBase64Media,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -897,5 +898,41 @@ describe('preserveErroredAssistantVariant — mid-stream fallback keeps the part
     expect(acc2.injectContinuationId).toBeNull(); // boundary closed
     expect(acc2.closedPrefixIds.has('user-inject-cont')).toBe(true);
     expect(acc2.headId).toBe('user-inject'); // rewound so the retry is a sibling
+  });
+});
+
+describe('branchHasInlineBase64Media', () => {
+  const msg = (content: unknown): Parameters<typeof branchHasInlineBase64Media>[0][number] =>
+    ({ id: 'm', role: 'user', parentId: null, content }) as unknown as Parameters<
+      typeof branchHasInlineBase64Media
+    >[0][number];
+
+  it('detects a base64 image display part', () => {
+    expect(branchHasInlineBase64Media([msg([{ type: 'image', image: 'data:image/png;base64,AAAA' }])])).toBe(true);
+  });
+
+  it('detects a base64 file display part', () => {
+    expect(branchHasInlineBase64Media([msg([{ type: 'file', data: 'data:application/pdf;base64,AAAA' }])])).toBe(true);
+  });
+
+  it('returns false for a kai-media / http URL image (already offloaded)', () => {
+    expect(branchHasInlineBase64Media([msg([{ type: 'image', image: 'kai-media://images/x.png' }])])).toBe(false);
+    expect(branchHasInlineBase64Media([msg([{ type: 'image', image: 'https://e.com/x.png' }])])).toBe(false);
+  });
+
+  it('returns false for text-only / empty / non-array content', () => {
+    expect(branchHasInlineBase64Media([msg([{ type: 'text', text: 'hi' }])])).toBe(false);
+    expect(branchHasInlineBase64Media([msg([])])).toBe(false);
+    expect(branchHasInlineBase64Media([msg('a plain string')])).toBe(false);
+    expect(branchHasInlineBase64Media([])).toBe(false);
+  });
+
+  it('finds media on a mid-branch node, not just the tail', () => {
+    expect(
+      branchHasInlineBase64Media([
+        msg([{ type: 'image', image: 'data:image/png;base64,AAAA' }]),
+        msg([{ type: 'text', text: 'assistant reply' }]),
+      ]),
+    ).toBe(true);
   });
 });
