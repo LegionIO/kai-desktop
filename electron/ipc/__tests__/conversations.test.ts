@@ -8,7 +8,7 @@
  *     renderer side talks to via `window.app.conversations.*`.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -241,6 +241,45 @@ describe('conversations IPC: list / get / put round-trip', () => {
     // The on-disk per-file store should contain the entry as well.
     const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations', 'conv-1.json'), 'utf-8'));
     expect(onDisk.id).toBe('conv-1');
+  });
+
+  it('offloads base64 display media to disk-backed media URLs on put (model view untouched)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const dataUrl = `data:image/png;base64,${PNG_B64}`;
+    const userNode = {
+      id: 'u1',
+      role: 'user',
+      parentId: null,
+      createdAt: '2026-01-02T00:00:00.000Z',
+      content: [
+        { type: 'text', text: 'see attached' },
+        { type: 'image', image: dataUrl, mimeType: 'image/png' },
+      ],
+    };
+    const conversation = makeConversation('conv-media', {
+      messages: [userNode],
+      messageTree: [userNode],
+      headId: 'u1',
+      messageCount: 1,
+      userMessageCount: 1,
+    });
+
+    await harness.invoke('conversations:put', FAKE_EVENT, conversation);
+
+    // On disk: the image part is now a media URL (no base64), and the file exists.
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations', 'conv-media.json'), 'utf-8'));
+    const storedImg = onDisk.messageTree[0].content[1].image as string;
+    expect(storedImg.startsWith('data:')).toBe(false);
+    expect(storedImg).toMatch(/:\/\/images\/[0-9a-f]{16}\.png$/);
+    const raw = readFileSync(join(appHome, 'data', 'conversations', 'conv-media.json'), 'utf-8');
+    expect(raw).not.toContain(PNG_B64); // the heavy base64 is gone from the JSON
+    expect(readdirSync(join(appHome, 'media', 'images'))).toHaveLength(1);
   });
 
   it('rejects a Browser-unauthorized put before it changes the durable branch', async () => {

@@ -8,6 +8,7 @@ import {
   tokenProjectionSerializedLength,
   tokenProjectionByteCeiling,
 } from '../agent/tokenization.js';
+import { offloadTreeDisplayMedia } from '../agent/offload-display-media.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -1046,9 +1047,37 @@ export function sanitizeMessageTree(
  * `headId`, `messages` (active branch) and counts consistent. Returns the SAME
  * object when nothing changed (no allocation churn on the hot write path).
  */
-export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: unknown[] | null): ConversationRecord {
-  const rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
+export function sanitizeConversationTree(
+  conv: ConversationRecord,
+  priorTree?: unknown[] | null,
+  appHome?: string,
+): ConversationRecord {
+  let rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
   if (!rawTree || rawTree.length === 0) return conv;
+  // Offload inline base64 DISPLAY media (user attachments) to disk-backed
+  // kai-media:// URLs BEFORE sanitize/backfill, so the persisted tree stores
+  // tiny URLs (not megabytes of base64), the token backfill counts the URL
+  // content, and `messages` is re-derived from the offloaded tree below. This is
+  // the single low-level write chokepoint (conversations:put AND the main-owned
+  // stream-persistence path both funnel through writeConversation → here).
+  // Model-visible `_modelContent` is never touched. No-op (original reference)
+  // when there's nothing to offload, so debounced metadata puts stay cheap.
+  // appHome is optional so existing callers/tests that only exercise structural
+  // sanitize keep working; media offload simply doesn't run without it.
+  if (appHome) {
+    const offloaded = offloadTreeDisplayMedia(rawTree, appHome);
+    if (offloaded.rewritten > 0) {
+      rawTree = offloaded.tree as unknown[];
+      // Also offload the linear `messages` mirror: the backfill-only path below
+      // maps it from `conv.messages` (not re-derived from the tree), so without
+      // this the mirror would keep the base64 the tree just shed. Content-
+      // addressed, so identical bytes resolve to the same URL on both arrays.
+      const messagesOffloaded = Array.isArray(conv.messages)
+        ? offloadTreeDisplayMedia(conv.messages, appHome)
+        : { tree: conv.messages, rewritten: 0 };
+      conv = { ...conv, messageTree: rawTree, messages: messagesOffloaded.tree as unknown[] };
+    }
+  }
   // Cached counts from the PREVIOUSLY-persisted tree, keyed by id, each carrying the
   // content signature the count was computed against. The backfill reuses one of
   // these (instead of re-encoding) when the incoming node's current content matches
@@ -1398,7 +1427,7 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   } catch {
     /* best-effort — fall back to fresh backfill */
   }
-  const sanitized = sanitizeConversationTree(conv, priorTree);
+  const sanitized = sanitizeConversationTree(conv, priorTree, appHome);
   // Resurrection guard: if this id was DELETED, a stale in-flight persist is trying to recreate it.
   // SKIP the write (return the record unchanged) rather than resurrect a deleted conversation with
   // stale messages + run state. Two tombstone sources: the in-memory TTL map (fast path, covers the
