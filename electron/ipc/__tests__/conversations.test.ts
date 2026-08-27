@@ -282,6 +282,55 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(readdirSync(join(appHome, 'media', 'images'))).toHaveLength(1);
   });
 
+  it('lazily migrates a pre-existing base64 conversation on get (returns URLs + shrinks disk)', async () => {
+    const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const dataUrl = `data:image/png;base64,${PNG_B64}`;
+    const legacyNode = {
+      id: 'u1',
+      role: 'user',
+      parentId: null,
+      createdAt: '2026-01-02T00:00:00.000Z',
+      content: [{ type: 'image', image: dataUrl, mimeType: 'image/png' }],
+    };
+    // Write the base64-laden conversation DIRECTLY to disk (bypassing the offload
+    // that writeConversation would apply), simulating a chat persisted before A1.
+    const convFile = join(appHome, 'data', 'conversations', 'legacy-media.json');
+    const record = makeConversation('legacy-media', {
+      messages: [legacyNode],
+      messageTree: [legacyNode],
+      headId: 'u1',
+      messageCount: 1,
+      userMessageCount: 1,
+    });
+    mkdirSync(join(appHome, 'data', 'conversations'), { recursive: true });
+    writeFileSync(convFile, JSON.stringify(record, null, 2));
+    expect(readFileSync(convFile, 'utf-8')).toContain(PNG_B64); // base64 is on disk
+
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    const got = (await harness.invoke('conversations:get', FAKE_EVENT, 'legacy-media')) as {
+      messageTree: Array<{ content: Array<{ image?: string }> }>;
+    };
+    // Returned record is already URL-ized.
+    const gotImg = got.messageTree[0].content[0].image as string;
+    expect(gotImg.startsWith('data:')).toBe(false);
+    expect(gotImg).toMatch(/:\/\/images\/[0-9a-f]{16}\.png$/);
+    // Disk was migrated in place (base64 gone, file materialized).
+    expect(readFileSync(convFile, 'utf-8')).not.toContain(PNG_B64);
+    expect(readdirSync(join(appHome, 'media', 'images'))).toHaveLength(1);
+
+    // A second get rewrites nothing (idempotent) and still returns URLs.
+    const again = (await harness.invoke('conversations:get', FAKE_EVENT, 'legacy-media')) as {
+      messageTree: Array<{ content: Array<{ image?: string }> }>;
+    };
+    expect((again.messageTree[0].content[0].image as string).startsWith('data:')).toBe(false);
+    expect(readdirSync(join(appHome, 'media', 'images'))).toHaveLength(1);
+  });
+
   it('rejects a Browser-unauthorized put before it changes the durable branch', async () => {
     const originalTree = [
       { id: 'user-owner', parentId: null, role: 'user', content: 'owner prompt', createdAt: '2026-01-01' },

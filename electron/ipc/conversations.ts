@@ -3,6 +3,7 @@ import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
+import { offloadTreeDisplayMedia } from '../agent/offload-display-media.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -957,7 +958,37 @@ export function registerConversationHandlers(
   });
 
   ipcMain.handle('conversations:get', (_event, id: string) => {
-    return readConversation(appHome, id) ?? null;
+    const conv = readConversation(appHome, id) ?? null;
+    if (!conv) return null;
+    // Lazy migration (A4): a conversation persisted before display-media offload
+    // still carries inline base64 attachments (multi-MiB) that would land in the
+    // renderer heap on load. Offload them to kai-media:// URLs NOW so the returned
+    // record is already URL-ized, and re-persist so the on-disk file shrinks
+    // permanently (idempotent + content-addressed → one-time cost per conversation;
+    // subsequent gets rewrite nothing). Skip the re-persist while compacting to
+    // avoid racing the summarizer's out-of-band write — the returned record is
+    // still URL-ized, and the file re-persists on the next non-compacting get.
+    // writeConversation applies its own tombstone/merge guards, so a stale
+    // re-persist can't corrupt the tree.
+    const treeOffload = offloadTreeDisplayMedia(conv.messageTree, appHome);
+    const msgOffload = Array.isArray(conv.messages)
+      ? offloadTreeDisplayMedia(conv.messages, appHome)
+      : { tree: conv.messages, rewritten: 0 };
+    if (treeOffload.rewritten === 0 && msgOffload.rewritten === 0) return conv;
+    const migrated: ConversationRecord = {
+      ...conv,
+      ...(Array.isArray(conv.messageTree) ? { messageTree: treeOffload.tree as unknown[] } : {}),
+      ...(Array.isArray(conv.messages) ? { messages: msgOffload.tree as unknown[] } : {}),
+    };
+    if (!isCompacting(id)) {
+      try {
+        writeConversation(appHome, migrated);
+      } catch {
+        /* best-effort migration; the media files are already written, and a later
+           write (or the next get) re-persists the URL tree. */
+      }
+    }
+    return migrated;
   });
 
   ipcMain.handle('conversations:get-for-restore', (_event, id: string) => {
