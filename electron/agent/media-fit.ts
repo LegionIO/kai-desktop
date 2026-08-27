@@ -290,6 +290,11 @@ export function estimateNativeTokensFromSize(
  *  IMAGE_HEADER_PROBE_BYTES (dimension headers live at the front of every common
  *  format). Falls back to the byte estimate when the probe/sharp is unavailable. */
 const IMAGE_HEADER_PROBE_BYTES = 128 * 1024;
+/** Cache of offloaded-image token estimates keyed by the content-addressed URL
+ *  (the filename IS a hash of the bytes → immutable), so a long history re-probes
+ *  each distinct image at most once rather than on every accounting pass. */
+const offloadedImageTokenCache = new Map<string, number>();
+const OFFLOADED_IMAGE_CACHE_MAX = 512;
 export async function estimateOffloadedImageTokens(
   value: string,
   appHome: string,
@@ -298,6 +303,13 @@ export async function estimateOffloadedImageTokens(
   const prefix = __BRAND_MEDIA_PROTOCOL + '://';
   const byteEst = Math.ceil(totalBytes / 2);
   if (!value.startsWith(prefix)) return byteEst;
+  const cacheKey = value.split('?')[0];
+  const cached = offloadedImageTokenCache.get(cacheKey);
+  if (cached !== undefined) {
+    offloadedImageTokenCache.delete(cacheKey);
+    offloadedImageTokenCache.set(cacheKey, cached); // LRU refresh
+    return cached;
+  }
   const mediaDir = join(appHome, 'media');
   let rel: string;
   try {
@@ -314,7 +326,13 @@ export async function estimateOffloadedImageTokens(
   try {
     const meta = await sharpMod(probe.data, { limitInputPixels: false }).metadata();
     const dimEst = estimateImageTokensFromDimensions(meta.width ?? 0, meta.height ?? 0);
-    return dimEst > 0 ? dimEst : byteEst;
+    const est = dimEst > 0 ? dimEst : byteEst;
+    offloadedImageTokenCache.set(cacheKey, est);
+    if (offloadedImageTokenCache.size > OFFLOADED_IMAGE_CACHE_MAX) {
+      const oldest = offloadedImageTokenCache.keys().next().value;
+      if (oldest !== undefined) offloadedImageTokenCache.delete(oldest);
+    }
+    return est;
   } catch {
     return byteEst;
   }
@@ -612,15 +630,19 @@ export async function stripBranchMediaForCount(
     const estimates = await Promise.all(batch.map((x) => estimateNativeMediaTokens(x.data, x.isImage, x.mediaType)));
     for (const e of estimates) nativeMediaTokens += e;
   }
-  // Probe offloaded IMAGES by header for accurate dimension-based tokens (bounded
-  // concurrency; on abort fall back to the byte estimate so accounting still completes).
+  // Probe offloaded IMAGES by header for accurate dimension-based tokens. BOUNDED:
+  // probe at most MEDIA_ESTIMATE_MAX (shared work budget with inline media); beyond
+  // that, and on abort, use the cheap size estimate so a long history can't perform
+  // thousands of header reads. Estimates are cached by content-addressed URL.
   if (appHome) {
-    for (let i = 0; i < offloadedImagesToProbe.length; i += MEDIA_ESTIMATE_CONCURRENCY) {
+    const probeImages = offloadedImagesToProbe.slice(0, MEDIA_ESTIMATE_MAX);
+    for (const x of offloadedImagesToProbe.slice(MEDIA_ESTIMATE_MAX)) nativeMediaTokens += Math.ceil(x.size / 2);
+    for (let i = 0; i < probeImages.length; i += MEDIA_ESTIMATE_CONCURRENCY) {
       if (signal?.aborted) {
-        for (const x of offloadedImagesToProbe.slice(i)) nativeMediaTokens += Math.ceil(x.size / 2);
+        for (const x of probeImages.slice(i)) nativeMediaTokens += Math.ceil(x.size / 2);
         break;
       }
-      const batch = offloadedImagesToProbe.slice(i, i + MEDIA_ESTIMATE_CONCURRENCY);
+      const batch = probeImages.slice(i, i + MEDIA_ESTIMATE_CONCURRENCY);
       const ests = await Promise.all(batch.map((x) => estimateOffloadedImageTokens(x.value, appHome, x.size)));
       for (const e of ests) nativeMediaTokens += e;
     }

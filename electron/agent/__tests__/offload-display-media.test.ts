@@ -401,3 +401,26 @@ describe('stripUnresolvedOffloadedMedia (R4-T2)', () => {
     expect(out[0].content[2].image).toBe('data:image/png;base64,AAAA'); // data URL untouched
   });
 });
+
+describe('rehydration per-occurrence cap (R5-F2)', () => {
+  let appHome: string;
+  beforeEach(() => { appHome = mkdtempSync(join(tmpdir(), 'kai-dup-')); });
+  afterEach(() => rmSync(appHome, { recursive: true, force: true }));
+
+  it('charges the cap per OCCURRENCE of a repeated URL (no dedup bypass)', () => {
+    // One ~4KB image offloaded, then referenced TWICE. With a cap that fits only ONE
+    // copy, exactly one occurrence must rehydrate; the other stays a URL.
+    const img = 'data:image/png;base64,' + Buffer.alloc(4096, 65).toString('base64');
+    const off = offloadTreeDisplayMedia([imageMsg('a', img)], appHome);
+    const url = ((off.tree as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>)[1].image as string;
+    const branch = [
+      { id: 'x', role: 'user', parentId: null, content: [{ type: 'image', image: url }] },
+      { id: 'y', role: 'user', parentId: null, content: [{ type: 'image', image: url }] },
+    ];
+    const out = rehydrateModelMedia(branch, appHome, 5000); // room for one 4KB copy only
+    const a = (out[0] as { content: Array<Record<string, unknown>> }).content[0].image as string;
+    const b = (out[1] as { content: Array<Record<string, unknown>> }).content[0].image as string;
+    const rehydratedCount = [a, b].filter((v) => v.startsWith('data:')).length;
+    expect(rehydratedCount).toBe(1); // NOT 2 — the second copy is charged and left a URL
+  });
+});

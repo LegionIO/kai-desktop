@@ -25,7 +25,7 @@
  * left untouched rather than throwing (a persist must never fail on bad media).
  */
 import { createHash } from 'crypto';
-import { mkdirSync, statSync, lstatSync, rmSync, realpathSync } from 'fs';
+import { mkdirSync, lstatSync, rmSync, realpathSync } from 'fs';
 import { join, sep } from 'path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -123,6 +123,10 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   if (isActiveFormat(mime)) return null;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return null;
+  // Pre-decode size gate: 4 base64 chars ≈ 3 bytes. Reject an over-cap payload from
+  // its ENCODED length BEFORE allocating the decoded buffer, so a pathological
+  // attachment can't spike main just to be rejected.
+  if (Math.floor((base64.length * 3) / 4) > MAX_MEDIA_BYTES) return null;
 
   let buf: Buffer;
   try {
@@ -144,12 +148,14 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
 
   try {
     // Reuse an existing content-addressed file only if it's a real, non-empty
-    // regular file matching the payload size — never trust a partial/zero-byte
-    // leftover from a crashed/ENOSPC write (which would let us drop the inline
-    // base64 while the on-disk copy is corrupt). Re-materialize otherwise.
+    // REGULAR file (lstat — NOT followed) matching the payload size. A symlink at the
+    // path must NOT count as reusable: statSync would follow it and we'd discard the
+    // inline bytes, but its target may be outside the media root, which the hardened
+    // serving/rehydration paths then reject → a permanently broken attachment. lstat
+    // + isFile() forces a re-materialize (atomic O_NOFOLLOW write) in that case.
     let reusable = false;
     try {
-      const st = statSync(filePath);
+      const st = lstatSync(filePath);
       reusable = st.isFile() && st.size === buf.length;
     } catch {
       /* missing → not reusable */
@@ -217,9 +223,28 @@ type LooseNode = {
   tokenCountSig?: unknown;
 } & Record<string, unknown>;
 
-/** Cheap read-only check: does any node hold an inline `data:` base64 image/file
- *  DISPLAY part? Used to decide whether a migration/offload pass is worth running
- *  (and to route it through the sanitize-first write path) WITHOUT writing any file. */
+/** Cheap eligibility check (no decode): is this value a base64 `data:` URL that
+ *  offload would actually MOVE to disk? Must match offloadBase64's criteria exactly
+ *  — excludes active/script-capable formats (kept inline for XSS safety), empty
+ *  bodies, and over-cap payloads (by encoded length) — so a migration/reload gate
+ *  built on it never churns on a value offload will reject. */
+function isOffloadableDataUrl(value: string): boolean {
+  if (!value.startsWith('data:')) return false;
+  const m = DATA_URL_RE.exec(value);
+  if (!m) return false;
+  const mime = (m[1] ?? 'application/octet-stream').trim() || 'application/octet-stream';
+  if (isActiveFormat(mime)) return false;
+  const base64 = m[2] ?? '';
+  if (base64.length === 0) return false;
+  return Math.floor((base64.length * 3) / 4) <= MAX_MEDIA_BYTES;
+}
+
+/** Cheap read-only check: does any node hold an inline base64 image/file DISPLAY
+ *  part that offload would actually move to disk? Used to decide whether a
+ *  migration/offload pass is worth running (and to route it through the sanitize-
+ *  first write path) WITHOUT writing any file. Matches offload eligibility exactly
+ *  (excludes SVG/HTML, which stay inline) so a record of only-inline-forever media
+ *  doesn't churn rewrite/reload on every read. */
 export function hasInlineBase64DisplayMedia(tree: unknown): boolean {
   if (!Array.isArray(tree)) return false;
   for (const node of tree) {
@@ -228,8 +253,8 @@ export function hasInlineBase64DisplayMedia(tree: unknown): boolean {
     for (const raw of content) {
       const p = raw as LoosePart;
       if (!p || typeof p !== 'object') continue;
-      if (p.type === 'image' && typeof p.image === 'string' && p.image.startsWith('data:')) return true;
-      if (p.type === 'file' && typeof p.data === 'string' && p.data.startsWith('data:')) return true;
+      if (p.type === 'image' && typeof p.image === 'string' && isOffloadableDataUrl(p.image)) return true;
+      if (p.type === 'file' && typeof p.data === 'string' && isOffloadableDataUrl(p.data)) return true;
     }
   }
   return false;
@@ -372,15 +397,22 @@ export function rehydrateMediaUrl(
 export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTotalBytes = REHYDRATE_TOTAL_CAP): unknown[] {
   if (!Array.isArray(messages)) return messages;
 
-  // Pass 1 (newest-first): decide which media values to materialize within budget.
-  const resolved = new Map<string, string>(); // original value → data: URL
+  // Pass 1 (newest-first): decide which specific OCCURRENCES to materialize within
+  // budget. Keyed by `mi:pi` (message index : part index), NOT by URL — pass 2 must
+  // substitute ONLY the occurrences pass 1 could afford. A repeated content-addressed
+  // URL resolves to the same data URL (cached in `resolvedData` to avoid re-reading
+  // the file), but each occurrence is CHARGED and SELECTED independently, so the Nth
+  // copy of an 11 MiB image is left as a URL once the cap can't fit it — no bypass.
+  const selected = new Set<string>(); // "mi:pi"
+  const resolvedData = new Map<string, string>(); // value → data: URL (dedup file reads)
   let budget = maxTotalBytes;
   for (let mi = messages.length - 1; mi >= 0 && budget > 0; mi--) {
     const msg = messages[mi] as { content?: unknown };
     if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) continue;
-    for (const raw of msg.content as LoosePart[]) {
+    const parts = msg.content as LoosePart[];
+    for (let pi = 0; pi < parts.length; pi++) {
       if (budget <= 0) break;
-      const part = raw as LoosePart;
+      const part = parts[pi] as LoosePart;
       if (!part || typeof part !== 'object') continue;
       const value =
         part.type === 'image' && typeof part.image === 'string'
@@ -390,43 +422,35 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
             : null;
       if (value === null) continue;
       const mime = typeof part.mimeType === 'string' ? part.mimeType : undefined;
-      // A repeated (content-addressed) value resolves to the same data URL, but pass 2
-      // substitutes it into EVERY occurrence — so it's sent N times and must be CHARGED
-      // N times against the cap (two refs to an 11 MiB image = 22 MiB on the wire). On a
-      // repeat, re-charge the already-known size; if that would exceed the budget, stop
-      // resolving (leave remaining/this occurrence as a URL) so the request stays bounded.
-      const already = resolved.get(value);
-      if (already !== undefined) {
-        const dupLen = already.length - (already.indexOf(',') + 1);
-        const dupBytes = Math.floor((dupLen * 3) / 4);
-        if (dupBytes > budget) break; // can't afford another copy → stop (older refs stay URLs)
-        budget -= dupBytes;
-        continue;
+      // Resolve (or reuse) the data URL. Pass the REMAINING budget so an over-budget
+      // file is rejected before it's read into memory (cap enforced pre-allocation).
+      let data = resolvedData.get(value);
+      if (data === undefined) {
+        const r = rehydrateMediaUrl(value, appHome, mime, budget);
+        if (!r) continue; // not resolvable (missing / over-budget / not kai-media) — leave as URL
+        data = r;
+        resolvedData.set(value, r);
       }
-      // Pass the REMAINING budget so an over-budget file is rejected before it's read
-      // into memory (the cap is enforced pre-allocation, not after).
-      const data = rehydrateMediaUrl(value, appHome, mime, budget);
-      if (!data) continue; // not a resolvable kai-media URL (or missing/over-budget) — leave as-is
       const payloadLen = data.length - (data.indexOf(',') + 1);
       const bytes = Math.floor((payloadLen * 3) / 4);
-      if (bytes > budget) continue; // defensive (probe already enforced) → leave as a URL
-      budget -= bytes;
-      resolved.set(value, data);
+      if (bytes > budget) continue; // this occurrence can't fit → leave it a URL, try older ones
+      budget -= bytes; // CHARGE per occurrence
+      selected.add(`${mi}:${pi}`);
     }
   }
-  if (resolved.size === 0) return messages;
+  if (selected.size === 0) return messages;
 
-  // Pass 2 (branch order): substitute only the values pass 1 materialized.
+  // Pass 2 (branch order): substitute ONLY the selected occurrences.
   let anyChanged = false;
-  const out = messages.map((rawMsg) => {
+  const out = messages.map((rawMsg, mi) => {
     const msg = rawMsg as { content?: unknown } & Record<string, unknown>;
     if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) return rawMsg;
     let contentChanged = false;
-    const content = (msg.content as LoosePart[]).map((raw) => {
+    const content = (msg.content as LoosePart[]).map((raw, pi) => {
       const part = raw as LoosePart;
-      if (!part || typeof part !== 'object') return raw;
+      if (!part || typeof part !== 'object' || !selected.has(`${mi}:${pi}`)) return raw;
       if (part.type === 'image' && typeof part.image === 'string') {
-        const data = resolved.get(part.image);
+        const data = resolvedData.get(part.image);
         if (data) {
           contentChanged = true;
           return { ...part, image: data };
@@ -434,7 +458,7 @@ export function rehydrateModelMedia(messages: unknown[], appHome: string, maxTot
         return raw;
       }
       if (part.type === 'file' && typeof part.data === 'string') {
-        const data = resolved.get(part.data);
+        const data = resolvedData.get(part.data);
         if (data) {
           contentChanged = true;
           return { ...part, data };

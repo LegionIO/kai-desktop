@@ -424,20 +424,26 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 
 /**
  * True if any message in `messages` still holds an inline base64 data URL in a
- * display image/file part. After a turn, the main-side write chokepoint offloads
- * these to kai-media:// URLs on disk (see electron/agent/offload-display-media.ts),
- * but the renderer's in-memory accumulator keeps the original base64. Used to
- * decide whether a post-turn reload from disk is worth an IPC round-trip: only
- * reload when there IS base64 to shed (the common no-attachment turn skips it).
+ * display image/file part THAT THE MAIN-SIDE OFFLOAD WOULD MOVE TO DISK. After a
+ * turn, the write chokepoint offloads these to kai-media:// URLs (see
+ * electron/agent/offload-display-media.ts), but the renderer's accumulator keeps the
+ * base64. Used to decide whether a post-turn reload is worth an IPC round-trip — so
+ * it must match offload eligibility: active/script-capable formats (SVG, HTML) are
+ * kept INLINE and never offloaded, so their presence must NOT trigger a (useless)
+ * reload. Only a normal base64 image/file that will actually be shed counts.
  */
+const ACTIVE_MEDIA_MIME_RE = /^data:\s*(image\/svg\+xml|text\/html|application\/xhtml\+xml)\b/i;
+function isOffloadableInlineData(value: string): boolean {
+  return value.startsWith('data:') && !ACTIVE_MEDIA_MIME_RE.test(value);
+}
 export function branchHasInlineBase64Media(messages: StoredMessage[]): boolean {
   for (const m of messages) {
     const content = (m as { content?: unknown }).content;
     if (!Array.isArray(content)) continue;
     for (const part of content) {
       const p = part as { type?: unknown; image?: unknown; data?: unknown };
-      if (p?.type === 'image' && typeof p.image === 'string' && p.image.startsWith('data:')) return true;
-      if (p?.type === 'file' && typeof p.data === 'string' && p.data.startsWith('data:')) return true;
+      if (p?.type === 'image' && typeof p.image === 'string' && isOffloadableInlineData(p.image)) return true;
+      if (p?.type === 'file' && typeof p.data === 'string' && isOffloadableInlineData(p.data)) return true;
     }
   }
   return false;
@@ -3511,6 +3517,28 @@ export function RuntimeProvider({
   // owns (it seeds + sets isRunning correctly, and the MAIN process sweeps
   // genuinely-stale flags at startup). The renderer no longer writes runStatus.
 
+  // After a GUI-owned terminal persist (done / error / max-turns), adopt the
+  // offloaded URL tree from disk so the accumulator's base64 doesn't linger in the
+  // renderer heap. Shared by every terminal branch (the base64 attachment is usually
+  // an EARLIER user node, so the onChanged tail-diff listener won't trigger a reload
+  // on its own). No-op unless the branch actually had offloadable inline media.
+  // Sequenced off the persist promise (so we never re-fetch a pre-offload snapshot),
+  // and gated on: the write COMMITTED (res.persisted), the conversation is still
+  // active, and no newer load/selection happened since the persist began (loadSeqRef).
+  const adoptOffloadedTreeAfterPersist = useCallback(
+    (convId: string, accMessages: StoredMessage[], persistPromise: ReturnType<typeof persistConversation>) => {
+      if (!branchHasInlineBase64Media(accMessages)) return;
+      const seqAtPersist = loadSeqRef.current;
+      void persistPromise.then((res) => {
+        if (res?.persisted === true && activeIdRef.current === convId && loadSeqRef.current === seqAtPersist) {
+          void loadConversationState(convId, { skipInFlightSeed: true });
+          clearFinalizedBranch(convId); // release the base64-bearing bridge (see done handler)
+        }
+      });
+    },
+    [loadConversationState],
+  );
+
   const schedulePersist = useCallback(
     (conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
       const timers = persistTimersRef.current;
@@ -5409,7 +5437,7 @@ export function RuntimeProvider({
         }
         recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
         streamAccumulators.delete(convId);
-        persistConversation(
+        const terminalPersist = persistConversation(
           convId,
           acc.messages,
           acc.headId,
@@ -5425,6 +5453,8 @@ export function RuntimeProvider({
           setIsRunning(false);
           setTree([...acc.messages]);
           setHeadId(acc.headId);
+          // Free any offloaded base64 the accumulator still holds (GUI-owned terminal).
+          adoptOffloadedTreeAfterPersist(convId, acc.messages, terminalPersist);
         }
         return;
       } else if (e.type === 'error') {
@@ -5487,7 +5517,7 @@ export function RuntimeProvider({
         }
         recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
         streamAccumulators.delete(convId);
-        persistConversation(
+        const terminalPersist = persistConversation(
           convId,
           acc.messages,
           acc.headId,
@@ -5503,6 +5533,8 @@ export function RuntimeProvider({
           setIsRunning(false);
           setTree([...acc.messages]);
           setHeadId(acc.headId);
+          // Free any offloaded base64 the accumulator still holds (GUI-owned terminal).
+          adoptOffloadedTreeAfterPersist(convId, acc.messages, terminalPersist);
         }
         return;
       } else if (e.type === 'done') {
@@ -5632,10 +5664,6 @@ export function RuntimeProvider({
           }
           recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
           streamAccumulators.delete(convId);
-          // Whether this branch carried inline base64 attachment media that the
-          // terminal persist will offload to kai-media:// URLs on disk. Captured
-          // BEFORE the persist so we can adopt the URL tree afterwards (below).
-          const hadInlineMedia = branchHasInlineBase64Media(acc.messages);
           const donePersist = persistConversation(
             convId,
             acc.messages,
@@ -5651,46 +5679,10 @@ export function RuntimeProvider({
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
-            // If the branch carried inline base64 attachment media, the persist
-            // above offloaded it to kai-media:// URLs on disk. The accumulator (and
-            // thus this setTree) still holds the heavy base64, which would otherwise
-            // sit in the renderer heap until a manual chat switch. AFTER the persist
-            // commits the URLs, reload from disk to adopt the URL tree and free the
-            // bytes. Sequenced off the persist promise so we never re-fetch a
-            // pre-offload snapshot. Gated on actually having base64 so the common
-            // no-attachment turn skips the extra conversations:get. skipInFlightSeed
-            // avoids re-seeding a stuck accumulator (mirrors the mainOwned branches).
-            if (hadInlineMedia) {
-              // Capture the load generation NOW (persist start). A chat switch or any
-              // other load bumps loadSeqRef, so if it advances before our reload fires
-              // the user has moved on and we must NOT drive a load for this (now stale)
-              // conversation over the newer selection — checking only activeIdRef is
-              // insufficient (an A→B→A flip leaves activeIdRef==A==convId while B's load
-              // is the current one). loadConversationState also self-supersedes via
-              // loadSeqRef, but gating here avoids even starting the stale load.
-              const seqAtPersist = loadSeqRef.current;
-              void donePersist.then((res) => {
-                // Adopt the offloaded URL tree from disk ONLY when the write actually
-                // COMMITTED (res.persisted). A failed ({}) or superseded persist did
-                // not update disk, so reloading would replace the just-finalized reply
-                // with stale/older content. AND only if no newer load/selection has
-                // happened since the persist began (generation unchanged) and this
-                // conversation is still active.
-                if (
-                  res?.persisted === true &&
-                  activeIdRef.current === convId &&
-                  loadSeqRef.current === seqAtPersist
-                ) {
-                  void loadConversationState(convId, { skipInFlightSeed: true });
-                  // The finalized-branch bridge holds a shallow copy of the full tree
-                  // INCLUDING the base64 we just offloaded; its 15s TTL would otherwise
-                  // pin those bytes in memory long after the reload replaced React state.
-                  // The disk copy is now authoritative (persisted) and the reload adopts
-                  // it, so the bridge's onNew-window purpose is served — release it now.
-                  clearFinalizedBranch(convId);
-                }
-              });
-            }
+            // The accumulator (and thus setTree) still holds any inline base64 the
+            // terminal persist just offloaded to kai-media:// URLs on disk — adopt the
+            // URL tree from disk to free those bytes (no-op without offloadable media).
+            adoptOffloadedTreeAfterPersist(convId, acc.messages, donePersist);
             // Update the model selector to reflect the actual model used (may differ
             // from requested if a fallback occurred during the pipeline run).
             const resolvedModel = (e.data as Record<string, unknown> | undefined)?.model as string | undefined;

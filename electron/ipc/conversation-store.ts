@@ -1057,7 +1057,17 @@ export function sanitizeConversationTree(
   appHome?: string,
 ): ConversationRecord {
   let rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
-  if (!rawTree || rawTree.length === 0) return conv;
+  if (!rawTree || rawTree.length === 0) {
+    // Legacy `messages`-only record (no messageTree — the monolith migration doesn't
+    // synthesize one). Structural sanitize has nothing to do, but its media STILL
+    // needs offloading, else exactly these legacy records keep their base64 and OOM
+    // startup. Offload the linear mirror in place before returning.
+    if (appHome && Array.isArray(conv.messages)) {
+      const msgOffload = offloadTreeDisplayMedia(conv.messages, appHome);
+      if (msgOffload.rewritten > 0) return { ...conv, messages: msgOffload.tree as unknown[] };
+    }
+    return conv;
+  }
   // Cached counts from the PREVIOUSLY-persisted tree, keyed by id, each carrying the
   // content signature the count was computed against. The backfill reuses one of
   // these (instead of re-encoding) when the incoming node's current content matches

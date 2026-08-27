@@ -1150,20 +1150,24 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           let start: number;
           let end: number;
           if (m[1] === '') {
-            // suffix range bytes=-N → last N bytes
+            // suffix range bytes=-N → last N bytes. Cap the SPAN by advancing `start`
+            // (keep the TAIL), not by lowering `end` — clients asking for `bytes=-N`
+            // want the final bytes (media/PDF metadata often lives at the end), so
+            // returning the head of the suffix would break tail seeking.
             const n = Math.min(parseInt(m[2], 10), st.size);
-            start = Math.max(0, st.size - n);
             end = st.size - 1;
+            start = Math.max(0, st.size - Math.min(n, MEDIA_RANGE_CHUNK));
           } else {
             start = parseInt(m[1], 10);
             end = m[2] === '' ? st.size - 1 : Math.min(parseInt(m[2], 10), st.size - 1);
+            // Normal range → cap the SPAN from the front (serve a bounded first chunk).
+            if (!Number.isNaN(start)) end = Math.min(end, start + MEDIA_RANGE_CHUNK - 1);
           }
           if (Number.isNaN(start) || start >= st.size || start > end) {
             res.writeHead(416, { 'Content-Range': `bytes */${st.size}`, 'Content-Type': 'text/plain' });
             res.end('Range Not Satisfiable');
             return;
           }
-          end = Math.min(end, start + MEDIA_RANGE_CHUNK - 1);
           const span = end - start + 1;
           const buf = Buffer.allocUnsafe(span);
           let off = 0;

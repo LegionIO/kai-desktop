@@ -721,13 +721,18 @@ async function stripMediaForSerialization(
   }
   // Offloaded images: header-probe for accurate dimension-based tokens (fall back to
   // the byte estimate on abort so the count still completes).
+  // Offloaded images: header-probe for accurate dimension-based tokens, BOUNDED at
+  // MEDIA_ESTIMATE_MAX (beyond it, and on abort, the cheap byte estimate) so a long
+  // history can't perform thousands of reads. Cached by content-addressed URL.
   if (appHome) {
-    for (let i = 0; i < offloadedImagesToProbe.length; i += CONCURRENCY) {
+    const probeImages = offloadedImagesToProbe.slice(0, MEDIA_ESTIMATE_MAX);
+    for (const x of offloadedImagesToProbe.slice(MEDIA_ESTIMATE_MAX)) mediaTokens += Math.ceil(x.size / 2);
+    for (let i = 0; i < probeImages.length; i += CONCURRENCY) {
       if (options.signal?.aborted) {
-        for (const x of offloadedImagesToProbe.slice(i)) mediaTokens += Math.ceil(x.size / 2);
+        for (const x of probeImages.slice(i)) mediaTokens += Math.ceil(x.size / 2);
         break;
       }
-      const batch = offloadedImagesToProbe.slice(i, i + CONCURRENCY);
+      const batch = probeImages.slice(i, i + CONCURRENCY);
       const ests = await Promise.all(batch.map((x) => estimateOffloadedImageTokens(x.value, appHome, x.size)));
       for (const e of ests) mediaTokens += e;
     }

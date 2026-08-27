@@ -1,6 +1,7 @@
 import type { BrowserWindow, NativeImage, ProcessMetric, WebContents } from 'electron';
 import { appendBoundedLog } from './main-diagnostics.js';
 import { traceDiagnostic } from './debug-trace.js';
+import { HeapSnapshotTimeoutError } from './heap-snapshot.js';
 
 const HEALTH_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 2_500;
@@ -408,6 +409,11 @@ export class WindowHealthMonitor {
   // fire while the heap is still over threshold — otherwise a failed capture would latch
   // off until the heap recovered below the hysteresis line and no snapshot is ever taken.
   private heapSnapshotRetryAfter = 0;
+  // Single-flight fence: true from the moment a capture is triggered until its bounded
+  // promise settles. Prevents a heartbeat tick (or hysteresis re-arm) from starting a
+  // second capture while one is still running — two concurrent takeHeapSnapshot on the
+  // same webContents.
+  private heapSnapshotInFlight = false;
 
   constructor(private readonly options: WindowHealthMonitorOptions) {
     this.now = options.now ?? Date.now;
@@ -516,9 +522,16 @@ export class WindowHealthMonitor {
       this.heapSnapshotRetryAfter = 0;
     }
     if (!this.heapSnapshotArmed || pct < policy.thresholdPct) return;
+    // Single-flight fence: never START a capture while one is still in flight. The
+    // heap heartbeat fires every ~Ns, and hysteresis re-arm could otherwise trigger a
+    // second capture while a slow one is mid-write — two concurrent takeHeapSnapshot
+    // on the same webContents. inFlight is set now and cleared only when the bounded
+    // capture promise SETTLES (resolve/timeout-reject), so overlapping ticks are gated.
+    if (this.heapSnapshotInFlight) return;
 
     // Latch immediately so overlapping ticks can't double-fire, then delegate.
     this.heapSnapshotArmed = false;
+    this.heapSnapshotInFlight = true;
     this.heapSnapshotRetryAfter = 0;
     this.log('renderer-heap-snapshot-triggered', {
       jsHeapUsedMB: sample.jsHeapUsedMB,
@@ -532,17 +545,39 @@ export class WindowHealthMonitor {
     // NOT re-arm the latch — without this, a single timed-out capture on a renderer
     // that then survives would permanently disable all further snapshots. The retry
     // only fires after SNAPSHOT_RETRY_COOLDOWN_MS (well past the capture timeout), by
-    // which point the abandoned native capture has settled; and its late-settler (see
-    // heap-snapshot.ts) removes any file it wrote, so a retry can't overlap a live one.
+    // which point the bounded capture has settled + cleared the in-flight fence; its
+    // late-settler (heap-snapshot.ts) removes any file the abandoned native op writes.
     const armRetry = (): void => {
       this.heapSnapshotRetryAfter = Date.now() + SNAPSHOT_RETRY_COOLDOWN_MS;
     };
+    const clearInFlight = (): void => {
+      this.heapSnapshotInFlight = false;
+    };
     try {
-      void Promise.resolve(trigger(window, sample)).catch((error) => {
-        this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
-        armRetry();
-      });
+      void Promise.resolve(trigger(window, sample))
+        .then(clearInFlight, (error) => {
+          this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+          if (error instanceof HeapSnapshotTimeoutError) {
+            // The BOUNDED wrapper rejected, but the NATIVE takeHeapSnapshot may still be
+            // running (that's the failure this fence guards). Clearing the fence now +
+            // retrying after the cooldown could start a SECOND native capture on the same
+            // webContents. So hold the fence through a native-drain window (the retry
+            // cooldown, ≫ the capture timeout) before allowing another; if the renderer is
+            // genuinely wedged it gets reloaded (attachWindow resets the fence anyway).
+            const drainTimer = setTimeout(() => {
+              clearInFlight();
+            }, SNAPSHOT_RETRY_COOLDOWN_MS);
+            (drainTimer as { unref?: () => void }).unref?.();
+            armRetry();
+            return;
+          }
+          // Non-timeout failure: the capture truly settled → clear + allow a prompt retry.
+          clearInFlight();
+          armRetry();
+        });
     } catch (error) {
+      // Synchronous throw from trigger() — the capture never became in-flight.
+      clearInFlight();
       this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
       armRetry();
     }
@@ -561,6 +596,7 @@ export class WindowHealthMonitor {
     // own snapshot until its heap first fell below hysteresis.
     this.heapSnapshotArmed = true;
     this.heapSnapshotRetryAfter = 0;
+    this.heapSnapshotInFlight = false; // fresh renderer — no capture in flight
     const contents = window.webContents;
 
     const onWindow = (event: string, listener: (...args: never[]) => void): void => {

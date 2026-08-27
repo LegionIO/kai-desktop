@@ -4387,7 +4387,11 @@ export function registerAgentHandlers(
       // pre-send hook actually EXISTS do we drop counts whose content-signature no
       // longer matches — otherwise skip the O(total-history) scan entirely so a
       // normal no-hook send keeps the integer-only fast path.
-      messages = stripDisplayOnlyParts(hookResult.messages);
+      // A pre-send/UserPromptSubmit hook returns transformed messages; if it (re)
+      // introduced a kai-media:// part, that scheme reaches no provider — strip any
+      // such leftover to an omission note (cheap, no I/O) so a hook can't smuggle an
+      // unresolved offloaded URL past the earlier rehydrate/strip boundary.
+      messages = stripUnresolvedOffloadedMedia(stripDisplayOnlyParts(hookResult.messages));
       if (pluginManager.hasPreSendHooks()) messages = invalidateStaleTokenCounts(messages);
       if (typeof hookResult.systemPrompt === 'string') {
         effectiveSystemPrompt = hookResult.systemPrompt;
@@ -4458,7 +4462,7 @@ export function registerAgentHandlers(
         // any message whose content no longer matches its signature. Only scan when
         // an enforcing UserPromptSubmit hook actually exists — otherwise skip the
         // O(total-history) work so a normal send keeps the integer-only fast path.
-        messages = stripDisplayOnlyParts(next.messages);
+        messages = stripUnresolvedOffloadedMedia(stripDisplayOnlyParts(next.messages));
         if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
           messages = invalidateStaleTokenCounts(messages);
         }
