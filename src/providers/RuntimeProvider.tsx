@@ -439,15 +439,20 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 // reload entails) for legacy media main leaves inline.
 const ACTIVE_MEDIA_MIME_RE = /^data:\s*(image\/svg\+xml|text\/html|application\/xhtml\+xml)\b/i;
 const MAX_OFFLOADABLE_MEDIA_BYTES = 512 * 1024 * 1024; // matches MAX_MEDIA_BYTES (main)
+// Standard base64 alphabet + valid padding (matches main's STRICT_BASE64_RE). We do
+// the cheap charset check but deliberately SKIP the decode round-trip main uses for
+// full canonicality: this predicate only gates a post-persist RELOAD (over-triggering
+// costs one wasted conversations:get, not correctness), and decoding a large base64
+// on the renderer hot path is exactly the work the offload avoids.
+const BASE64_CHARSET_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 function isOffloadableInlineData(value: string): boolean {
   if (!value.startsWith('data:') || ACTIVE_MEDIA_MIME_RE.test(value)) return false;
   const comma = value.indexOf(',');
   if (comma < 0) return false;
   const body = value.slice(comma + 1);
   if (body.length === 0) return false;
-  // Only base64 data URLs are offloaded (a `data:...;base64,` header); and the decoded
-  // size must be within the cap (~3/4 of the base64 length).
-  if (!/;base64/i.test(value.slice(0, comma))) return false;
+  if (!/;base64/i.test(value.slice(0, comma))) return false; // only base64 data URLs are offloaded
+  if (!BASE64_CHARSET_RE.test(body)) return false; // malformed → main leaves it inline
   return Math.floor((body.length * 3) / 4) <= MAX_OFFLOADABLE_MEDIA_BYTES;
 }
 export function branchHasInlineBase64Media(messages: StoredMessage[]): boolean {

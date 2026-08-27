@@ -647,6 +647,12 @@ protocol.registerSchemesAsPrivileged([
       secure: true,
       supportFetchAPI: true,
       stream: true,
+      // The renderer fetch()es media URLs for bounded text/PDF previews (a
+      // cross-origin request from the app origin to this scheme); without
+      // corsEnabled Chromium blocks the preflight and the preview errors. The
+      // protocol handler is read-only + path-contained + serves inert content, so
+      // exposing it to fetch is safe (parity with the plugin-renderer scheme).
+      corsEnabled: true,
     },
   },
   {

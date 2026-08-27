@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   offloadTreeDisplayMedia,
+  isCanonicalBase64,
   rehydrateModelMedia,
   rehydrateMediaUrl,
   collectReferencedMediaPaths,
@@ -445,5 +446,26 @@ describe('strict base64 validation (R6-S1)', () => {
     const clean = 'data:image/png;base64,' + Buffer.from('hello world image bytes').toString('base64');
     const { rewritten } = offloadTreeDisplayMedia([imageMsg('c', clean)], appHome);
     expect(rewritten).toBe(1);
+  });
+});
+
+describe('isCanonicalBase64 (R8: regex + round-trip)', () => {
+  it('accepts canonical, rejects non-canonical padding and bad charset', () => {
+    expect(isCanonicalBase64(Buffer.from('hello').toString('base64'))).toBe(true);
+    expect(isCanonicalBase64('AA==')).toBe(true); // canonical single zero byte
+    expect(isCanonicalBase64('AB==')).toBe(false); // non-canonical padding (trailing bits set)
+    expect(isCanonicalBase64('QUJD!!!!')).toBe(false); // out-of-alphabet
+    expect(isCanonicalBase64('')).toBe(false);
+  });
+
+  it('a non-canonical (AB==) attachment is NOT offloaded (stays inline)', () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-canon-'));
+    try {
+      const bad = 'data:image/png;base64,AB==';
+      const { rewritten } = offloadTreeDisplayMedia([imageMsg('n', bad)], appHome);
+      expect(rewritten).toBe(0);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
   });
 });

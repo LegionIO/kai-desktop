@@ -19,7 +19,7 @@ import {
   isSanitizerRetainableMedia,
 } from './media-fit.js';
 import { getMaxPartBytes, getMaxTotalBytes } from './tool-model-content.js';
-import { extForMime } from './offload-display-media.js';
+import { extForMime, isCanonicalBase64 } from './offload-display-media.js';
 import { offloadedMediaSize, estimateNativeTokensFromSize, estimateOffloadedImageTokens } from './media-fit.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
@@ -69,9 +69,6 @@ let outstandingSummarizerGenerates = 0;
  * is a transient allocation of an already-resident payload, and only occurs for a
  * not-yet-offloaded in-memory tree — a persisted tree signs the cheap URL form.
  */
-/** Canonical base64 (alphabet + valid padding) — mirrors the offloader's strict
- *  check so the identity digest is only taken for cleanly-decodable payloads. */
-const CANONICAL_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 function mediaIdentityToken(value: string): string {
   const MEDIA_PREFIX = __BRAND_MEDIA_PROTOCOL + '://';
   if (value.startsWith(MEDIA_PREFIX)) {
@@ -87,7 +84,7 @@ function mediaIdentityToken(value: string): string {
     // → two DIFFERENT malformed inline values (which the offloader leaves inline)
     // collide and a same-id edit between them could reuse a stale compaction summary.
     // Non-canonical payloads fall through to the raw-string hash below (distinct).
-    if (payload.length > 0 && CANONICAL_BASE64_RE.test(payload)) {
+    if (payload.length > 0 && isCanonicalBase64(payload)) {
       try {
         const bytes = Buffer.from(payload, 'base64');
         if (bytes.length > 0) {

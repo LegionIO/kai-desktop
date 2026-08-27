@@ -43,10 +43,25 @@ const REHYDRATE_TOTAL_CAP = 64 * 1024 * 1024;
  *  tolerates a missing/again-declared charset segment. We only offload base64
  *  data URLs (the heavy ones); a `data:...;utf8,` text URL is left as-is. */
 const DATA_URL_RE = /^data:([^;,]+)?(?:;[^,]*?)?;base64,([\s\S]*)$/;
-/** Canonical base64: groups of the standard alphabet with valid terminal padding.
- *  Buffer.from silently DROPS out-of-alphabet chars, so we validate before decoding
- *  to avoid persisting a truncated/corrupted attachment. */
+/** Standard base64 alphabet + valid terminal padding. Necessary but NOT sufficient:
+ *  `AB==` passes this yet is non-canonical (the trailing bits aren't zero), and
+ *  Buffer.from normalizes it — so callers use isCanonicalBase64 (regex + round-trip)
+ *  as the single source of truth for "cleanly, uniquely decodable". */
 const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** True iff `payload` is CANONICAL base64: correct alphabet/padding AND it round-trips
+ *  (decode → re-encode === input). The round-trip rejects non-canonical forms like
+ *  `AB==` that the regex alone accepts but Buffer.from silently normalizes — so two
+ *  distinct such values can't be treated as identical (offload / compaction-identity /
+ *  eligibility all agree). Exported as the shared predicate. */
+export function isCanonicalBase64(payload: string): boolean {
+  if (payload.length === 0 || !STRICT_BASE64_RE.test(payload)) return false;
+  try {
+    return Buffer.from(payload, 'base64').toString('base64') === payload;
+  } catch {
+    return false;
+  }
+}
 
 /** Map a decoded mime type to a media subdir + file extension. Non-media
  *  documents (PDF, text, JSON, …) go under `files/` with a type-appropriate
@@ -127,13 +142,12 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   if (isActiveFormat(mime)) return null;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return null;
-  // STRICT base64 validation: Buffer.from(x,'base64') silently DROPS invalid chars
-  // (e.g. `QUJD!!!!` decodes as if the `!!!!` weren't there), which would persist a
-  // TRUNCATED/corrupted attachment while replacing the original value. The contract is
-  // that a malformed data URL stays inline, so reject anything that isn't clean base64
-  // (canonical alphabet + valid padding) up front. Whitespace inside data URLs is not
-  // expected here (DATA_URL_RE already split the payload), so disallow it too.
-  if (!STRICT_BASE64_RE.test(base64)) return null;
+  // CANONICAL base64 only: Buffer.from silently drops invalid chars AND normalizes
+  // non-canonical padding (`QUJD!!!!` truncates, `AB==` re-encodes differently), which
+  // would persist a corrupted/ambiguous attachment while replacing the original. The
+  // contract is that any non-canonical data URL stays inline, so validate up front
+  // (regex + round-trip). Whitespace isn't expected (DATA_URL_RE split the payload).
+  if (!isCanonicalBase64(base64)) return null;
   // Pre-decode size gate: 4 base64 chars ≈ 3 bytes. Reject an over-cap payload from
   // its ENCODED length BEFORE allocating the decoded buffer, so a pathological
   // attachment can't spike main just to be rejected.
@@ -145,11 +159,7 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   } catch {
     return null;
   }
-  // Round-trip guard: even after the charset check, confirm the decode re-encodes to
-  // the SAME canonical base64 (catches any residual malformed/non-canonical padding
-  // Buffer would have silently normalized), so we never persist a corrupted subset.
   if (buf.length === 0 || buf.length > MAX_MEDIA_BYTES) return null;
-  if (buf.toString('base64') !== base64) return null;
 
   const { type, ext } = mediaTarget(mime);
   // Content-addressed filename: identical bytes → same file, so editing or
@@ -160,12 +170,29 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
   const filePath = join(dir, filename);
 
   try {
-    // Reuse an existing content-addressed file only if it's a real, non-empty
-    // REGULAR file (lstat — NOT followed) matching the payload size. A symlink at the
-    // path must NOT count as reusable: statSync would follow it and we'd discard the
-    // inline bytes, but its target may be outside the media root, which the hardened
-    // serving/rehydration paths then reject → a permanently broken attachment. lstat
-    // + isFile() forces a re-materialize (atomic O_NOFOLLOW write) in that case.
+    // Ensure the category dir exists, then confirm ITS canonical path is inside the
+    // canonical media root — BEFORE either reusing an existing file or writing a new
+    // one. A symlinked category dir (e.g. media/images -> /elsewhere) would otherwise
+    // let both paths accept/produce a URL pointing outside the root, which serving +
+    // rehydration then reject → a permanently broken attachment. Done unconditionally
+    // so the reuse path is guarded too (not just the write path). On any failure, keep
+    // the bytes inline (return null) rather than emit an unservable URL.
+    mkdirSync(dir, { recursive: true });
+    const mediaRoot = join(appHome, 'media');
+    let realDir: string;
+    let realRoot: string;
+    try {
+      realDir = realpathSync(dir);
+      realRoot = realpathSync(mediaRoot);
+    } catch {
+      return null;
+    }
+    if (realDir !== realRoot && !realDir.startsWith(realRoot + sep)) return null;
+
+    // Reuse an existing content-addressed file only if it's a real, non-empty REGULAR
+    // file (lstat — NOT followed) matching the payload size. A symlink at the leaf must
+    // NOT count as reusable (its target may be elsewhere); lstat + isFile() forces a
+    // re-materialize (atomic O_NOFOLLOW write) in that case.
     let reusable = false;
     try {
       const st = lstatSync(filePath);
@@ -174,23 +201,6 @@ function offloadBase64(dataUrl: string, appHome: string): string | null {
       /* missing → not reusable */
     }
     if (!reusable) {
-      mkdirSync(dir, { recursive: true });
-      // Guard the PARENT chain, not just the leaf: atomicWriteFileSync's O_NOFOLLOW
-      // only protects the final component, so a symlinked CATEGORY dir (e.g.
-      // media/images -> /elsewhere) would let the write escape the media root. Confirm
-      // the category dir's canonical path is inside the canonical media root before
-      // writing; otherwise skip offload (keep the bytes inline) rather than write out
-      // of tree and then serve an unreadable URL.
-      const mediaRoot = join(appHome, 'media');
-      let realDir: string;
-      let realRoot: string;
-      try {
-        realDir = realpathSync(dir);
-        realRoot = realpathSync(mediaRoot);
-      } catch {
-        return null;
-      }
-      if (realDir !== realRoot && !realDir.startsWith(realRoot + sep)) return null;
       // Atomic write: tmp sibling opened O_EXCL|O_NOFOLLOW, then rename into place.
       // A crash mid-write can never leave a partial at `filePath` (only an orphan
       // .tmp), and a symlink planted at the destination can't redirect the write.
@@ -265,7 +275,7 @@ function isOffloadableDataUrl(value: string): boolean {
   if (isActiveFormat(mime)) return false;
   const base64 = m[2] ?? '';
   if (base64.length === 0) return false;
-  if (!STRICT_BASE64_RE.test(base64)) return false; // malformed → stays inline (matches offloadBase64)
+  if (!isCanonicalBase64(base64)) return false; // non-canonical → stays inline (matches offloadBase64)
   return Math.floor((base64.length * 3) / 4) <= MAX_MEDIA_BYTES;
 }
 
