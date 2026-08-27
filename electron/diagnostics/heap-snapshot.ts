@@ -159,20 +159,58 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
   return evicted;
 }
 
+/** Thrown when a `take` call exceeds the configured timeout. Distinct so callers
+ *  can tell a HUNG capture (renderer serializing itself into an OOM, promise never
+ *  settles) apart from a normal rejection. NOT a disk-space error, so the
+ *  evict-and-retry loop correctly skips it. */
+export class HeapSnapshotTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`heap snapshot capture timed out after ${timeoutMs}ms`);
+    this.name = 'HeapSnapshotTimeoutError';
+  }
+}
+
 /**
  * Capture a renderer heap snapshot and enforce retention. `take` is the
  * Electron seam: `(filePath) => webContents.takeHeapSnapshot(filePath)`.
  * Returns the written path + size and any evicted files, or throws if the
  * capture itself failed (caller logs and re-arms).
+ *
+ * `timeoutMs` (>0) bounds each `take` call. This is essential: a renderer at
+ * the V8 heap limit dies mid-serialization, and `webContents.takeHeapSnapshot`
+ * then NEITHER resolves NOR rejects — without a timeout the await hangs forever,
+ * the caller's `.catch`/`failed`-log never runs, and a 0-byte partial is left on
+ * disk (the observed "triggered×N, captured×0, failed×0" bug). On timeout we
+ * reject with HeapSnapshotTimeoutError so the normal failure path (partial
+ * cleanup + caller re-arm) engages.
  */
 export async function captureHeapSnapshot(
   logsDir: string,
   take: (filePath: string) => Promise<void>,
   retention: HeapSnapshotRetention,
   now: Date = new Date(),
+  timeoutMs = 0,
 ): Promise<HeapSnapshotResult> {
   const dir = heapSnapshotDir(logsDir);
   mkdirSync(dir, { recursive: true });
+
+  // Bound each capture attempt. A hung takeHeapSnapshot must reject, not hang.
+  const takeBounded =
+    timeoutMs > 0
+      ? (filePath: string): Promise<void> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new HeapSnapshotTimeoutError(timeoutMs)), timeoutMs);
+            // Never let the timeout timer hold the process open on its own.
+            (timer as { unref?: () => void }).unref?.();
+          });
+          // Whichever settles first wins; clear the timer either way so a
+          // resolved capture doesn't leave a dangling handle.
+          return Promise.race([take(filePath), timeout]).finally(() => {
+            if (timer) clearTimeout(timer);
+          });
+        }
+      : take;
 
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
@@ -190,7 +228,7 @@ export async function captureHeapSnapshot(
   let captured = false;
   let firstErr: unknown;
   try {
-    await take(path);
+    await takeBounded(path);
     captured = true;
   } catch (err) {
     firstErr = err;
@@ -222,7 +260,7 @@ export async function captureHeapSnapshot(
         break; // can't free the oldest (e.g. permission) — stop rather than spin
       }
       try {
-        await take(path);
+        await takeBounded(path);
         captured = true;
       } catch (retryErr) {
         try {
@@ -255,7 +293,6 @@ export async function captureHeapSnapshot(
 
   const evicted = enforceHeapSnapshotRetention(dir, retention);
   // Report everything evicted across the retry + final passes (dedup).
-  const allEvicted =
-    evictedForRetry.length > 0 ? [...new Set([...evictedForRetry, ...evicted])] : evicted;
+  const allEvicted = evictedForRetry.length > 0 ? [...new Set([...evictedForRetry, ...evicted])] : evicted;
   return { path, bytes, evicted: allEvicted };
 }

@@ -964,6 +964,11 @@ const windowHealthMonitor = new WindowHealthMonitor({
       join(APP_HOME, 'logs'),
       (filePath) => (win as unknown as { webContents: Electron.WebContents }).webContents.takeHeapSnapshot(filePath),
       { maxCount: hs?.maxCount ?? 3, maxTotalBytes: hs?.maxTotalBytes ?? 6442450944 },
+      new Date(),
+      // Bound each capture: a renderer at the heap limit dies mid-serialization
+      // and takeHeapSnapshot then never settles — the timeout turns that hang
+      // into a reject so the failure path (partial cleanup + re-arm) runs.
+      hs?.captureTimeoutMs ?? 30000,
     );
     windowHealthMonitor.recordLifecycleEvent('renderer-heap-snapshot-captured', {
       path: result.path,

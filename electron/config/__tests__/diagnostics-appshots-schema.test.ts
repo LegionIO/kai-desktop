@@ -17,7 +17,13 @@ describe('diagnostics debug trace schema', () => {
     expect(diagnostics.memoryDiagnostics).toEqual({
       enabled: false,
       windowHealthLogMaxBytes: 10485760,
-      heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+      heapSnapshot: {
+        enabled: false,
+        thresholdPct: 85,
+        maxCount: 3,
+        maxTotalBytes: 6442450944,
+        captureTimeoutMs: 30000,
+      },
     });
   });
 
@@ -28,6 +34,7 @@ describe('diagnostics debug trace schema', () => {
       thresholdPct: 85,
       maxCount: 3,
       maxTotalBytes: 6442450944,
+      captureTimeoutMs: 30000,
     });
   });
 
@@ -37,6 +44,15 @@ describe('diagnostics debug trace schema', () => {
     ).toThrow();
     expect(() =>
       appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { thresholdPct: 100 } } }),
+    ).toThrow();
+  });
+
+  it('rejects an out-of-range heap-snapshot capture timeout', () => {
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { captureTimeoutMs: 4999 } } }),
+    ).toThrow();
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { captureTimeoutMs: 120001 } } }),
     ).toThrow();
   });
 
@@ -50,9 +66,7 @@ describe('diagnostics debug trace schema', () => {
   });
 
   it('clamps an out-of-range stallReloadMs', () => {
-    expect(() =>
-      appConfigSchema.shape.diagnostics.parse({ rendererRecovery: { stallReloadMs: 1000 } }),
-    ).toThrow();
+    expect(() => appConfigSchema.shape.diagnostics.parse({ rendererRecovery: { stallReloadMs: 1000 } })).toThrow();
     const ok = appConfigSchema.shape.diagnostics.parse({ rendererRecovery: { stallReloadMs: 60000 } });
     expect(ok.rendererRecovery.stallReloadMs).toBe(60000);
   });

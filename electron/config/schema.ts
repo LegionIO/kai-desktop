@@ -1278,13 +1278,34 @@ export const appConfigSchema = z.object({
                 .min(0)
                 .max(53687091200) // 50 GiB hard ceiling
                 .default(6442450944), // 6 GiB
+              /**
+               * Hard timeout for a single capture. A renderer at the V8 heap
+               * limit dies mid-serialization and `takeHeapSnapshot` then never
+               * resolves NOR rejects — without this bound the await hangs forever,
+               * the failure path never runs, and a 0-byte partial is left on disk.
+               * On timeout the capture rejects so cleanup + re-arm engage. Generous
+               * enough for a healthy multi-hundred-MB heap; bounded 5–120 s.
+               */
+              captureTimeoutMs: z.number().int().min(5000).max(120000).default(30000),
             })
-            .default({ enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 }),
+            .default({
+              enabled: false,
+              thresholdPct: 85,
+              maxCount: 3,
+              maxTotalBytes: 6442450944,
+              captureTimeoutMs: 30000,
+            }),
         })
         .default({
           enabled: false,
           windowHealthLogMaxBytes: 10485760,
-          heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+          heapSnapshot: {
+            enabled: false,
+            thresholdPct: 85,
+            maxCount: 3,
+            maxTotalBytes: 6442450944,
+            captureTimeoutMs: 30000,
+          },
         }),
       /**
        * Renderer crash-recovery hardening. Separate from memoryDiagnostics (that
@@ -1326,7 +1347,13 @@ export const appConfigSchema = z.object({
       memoryDiagnostics: {
         enabled: false,
         windowHealthLogMaxBytes: 10485760,
-        heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+        heapSnapshot: {
+          enabled: false,
+          thresholdPct: 85,
+          maxCount: 3,
+          maxTotalBytes: 6442450944,
+          captureTimeoutMs: 30000,
+        },
       },
       rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },
     }),

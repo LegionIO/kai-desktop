@@ -6,6 +6,7 @@ import {
   captureHeapSnapshot,
   enforceHeapSnapshotRetention,
   heapSnapshotDir,
+  HeapSnapshotTimeoutError,
   snapshotFileName,
 } from '../heap-snapshot';
 
@@ -40,14 +41,8 @@ describe('enforceHeapSnapshotRetention', () => {
 
     const evicted = enforceHeapSnapshotRetention(dir, { maxCount: 2, maxTotalBytes: 0 });
 
-    expect(evicted.sort()).toEqual([
-      'heap-20260101T000000.heapsnapshot',
-      'heap-20260101T000001.heapsnapshot',
-    ]);
-    expect(readdirSync(dir).sort()).toEqual([
-      'heap-20260101T000002.heapsnapshot',
-      'heap-20260101T000003.heapsnapshot',
-    ]);
+    expect(evicted.sort()).toEqual(['heap-20260101T000000.heapsnapshot', 'heap-20260101T000001.heapsnapshot']);
+    expect(readdirSync(dir).sort()).toEqual(['heap-20260101T000002.heapsnapshot', 'heap-20260101T000003.heapsnapshot']);
   });
 
   it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {
@@ -67,7 +62,9 @@ describe('enforceHeapSnapshotRetention', () => {
 
     // The undeletable dir remains (unlink failed), but the count sweep kept dropping the
     // NEXT-oldest real files until the on-disk count reached the cap: dir + 1 file = 2.
-    const remaining = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).sort();
+    const remaining = readdirSync(dir)
+      .filter((n) => n.endsWith('.heapsnapshot'))
+      .sort();
     expect(remaining).toEqual([
       'heap-20260101T000000.heapsnapshot', // the undeletable dir
       'heap-20260101T000003.heapsnapshot', // newest real file
@@ -89,7 +86,9 @@ describe('enforceHeapSnapshotRetention', () => {
     const evicted = enforceHeapSnapshotRetention(dir, { maxCount: 1, maxTotalBytes: 0 });
 
     expect(evicted).not.toContain('heap-20260101T000005.heapsnapshot'); // newest preserved
-    const remaining = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).sort();
+    const remaining = readdirSync(dir)
+      .filter((n) => n.endsWith('.heapsnapshot'))
+      .sort();
     expect(remaining).toContain('heap-20260101T000005.heapsnapshot');
     rmSync(unremovable, { recursive: true, force: true });
   });
@@ -230,10 +229,62 @@ describe('captureHeapSnapshot', () => {
     const take = vi.fn(async () => {
       throw new Error('takeHeapSnapshot failed');
     });
-    await expect(
-      captureHeapSnapshot(logsDir, take, { maxCount: 1, maxTotalBytes: 0 }),
-    ).rejects.toThrow(/out of space|takeHeapSnapshot failed/);
+    await expect(captureHeapSnapshot(logsDir, take, { maxCount: 1, maxTotalBytes: 0 })).rejects.toThrow(
+      /out of space|takeHeapSnapshot failed/,
+    );
     expect(take).toHaveBeenCalledTimes(1); // only 1 existing → never evicted → no retry
     expect(existsSync(sole)).toBe(true); // the sole valid snapshot is preserved
+  });
+
+  it('rejects (does not hang) when take never settles, and leaves no partial behind', async () => {
+    // The real bug: a renderer at the heap limit dies mid-serialization, so
+    // webContents.takeHeapSnapshot NEITHER resolves NOR rejects. Without a
+    // timeout the await hangs forever. With timeoutMs the capture must reject
+    // with HeapSnapshotTimeoutError so the caller's failure path runs, and the
+    // 0-byte partial must be cleaned up.
+    vi.useFakeTimers();
+    try {
+      const take = vi.fn(
+        (filePath: string) =>
+          new Promise<void>(() => {
+            // Simulate a hung capture that opened a 0-byte partial then never returns.
+            writeFileSync(filePath, Buffer.alloc(0));
+          }),
+      );
+      const promise = captureHeapSnapshot(
+        logsDir,
+        take,
+        { maxCount: 3, maxTotalBytes: 0 },
+        new Date('2026-08-06T04:20:56.000Z'),
+        5000,
+      );
+      // Attach the rejection assertion BEFORE advancing timers so the rejection
+      // is always observed (no unhandled-rejection warning).
+      const assertion = expect(promise).rejects.toBeInstanceOf(HeapSnapshotTimeoutError);
+      await vi.advanceTimersByTimeAsync(5000);
+      await assertion;
+      expect(take).toHaveBeenCalledTimes(1);
+      // No leftover heapsnapshot file (the partial was rm'd on failure).
+      const dir = heapSnapshotDir(logsDir);
+      const leftovers = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')) : [];
+      expect(leftovers).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not time out a capture that completes within the bound', async () => {
+    const take = vi.fn(async (filePath: string) => {
+      writeFileSync(filePath, Buffer.alloc(2048, 7));
+    });
+    const result = await captureHeapSnapshot(
+      logsDir,
+      take,
+      { maxCount: 3, maxTotalBytes: 0 },
+      new Date('2026-08-06T04:20:56.000Z'),
+      30000,
+    );
+    expect(result.bytes).toBe(2048);
+    expect(existsSync(result.path)).toBe(true);
   });
 });
