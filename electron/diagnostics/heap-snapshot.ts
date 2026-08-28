@@ -288,6 +288,10 @@ export async function captureHeapSnapshot(
       ? (filePath: string): Promise<void> => {
           let timer: ReturnType<typeof setTimeout> | undefined;
           let timedOut = false;
+          // "dev:ino" of the file at filePath at timeout time (our partial), or
+          // null if none exists then. cleanupLate uses it to avoid deleting a
+          // DIFFERENT file that later took the same pathname.
+          let ourPartialId: string | null = null;
           // Abort the capture on timeout so a well-behaved `take` tears down
           // (detach + close the sink) rather than leaving the native op running.
           // This is the PRIMARY cancellation path; the late-settler below is a
@@ -296,6 +300,13 @@ export async function captureHeapSnapshot(
           const timeout = new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               timedOut = true;
+              try {
+                ourPartialId = null;
+                const st = lstatSync(filePath);
+                ourPartialId = `${st.dev}:${st.ino}`;
+              } catch {
+                /* no partial on disk at timeout — nothing to identify */
+              }
               try {
                 ac.abort();
               } catch {
@@ -322,12 +333,24 @@ export async function captureHeapSnapshot(
           // the file at `filePath`. On EITHER late outcome, remove whatever it wrote so
           // no untracked file escapes retention. (Not timed-out ⇒ the race resolved
           // normally and the file is a real tracked snapshot — leave it.)
+          // Identity (dev+ino) of OUR partial, captured when the timeout fires
+          // (see the timeout callback). cleanupLate deletes the file at filePath
+          // ONLY if it still has this identity — so a DIFFERENT file created at
+          // the same pathname in the interval (e.g. a later capture that reused
+          // the timestamp+random suffix) is never wrongly removed.
           const cleanupLate = (): void => {
             if (!timedOut) return;
+            // If no partial of ours existed at timeout, there's nothing we own
+            // to remove — a file appearing later is not ours.
+            if (ourPartialId === null) return;
             try {
+              const st = lstatSync(filePath);
+              if (`${st.dev}:${st.ino}` !== ourPartialId) {
+                return; // a different file now occupies this path — not ours
+              }
               rmSync(filePath, { force: true });
             } catch {
-              /* best-effort late cleanup */
+              /* best-effort late cleanup (file already gone → nothing to do) */
             }
           };
           // Track this attempt's native promise so the caller's fence is released only

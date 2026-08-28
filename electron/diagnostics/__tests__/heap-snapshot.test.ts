@@ -353,6 +353,40 @@ describe('captureHeapSnapshot', () => {
     }
   });
 
+  it('late timeout cleanup does not delete a DIFFERENT file that took the path', async () => {
+    // After a timeout, the abandoned native settling triggers cleanupLate. If a
+    // DIFFERENT file (different inode) now occupies filePath (a later capture
+    // reused the timestamp+random suffix), cleanupLate must NOT delete it.
+    let capturedPath = '';
+    let releaseNative: (() => void) | undefined;
+    const take = vi.fn(
+      (filePath: string) =>
+        new Promise<void>((resolve) => {
+          capturedPath = filePath;
+          writeFileSync(filePath, Buffer.alloc(0)); // our partial
+          releaseNative = resolve as () => void; // settle later, AFTER we swap the file
+        }),
+    );
+    const promise = captureHeapSnapshot(
+      logsDir,
+      take,
+      { maxCount: 3, maxTotalBytes: 0 },
+      new Date('2026-08-06T04:20:56.000Z'),
+      50, // short real-timer timeout
+    );
+    const assertion = expect(promise).rejects.toBeInstanceOf(HeapSnapshotTimeoutError);
+    await assertion; // timeout fires (captures our partial's inode) + rejects
+    // Replace the file at the path with a DIFFERENT inode (rm + recreate).
+    rmSync(capturedPath, { force: true });
+    writeFileSync(capturedPath, 'REPLACEMENT');
+    // Now let the abandoned native settle → cleanupLate runs. It must see the
+    // different inode and leave the replacement alone.
+    releaseNative?.();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(capturedPath)).toBe(true);
+    expect(readFileSync(capturedPath, 'utf8')).toBe('REPLACEMENT');
+  });
+
   it('does not time out a capture that completes within the bound', async () => {
     const take = vi.fn(async (filePath: string) => {
       writeFileSync(filePath, Buffer.alloc(2048, 7));

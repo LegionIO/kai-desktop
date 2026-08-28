@@ -161,6 +161,11 @@ export function makeCdpHeapSnapshotTake(
     // An external `detach` event (DevTools opened, target closed) flips this so
     // cleanup does NOT detach a session we no longer own.
     let owned = false;
+    // Set by the external-detach handler. Distinct from `owned` because the
+    // detach event can fire DURING attach() — before we set owned=true — and we
+    // must not re-claim ownership afterward (cleanup would detach a foreign
+    // session). A one-way latch: once an external detach happened, we never own.
+    let externallyDetached = false;
     // Rejects the moment a fatal condition is recorded, so the capture flow can
     // race it against `sendCommand` and unwind IMMEDIATELY even when the native
     // command never settles after detach (the hung-capture case the timeout must
@@ -281,6 +286,7 @@ export function makeCdpHeapSnapshotTake(
       // session; do NOT re-detach it in cleanup, and treat the capture as failed.
       onDetach = () => {
         owned = false;
+        externallyDetached = true;
         setFatal(new Error('debugger detached during capture'));
       };
       dbg.on('detach', onDetach);
@@ -317,7 +323,10 @@ export function makeCdpHeapSnapshotTake(
 
       if (fatal) throw fatal;
       dbg.attach('1.3');
-      owned = true;
+      // Only claim ownership if no external detach fired DURING attach — else
+      // cleanup would detach a session we no longer own. (externallyDetached is
+      // a one-way latch set by onDetach.)
+      if (!externallyDetached) owned = true;
 
       // Re-check after attach: attaching can race a renderer teardown or a
       // late-arriving abort. NOTE: the sink is already open by now, so this is a

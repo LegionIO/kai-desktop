@@ -62,6 +62,9 @@ function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error; closeErr?: Erro
 function makeFakeDebugger(opts: {
   attached?: boolean;
   onTake?: (emitChunk: (s: string) => void, emitDetach: () => void) => Promise<void>;
+  /** Fire the 'detach' listeners synchronously from inside attach() — models a
+   *  reentrant external detach (DevTools open / target close) during attach. */
+  detachDuringAttach?: boolean;
 }): {
   dbg: CdpDebugger;
   attachCalls: () => number;
@@ -82,6 +85,7 @@ function makeFakeDebugger(opts: {
     attach() {
       state.attachCalls += 1;
       attached = true;
+      if (opts.detachDuringAttach) emitDetach();
     },
     detach() {
       state.detachCalls += 1;
@@ -197,6 +201,23 @@ describe('makeCdpHeapSnapshotTake', () => {
     expect(err).not.toBeInstanceOf(CdpCaptureUnavailableError);
     expect(String(err.message)).toMatch(/destroyed during attach/);
     expect(dbgs.detachCalls()).toBe(1); // we owned the session → detached
+  });
+
+  it('does NOT re-detach when an external detach fires DURING attach()', async () => {
+    // The detach event can arrive synchronously inside attach() (a reentrant
+    // DevTools-open / target-close). onDetach clears ownership; the post-attach
+    // `owned = true` must NOT re-claim it, or cleanup would detach a session we
+    // no longer own.
+    const fake = makeFakeSink();
+    const dbgs = makeFakeDebugger({ detachDuringAttach: true });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => fake.sink,
+      nativeSettleGraceMs: 10,
+    });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/detached/);
+    // The in-attach detach dropped ownership → we must NOT call detach() again.
+    expect(dbgs.detachCalls()).toBe(0);
   });
 
   it('detaches and rejects immediately when the sink errors mid-capture', async () => {
