@@ -506,4 +506,31 @@ describe('captureHeapSnapshot', () => {
       randomSpy.mockRestore();
     }
   });
+
+  it('DELETES our partial when a post-open error merely MENTIONS "capture unavailable" in its text', async () => {
+    // destinationNotOurs must classify by STRUCTURED fields (code/name) only —
+    // NOT loose message text. A post-open CDP/stream error whose message happens
+    // to contain "capture unavailable"/"file already exists" is still OURS (the
+    // sink was opened) and its partial must be cleaned up.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.321);
+    try {
+      const ourPath = join(dir, snapshotFileName(new Date('2026-08-06T04:20:56.000Z'), '-321'));
+      const take = vi.fn(async (filePath: string) => {
+        writeFileSync(filePath, Buffer.alloc(0)); // our 0-byte partial
+        // Plain Error, no EEXIST code, no CdpCaptureUnavailableError name — but
+        // the message coincidentally contains the old regex trigger words.
+        throw new Error('stream failed: file already exists in mirror / capture unavailable downstream');
+      });
+
+      await expect(
+        captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 }, new Date('2026-08-06T04:20:56.000Z')),
+      ).rejects.toThrow(/stream failed/);
+      // Our partial was deleted (not misclassified as "not ours").
+      expect(existsSync(ourPath)).toBe(false);
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
 });

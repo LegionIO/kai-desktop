@@ -47,19 +47,20 @@ function isDiskSpaceError(err: unknown): boolean {
 /** Whether a capture error proves the destination was NOT created by THIS
  *  attempt — so the failure-cleanup must NOT delete it (that would destroy a
  *  pre-existing same-name snapshot / symlink, or a concurrent writer's file):
- *   - EEXIST: the sink's O_CREAT|O_EXCL open refused a pre-existing path.
- *   - CdpCaptureUnavailableError: a PREFLIGHT failure (destroyed target /
+ *   - EEXIST (code): the sink's O_CREAT|O_EXCL open refused a pre-existing path.
+ *   - CdpCaptureUnavailableError (name): a PREFLIGHT failure (destroyed target /
  *     debugger already attached / aborted before start) that rejects BEFORE the
- *     sink is ever opened — so no file of ours exists at `path`, and any file
- *     that IS there is someone else's. Matched by name to avoid importing the
- *     CDP module into this policy layer. */
+ *     sink is ever opened — so no file of ours exists at `path`.
+ *  Matched by STRUCTURED fields (code / name) ONLY — never by loose message
+ *  text, which a POST-open CDP/stream error could coincidentally contain (that
+ *  would wrongly skip cleanup and leave a partial). A post-open failure must be
+ *  a plain Error with neither the EEXIST code nor that name (see
+ *  heap-snapshot-cdp.ts "destroyed during attach"). */
 function destinationNotOurs(err: unknown): boolean {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   if (code === 'EEXIST') return true;
   const name = (err as { name?: unknown } | null | undefined)?.name;
-  if (name === 'CdpCaptureUnavailableError') return true;
-  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
-  return /EEXIST|file already exists|capture unavailable/i.test(msg);
+  return name === 'CdpCaptureUnavailableError';
 }
 
 /** `~/.kai/logs/heap-snapshots` — colocated with the other diagnostic logs. */
