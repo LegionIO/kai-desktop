@@ -975,6 +975,19 @@ const windowHealthMonitor = new WindowHealthMonitor({
     // 0-byte files. The CDP path streams chunks out, so RSS does not double and
     // the capture is detach-cancellable under memory pressure.
     const webContents = (win as unknown as { webContents: Electron.WebContents }).webContents;
+    // Legacy-default migration (read-time resolver, mirroring resolveAlertSurface):
+    // existing desktop.json persists the OLD default captureTimeoutMs=30000, which
+    // deepMerge keeps over the new 120000 default — leaving upgraded users with a
+    // too-short bound that repeatedly times out large (floor-gated ≥3 GB) captures
+    // and deletes every partial. 30000 was ONLY ever the old default (never a
+    // GUI-selectable value), so treat a persisted 30000 as "use the current
+    // default". A user who explicitly sets any other value is honored.
+    const LEGACY_CAPTURE_TIMEOUT_MS = 30000;
+    const DEFAULT_CAPTURE_TIMEOUT_MS = 120000;
+    const captureTimeoutMs =
+      hs?.captureTimeoutMs === undefined || hs.captureTimeoutMs === LEGACY_CAPTURE_TIMEOUT_MS
+        ? DEFAULT_CAPTURE_TIMEOUT_MS
+        : hs.captureTimeoutMs;
     const result = await captureHeapSnapshot(
       join(APP_HOME, 'logs'),
       makeCdpHeapSnapshotTake(webContents),
@@ -983,7 +996,7 @@ const windowHealthMonitor = new WindowHealthMonitor({
       // Bound each capture: if a renderer under pressure stalls mid-capture the
       // CDP takeHeapSnapshot may not settle — the timeout turns that hang into a
       // reject so the failure path (partial cleanup + detach + re-arm) runs.
-      hs?.captureTimeoutMs ?? 120000,
+      captureTimeoutMs,
       // Release the monitor's single-flight fence exactly when the NATIVE capture
       // settles (incl. a late settle after the timeout), so a still-hung capture
       // can never overlap a retry.
