@@ -397,6 +397,12 @@ export async function captureHeapSnapshot(
           await takeBounded(path);
           captured = true;
         } catch (retryErr) {
+          // If the retry failed EEXIST, the destination pre-existed (a concurrent
+          // writer / real file / symlink) and was NOT created by us — do NOT
+          // rmSync it. EEXIST is also non-space, so surface it (stop evicting).
+          if (isFileExistsError(retryErr)) {
+            throw retryErr;
+          }
           try {
             rmSync(path, { force: true }); // drop this retry's partial before the next evict
           } catch {

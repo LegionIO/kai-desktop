@@ -421,6 +421,50 @@ describe('captureHeapSnapshot', () => {
     }
   });
 
+  it('does NOT delete the destination when a RETRY (after ENOSPC) fails EEXIST', async () => {
+    // First attempt ENOSPC → evict oldest + retry. If the retry then fails
+    // EEXIST (a concurrent writer created the path), the retry cleanup must NOT
+    // rmSync it. Provide two existing snapshots so the evict-and-retry loop runs.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    const older = join(dir, 'heap-20260806T000000.heapsnapshot');
+    const newer = join(dir, 'heap-20260806T000100.heapsnapshot');
+    writeFileSync(older, Buffer.alloc(10, 1));
+    writeFileSync(newer, Buffer.alloc(10, 1));
+    utimesSync(older, new Date(2026, 7, 6, 0, 0), new Date(2026, 7, 6, 0, 0));
+    utimesSync(newer, new Date(2026, 7, 6, 0, 1), new Date(2026, 7, 6, 0, 1));
+
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      const collidePath = join(dir, snapshotFileName(new Date('2026-08-06T04:20:56.000Z'), '-500'));
+      let attempt = 0;
+      const take = vi.fn(async () => {
+        attempt++;
+        if (attempt === 1) {
+          const e = new Error('ENOSPC: no space') as NodeJS.ErrnoException;
+          e.code = 'ENOSPC';
+          throw e;
+        }
+        // Between attempt 1 and the retry, a concurrent writer created the path.
+        // The retry's O_EXCL open (simulated) fails EEXIST — cleanup must NOT
+        // delete this concurrently-created file.
+        writeFileSync(collidePath, 'CONCURRENT');
+        const e = new Error('EEXIST: file already exists') as NodeJS.ErrnoException;
+        e.code = 'EEXIST';
+        throw e;
+      });
+
+      await expect(
+        captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 }, new Date('2026-08-06T04:20:56.000Z')),
+      ).rejects.toThrow(/EEXIST/);
+      // The concurrently-created destination survives the retry's failure cleanup.
+      expect(existsSync(collidePath)).toBe(true);
+      expect(readFileSync(collidePath, 'utf8')).toBe('CONCURRENT');
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
+
   it('refuses to capture when the snapshot dir is a symlink', async () => {
     // If `heap-snapshots` is a pre-planted symlink, dumps would land on / chmod
     // its target. captureHeapSnapshot must reject before writing anything.
