@@ -186,7 +186,10 @@ export class HeapSnapshotTimeoutError extends Error {
  */
 export async function captureHeapSnapshot(
   logsDir: string,
-  take: (filePath: string) => Promise<void>,
+  /** The capture seam. Receives the destination path and an AbortSignal that is
+   *  aborted when the bounded timeout fires — a well-behaved `take` tears its
+   *  capture down on abort (detach + close) instead of leaving it running. */
+  take: (filePath: string, signal?: AbortSignal) => Promise<void>,
   retention: HeapSnapshotRetention,
   now: Date = new Date(),
   timeoutMs = 0,
@@ -197,7 +200,9 @@ export async function captureHeapSnapshot(
   onNativeSettled?: () => void,
 ): Promise<HeapSnapshotResult> {
   const dir = heapSnapshotDir(logsDir);
-  mkdirSync(dir, { recursive: true });
+  // 0700 so heap dumps (which can contain credentials + conversation content)
+  // aren't group/world-traversable. Files themselves are written 0600 by the sink.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   // Native promises from every bounded attempt (initial + eviction/retry). The fence
   // release (onNativeSettled) waits for ALL of them so a retry can't overlap.
@@ -219,9 +224,19 @@ export async function captureHeapSnapshot(
       ? (filePath: string): Promise<void> => {
           let timer: ReturnType<typeof setTimeout> | undefined;
           let timedOut = false;
+          // Abort the capture on timeout so a well-behaved `take` tears down
+          // (detach + close the sink) rather than leaving the native op running.
+          // This is the PRIMARY cancellation path; the late-settler below is a
+          // backstop for a `take` that ignores the signal or writes anyway.
+          const ac = new AbortController();
           const timeout = new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               timedOut = true;
+              try {
+                ac.abort();
+              } catch {
+                /* best-effort */
+              }
               reject(new HeapSnapshotTimeoutError(timeoutMs));
             }, timeoutMs);
             // Never let the timeout timer hold the process open on its own.
@@ -232,7 +247,7 @@ export async function captureHeapSnapshot(
           // rejection of the raced promise rather than escaping this function — which
           // would leave `timeout` unhandled (its timer still armed) to reject later as
           // a spurious unhandled rejection.
-          const native = Promise.resolve().then(() => take(filePath));
+          const native = Promise.resolve().then(() => take(filePath, ac.signal));
           // The Promise.race abandons `native` on timeout, but the NATIVE capture keeps
           // running and may finish AFTER we've rejected + removed the partial — leaving
           // an untracked file at `filePath` outside retention. So when the timeout wins,

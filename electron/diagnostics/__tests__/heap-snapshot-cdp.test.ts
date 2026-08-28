@@ -2,46 +2,63 @@ import { describe, expect, it } from 'vitest';
 import { makeCdpHeapSnapshotTake, CdpCaptureUnavailableError } from '../heap-snapshot-cdp';
 import type { CdpCaptureTarget, CdpDebugger } from '../heap-snapshot-cdp';
 
-/** In-memory sink capturing written chunks; models the fs.WriteStream slice. */
-function makeFakeSink() {
+/** In-memory sink modeling the fs.WriteStream slice we depend on. `writeOk`
+ *  controls backpressure (false = buffer full). */
+function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error } = {}) {
   const chunks: string[] = [];
-  let errListener: ((err: Error) => void) | undefined;
+  const listeners: Record<string, Array<(err?: Error) => void>> = { error: [], drain: [], close: [] };
   let ended = false;
   let destroyed = false;
+  const emit = (event: string, err?: Error) => listeners[event]?.forEach((l) => l(err));
   return {
     chunks,
     ended: () => ended,
     destroyed: () => destroyed,
-    emitError: (err: Error) => errListener?.(err),
+    emit,
     sink: {
       write(chunk: string) {
         chunks.push(chunk);
+        return opts.writeOk ?? true;
       },
-      end(cb: () => void) {
+      end(cb: (err?: Error | null) => void) {
         ended = true;
-        cb();
+        cb(opts.endErr ?? null);
       },
       destroy() {
         destroyed = true;
+        // fs streams emit 'close' asynchronously after destroy.
+        setTimeout(() => emit('close'), 0);
       },
-      on(_event: 'error', listener: (err: Error) => void) {
-        errListener = listener;
+      on(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void) {
+        listeners[event]?.push(listener);
+      },
+      off(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void) {
+        listeners[event] = (listeners[event] ?? []).filter((l) => l !== listener);
       },
     },
   };
 }
 
-/** Fake CDP debugger. `onTakeSnapshot` drives what happens when the capture
- *  command is sent (emit chunks, resolve/reject, hang). */
-function makeFakeDebugger(opts: { attached?: boolean; onTake?: (emitChunk: (s: string) => void) => Promise<void> }): {
+/** Fake CDP debugger. `onTake` drives what happens when the capture command is
+ *  sent (emit chunks, resolve/reject, hang). */
+function makeFakeDebugger(opts: {
+  attached?: boolean;
+  onTake?: (emitChunk: (s: string) => void, emitDetach: () => void) => Promise<void>;
+}): {
   dbg: CdpDebugger;
-  attachCalls: number;
-  detachCalls: number;
+  attachCalls: () => number;
+  detachCalls: () => number;
 } {
   let attached = opts.attached ?? false;
-  let msgListener: ((event: unknown, method: string, params: unknown) => void) | undefined;
+  const msgListeners: Array<(...args: unknown[]) => void> = [];
+  const detachListeners: Array<(...args: unknown[]) => void> = [];
   const state = { attachCalls: 0, detachCalls: 0 };
-  const emitChunk = (s: string) => msgListener?.({}, 'HeapProfiler.addHeapSnapshotChunk', { chunk: s });
+  const emitChunk = (s: string) =>
+    msgListeners.forEach((l) => l({}, 'HeapProfiler.addHeapSnapshotChunk', { chunk: s }));
+  const emitDetach = () => {
+    attached = false;
+    detachListeners.forEach((l) => l({}, 'target closed'));
+  };
   const dbg: CdpDebugger = {
     isAttached: () => attached,
     attach() {
@@ -54,26 +71,25 @@ function makeFakeDebugger(opts: { attached?: boolean; onTake?: (emitChunk: (s: s
     },
     async sendCommand(method) {
       if (method === 'HeapProfiler.takeHeapSnapshot') {
-        await (opts.onTake ?? (async (emit) => emit('{"snapshot":{}}')))(emitChunk);
+        await (opts.onTake ?? (async (emit) => emit('{"snapshot":{}}')))(emitChunk, emitDetach);
       }
       return undefined;
     },
-    on(_event, listener) {
-      msgListener = listener;
+    on(event, listener) {
+      if (event === 'message') msgListeners.push(listener);
+      else if (event === 'detach') detachListeners.push(listener);
     },
-    off() {
-      msgListener = undefined;
-    },
-  };
-  return {
-    dbg,
-    get attachCalls() {
-      return state.attachCalls;
-    },
-    get detachCalls() {
-      return state.detachCalls;
+    off(event, listener) {
+      if (event === 'message') {
+        const i = msgListeners.indexOf(listener);
+        if (i >= 0) msgListeners.splice(i, 1);
+      } else if (event === 'detach') {
+        const i = detachListeners.indexOf(listener);
+        if (i >= 0) detachListeners.splice(i, 1);
+      }
     },
   };
+  return { dbg, attachCalls: () => state.attachCalls, detachCalls: () => state.detachCalls };
 }
 
 function makeTarget(dbg: CdpDebugger, destroyed = false): CdpCaptureTarget {
@@ -95,9 +111,9 @@ describe('makeCdpHeapSnapshotTake', () => {
 
     expect(fake.chunks.join('')).toBe('{"snapshot":{"meta":{}}}');
     expect(fake.ended()).toBe(true);
-    expect(dbgs.attachCalls).toBe(1);
+    expect(dbgs.attachCalls()).toBe(1);
     // Always detaches after the capture — this is the un-wedge guard.
-    expect(dbgs.detachCalls).toBe(1);
+    expect(dbgs.detachCalls()).toBe(1);
   });
 
   it('detaches even when the capture command rejects', async () => {
@@ -110,7 +126,7 @@ describe('makeCdpHeapSnapshotTake', () => {
     const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow('protocol boom');
-    expect(dbgs.detachCalls).toBe(1); // detached in finally
+    expect(dbgs.detachCalls()).toBe(1); // detached in cleanup
     expect(fake.destroyed()).toBe(true); // partial sink cleaned up
   });
 
@@ -121,8 +137,8 @@ describe('makeCdpHeapSnapshotTake', () => {
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toBeInstanceOf(CdpCaptureUnavailableError);
     // Never attach/detach a session we didn't own.
-    expect(dbgs.attachCalls).toBe(0);
-    expect(dbgs.detachCalls).toBe(0);
+    expect(dbgs.attachCalls()).toBe(0);
+    expect(dbgs.detachCalls()).toBe(0);
   });
 
   it('rejects without attaching when the target is already destroyed', async () => {
@@ -131,22 +147,98 @@ describe('makeCdpHeapSnapshotTake', () => {
     const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg, true), { createSink: () => fake.sink });
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toBeInstanceOf(CdpCaptureUnavailableError);
-    expect(dbgs.attachCalls).toBe(0);
+    expect(dbgs.attachCalls()).toBe(0);
   });
 
-  it('surfaces a stream error rather than reporting success', async () => {
+  it('detaches and rejects immediately when the sink errors mid-capture', async () => {
     const fake = makeFakeSink();
+    let detachedDuringTake = false;
     const dbgs = makeFakeDebugger({
       onTake: async (emit) => {
         emit('partial');
+        fake.emit('error', new Error('ENOSPC disk full'));
+        // A well-behaved capture is torn down by the error → by the time the
+        // command "would" continue, we should already have detached.
+      },
+    });
+    const target = makeTarget(dbgs.dbg);
+    const take = makeCdpHeapSnapshotTake(target, { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/ENOSPC/);
+    detachedDuringTake = dbgs.detachCalls() === 1;
+    expect(detachedDuringTake).toBe(true);
+  });
+
+  it('propagates an error surfaced by the end() callback', async () => {
+    const fake = makeFakeSink({ endErr: new Error('EIO final write') });
+    const dbgs = makeFakeDebugger({ onTake: async (emit) => emit('{}') });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/EIO final write/);
+    expect(dbgs.detachCalls()).toBe(1);
+  });
+
+  it('aborts (detaches) when the abort signal fires', async () => {
+    const fake = makeFakeSink();
+    const ac = new AbortController();
+    const dbgs = makeFakeDebugger({
+      onTake: async (emit) => {
+        emit('chunk-1');
+        ac.abort(); // simulate the outer timeout aborting mid-capture
+        // hang a little so the abort handler runs before we resolve
+        await new Promise((r) => setTimeout(r, 5));
       },
     });
     const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
 
-    // Fire the sink error before the take resolves.
-    const p = take('/tmp/snap.heapsnapshot');
-    fake.emitError(new Error('ENOSPC disk full'));
-    await expect(p).rejects.toThrow(/ENOSPC/);
-    expect(dbgs.detachCalls).toBe(1);
+    await expect(take('/tmp/snap.heapsnapshot', ac.signal)).rejects.toThrow(/aborted/);
+    expect(dbgs.detachCalls()).toBe(1);
+  });
+
+  it('rejects fast when the signal is already aborted', async () => {
+    const fake = makeFakeSink();
+    const dbgs = makeFakeDebugger({});
+    const ac = new AbortController();
+    ac.abort();
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot', ac.signal)).rejects.toBeInstanceOf(CdpCaptureUnavailableError);
+    expect(dbgs.attachCalls()).toBe(0);
+  });
+
+  it('aborts when sink backpressure exceeds the cap', async () => {
+    // write() always returns false (buffer full) and 'drain' never fires, so
+    // pending bytes accumulate past the small cap → capture aborts + detaches.
+    const fake = makeFakeSink({ writeOk: false });
+    const dbgs = makeFakeDebugger({
+      onTake: async (emit) => {
+        emit('x'.repeat(200));
+        emit('y'.repeat(200));
+      },
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => fake.sink,
+      maxPendingBytes: 256,
+    });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/backpressure/);
+    expect(dbgs.detachCalls()).toBe(1);
+  });
+
+  it('does not re-detach an externally-detached session', async () => {
+    const fake = makeFakeSink();
+    const dbgs = makeFakeDebugger({
+      onTake: async (emit, emitDetach) => {
+        emit('chunk');
+        emitDetach(); // DevTools opened / target closed → external detach
+        await new Promise((r) => setTimeout(r, 5));
+      },
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/detached/);
+    // The external detach already dropped the session; we must NOT call detach()
+    // ourselves (which could tear down a newer consumer's session).
+    expect(dbgs.detachCalls()).toBe(0);
   });
 });

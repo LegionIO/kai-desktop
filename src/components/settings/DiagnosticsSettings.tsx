@@ -472,9 +472,9 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           <p className="mt-1 text-[10px] text-muted-foreground">
             When the renderer heap crosses the threshold, one <span className="font-mono">.heapsnapshot</span> is
             written to <span className="font-mono">~/.kai/logs/heap-snapshots/</span> — it names the objects retaining
-            memory, which the size graph alone can’t. The snapshot is streamed to disk (via the DevTools protocol) so it
-            does not duplicate the heap in memory; it fires at most once per climb, and only when the heap is both over
-            the threshold and above the absolute floor below.
+            memory, which the size graph alone can’t. The snapshot is streamed to disk (via the DevTools protocol) so
+            the main process doesn’t buffer the whole file; it fires at most once per climb, and only when the heap is
+            both over the threshold and above the absolute floor below.
           </p>
           <div className="mt-3 grid gap-3 sm:grid-cols-3">
             <label className="text-[11px] text-muted-foreground">

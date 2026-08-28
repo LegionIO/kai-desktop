@@ -13,19 +13,23 @@
  *
  * The Chrome DevTools Protocol `HeapProfiler.takeHeapSnapshot` instead STREAMS
  * the snapshot out incrementally as `HeapProfiler.addHeapSnapshotChunk` events.
- * We append each chunk to a write stream, so no giant snapshot string is built
- * on the JS heap and the renderer's RSS does not double — an external
- * watchdog/OS memory monitor never sees a 2x spike to kill on. We attach the
- * debugger, drive the capture, and ALWAYS detach in a finally (detach is itself
- * the guard that un-wedges the renderer if anything goes wrong).
+ * We append each chunk to a write stream, honoring the stream's backpressure so
+ * the main process does not accumulate the whole snapshot in a buffer (which
+ * would just move the OOM to main). We attach the debugger, drive the capture,
+ * and ALWAYS detach — on success, on error, and on abort/timeout — because
+ * detach is what cancels an in-progress serialization and un-wedges the target.
  *
- * The serialization still executes in the target renderer's V8, so it is not
- * free — but it is incremental and interruptible (detach cancels it), which is
- * what makes it safe to run under memory pressure.
+ * IMPORTANT — this is a HARM-REDUCTION, not a guarantee: V8 still builds the
+ * snapshot graph inside the target's heap before/while streaming, so a capture
+ * on a very large heap is not free and can still add pressure. The trigger floor
+ * (window-health) keeps auto-capture rare; this module keeps a capture that DOES
+ * run from wedging the process (bounded buffer + abortable + always-detach).
  *
- * This module exposes a `take(filePath)` seam compatible with
+ * This module exposes a `take(filePath, signal?)` seam compatible with
  * {@link captureHeapSnapshot} in heap-snapshot.ts, so all the existing
- * retention / timeout / single-flight-fence policy is reused unchanged.
+ * retention / timeout / single-flight-fence policy is reused unchanged. The
+ * timeout in captureHeapSnapshot aborts `signal`, which detaches + tears down
+ * here rather than merely abandoning the promise.
  */
 import { createWriteStream } from 'fs';
 
@@ -35,8 +39,8 @@ export interface CdpDebugger {
   attach(protocolVersion?: string): void;
   detach(): void;
   sendCommand(method: string, commandParams?: Record<string, unknown>): Promise<unknown>;
-  on(event: 'message', listener: (event: unknown, method: string, params: unknown) => void): void;
-  off(event: 'message', listener: (event: unknown, method: string, params: unknown) => void): void;
+  on(event: 'message' | 'detach', listener: (...args: unknown[]) => void): void;
+  off(event: 'message' | 'detach', listener: (...args: unknown[]) => void): void;
 }
 
 /** The slice of WebContents this capturer needs. */
@@ -47,15 +51,21 @@ export interface CdpCaptureTarget {
 
 /** Node writable-stream slice we depend on (injectable for tests). */
 interface ChunkSink {
-  write(chunk: string): void;
-  end(cb: () => void): void;
+  /** Returns false when the internal buffer is full (backpressure). */
+  write(chunk: string): boolean;
+  end(cb: (err?: Error | null) => void): void;
+  /** Destroy the stream; `cb` fires on 'close'. */
   destroy(err?: Error): void;
-  on(event: 'error', listener: (err: Error) => void): void;
+  on(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void): void;
+  off?(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void): void;
 }
 
 export interface CdpCaptureDeps {
-  /** Factory for the on-disk sink. Defaults to fs.createWriteStream. */
+  /** Factory for the on-disk sink. Defaults to a 0600 fs.createWriteStream. */
   createSink?: (filePath: string) => ChunkSink;
+  /** Max bytes allowed to sit unflushed in the sink before we abort the capture
+   *  rather than let the main-process buffer grow unbounded. Default 64 MiB. */
+  maxPendingBytes?: number;
 }
 
 /**
@@ -73,26 +83,26 @@ export class CdpCaptureUnavailableError extends Error {
 }
 
 const CHUNK_EVENT = 'HeapProfiler.addHeapSnapshotChunk';
+const DEFAULT_MAX_PENDING_BYTES = 64 * 1024 * 1024;
 
 /**
- * Build a `take(filePath)` function that captures the renderer heap via CDP and
- * streams it to `filePath`. The returned function resolves when the full
- * snapshot has been flushed to disk, or rejects on any protocol/stream error.
- *
- * The debugger is attached for the duration of ONE capture and detached in a
- * finally — including when the outer timeout in captureHeapSnapshot abandons the
- * promise, because that rejection propagates through this promise's own chain
- * only after detach runs. To make abandonment safe, we also detach eagerly the
- * moment the target is seen destroyed.
+ * Build a `take(filePath, signal?)` function that captures the renderer heap via
+ * CDP and streams it to `filePath`. The returned function resolves when the full
+ * snapshot has been flushed to disk, or rejects on any protocol/stream/abort
+ * error. On EVERY exit path it removes its 'message'/'detach' listeners and
+ * detaches the debugger (when it still owns the session) — detach cancels an
+ * in-progress serialization, which is what makes an aborted/timed-out capture
+ * safe.
  */
 export function makeCdpHeapSnapshotTake(
   target: CdpCaptureTarget,
   deps: CdpCaptureDeps = {},
-): (filePath: string) => Promise<void> {
+): (filePath: string, signal?: AbortSignal) => Promise<void> {
   const createSink =
-    deps.createSink ?? ((p: string) => createWriteStream(p, { encoding: 'utf8' }) as unknown as ChunkSink);
+    deps.createSink ?? ((p: string) => createWriteStream(p, { encoding: 'utf8', mode: 0o600 }) as unknown as ChunkSink);
+  const maxPendingBytes = deps.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
 
-  return async (filePath: string): Promise<void> => {
+  return async (filePath: string, signal?: AbortSignal): Promise<void> => {
     if (target.isDestroyed()) {
       throw new CdpCaptureUnavailableError('webContents destroyed');
     }
@@ -103,11 +113,45 @@ export function makeCdpHeapSnapshotTake(
     if (dbg.isAttached()) {
       throw new CdpCaptureUnavailableError('debugger already attached');
     }
+    if (signal?.aborted) {
+      throw new CdpCaptureUnavailableError('aborted before start');
+    }
 
     let sink: ChunkSink | null = null;
-    let onMessage: ((event: unknown, method: string, params: unknown) => void) | null = null;
-    let streamError: Error | null = null;
-    let attached = false;
+    let onMessage: ((...args: unknown[]) => void) | null = null;
+    let onDetach: ((...args: unknown[]) => void) | null = null;
+    let onAbort: (() => void) | null = null;
+    // First fatal condition (stream error, backpressure overflow, abort, or an
+    // external detach). Once set, the capture is doomed → reject with it.
+    let fatal: Error | null = null;
+    // We own the debugger session only between our attach() and our detach().
+    // An external `detach` event (DevTools opened, target closed) flips this so
+    // cleanup does NOT detach a session we no longer own.
+    let owned = false;
+    // Unflushed bytes handed to the sink but not yet drained — bounded so a slow
+    // disk can't let the main-process buffer grow without limit.
+    let pendingBytes = 0;
+    // Wakes the drain waiter when the sink drains OR a fatal condition arrives.
+    let drainResolve: (() => void) | null = null;
+
+    const setFatal = (err: Error): void => {
+      if (!fatal) fatal = err;
+      // Detach IMMEDIATELY on a fatal condition so the renderer stops serializing
+      // instead of grinding until the outer timeout.
+      if (owned) {
+        owned = false;
+        try {
+          dbg.detach();
+        } catch {
+          /* best-effort */
+        }
+      }
+      if (drainResolve) {
+        const r = drainResolve;
+        drainResolve = null;
+        r();
+      }
+    };
 
     const cleanup = (): void => {
       if (onMessage) {
@@ -118,80 +162,152 @@ export function makeCdpHeapSnapshotTake(
         }
         onMessage = null;
       }
-      if (attached) {
+      if (onDetach) {
         try {
-          // detach cancels an in-progress serialization — this is what makes an
-          // abandoned/timed-out capture safe: the renderer stops serializing.
-          dbg.detach();
+          dbg.off('detach', onDetach);
         } catch {
           /* best-effort */
         }
-        attached = false;
+        onDetach = null;
       }
-      if (sink) {
+      if (onAbort && signal) {
         try {
-          sink.destroy();
+          signal.removeEventListener('abort', onAbort);
+        } catch {
+          /* best-effort */
+        }
+        onAbort = null;
+      }
+      if (owned) {
+        owned = false;
+        try {
+          dbg.detach();
         } catch {
           /* best-effort */
         }
       }
     };
 
-    try {
-      sink = createSink(filePath);
-      sink.on('error', (err) => {
-        // Capture the first stream error; surfaced after the capture flow so we
-        // reject rather than leave a truncated file looking successful.
-        if (!streamError) streamError = err instanceof Error ? err : new Error(String(err));
-      });
-
-      // Collect every snapshot chunk into the sink. Chunks arrive as
-      // { chunk: string } params on the debugger 'message' event.
-      onMessage = (_event: unknown, method: string, params: unknown): void => {
-        if (method !== CHUNK_EVENT) return;
-        const chunk = (params as { chunk?: unknown } | null | undefined)?.chunk;
-        if (typeof chunk === 'string' && sink) {
-          try {
-            sink.write(chunk);
-          } catch (err) {
-            if (!streamError) streamError = err instanceof Error ? err : new Error(String(err));
-          }
-        }
-      };
-      dbg.on('message', onMessage);
-
-      dbg.attach('1.3');
-      attached = true;
-
-      // Re-check after attach: attaching can race a renderer teardown.
-      if (target.isDestroyed()) {
-        throw new CdpCaptureUnavailableError('webContents destroyed during attach');
-      }
-
-      // Drive the capture. This resolves once the renderer has emitted all
-      // chunks. `reportProgress:false` keeps the protocol chatter minimal;
-      // `captureNumericValue`/`exposeInternals` left default (smaller snapshot).
-      await dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
-
-      if (streamError) throw streamError;
-
-      // Flush the sink and wait for the OS write to complete before reporting
-      // success — otherwise the caller stats a partially-flushed file.
-      await new Promise<void>((resolve, reject) => {
+    // Destroy the sink and wait for its 'close' so the caller's post-reject
+    // unlink can't race an async file open/flush into a zero-byte orphan.
+    const destroySinkAndClose = (): Promise<void> =>
+      new Promise<void>((resolve) => {
         const s = sink;
         if (!s) {
           resolve();
           return;
         }
-        s.end(() => {
-          if (streamError) reject(streamError);
+        sink = null;
+        let done = false;
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          resolve();
+        };
+        try {
+          s.on('close', finish);
+          s.destroy();
+        } catch {
+          finish();
+          return;
+        }
+        // Safety net: never hang forever waiting for 'close'.
+        const t = setTimeout(finish, 2000);
+        (t as { unref?: () => void }).unref?.();
+      });
+
+    try {
+      sink = createSink(filePath);
+      sink.on('error', (err) => {
+        setFatal(err instanceof Error ? err : new Error(String(err)));
+      });
+      sink.on('drain', () => {
+        pendingBytes = 0;
+        if (drainResolve) {
+          const r = drainResolve;
+          drainResolve = null;
+          r();
+        }
+      });
+
+      // Abort (timeout from captureHeapSnapshot, or caller cancel) → detach now.
+      if (signal) {
+        onAbort = () => setFatal(new Error('heap snapshot capture aborted'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      // External detach (DevTools opened, target closed) — we no longer own the
+      // session; do NOT re-detach it in cleanup, and treat the capture as failed.
+      onDetach = () => {
+        owned = false;
+        setFatal(new Error('debugger detached during capture'));
+      };
+      dbg.on('detach', onDetach);
+
+      // Collect every snapshot chunk into the sink, honoring backpressure.
+      onMessage = (...args: unknown[]): void => {
+        const method = args[1] as string | undefined;
+        const params = args[2];
+        if (method !== CHUNK_EVENT || fatal || !sink) return;
+        const chunk = (params as { chunk?: unknown } | null | undefined)?.chunk;
+        if (typeof chunk !== 'string') return;
+        try {
+          const ok = sink.write(chunk);
+          if (!ok) {
+            // Backpressure: bytes are queued in the sink until 'drain'. Track the
+            // outstanding volume and abort if it exceeds the cap rather than let
+            // the main-process buffer grow without bound.
+            pendingBytes += Buffer.byteLength(chunk, 'utf8');
+            if (pendingBytes > maxPendingBytes) {
+              setFatal(new Error(`heap snapshot sink backpressure exceeded ${maxPendingBytes} bytes`));
+            }
+          }
+        } catch (err) {
+          setFatal(err instanceof Error ? err : new Error(String(err)));
+        }
+      };
+      dbg.on('message', onMessage);
+
+      dbg.attach('1.3');
+      owned = true;
+
+      // Re-check after attach: attaching can race a renderer teardown or a
+      // late-arriving abort.
+      if (target.isDestroyed()) {
+        throw new CdpCaptureUnavailableError('webContents destroyed during attach');
+      }
+      if (fatal) throw fatal;
+
+      // Drive the capture. This resolves once the renderer has emitted all
+      // chunks. reportProgress:false keeps protocol chatter minimal.
+      await dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
+
+      if (fatal) throw fatal;
+
+      // Flush the sink and wait for the OS write to complete. end()'s callback
+      // receives any final-write error (e.g. ENOSPC) — honor it rather than
+      // reporting a partial file as success.
+      await new Promise<void>((resolve, reject) => {
+        const s = sink;
+        if (!s) {
+          reject(fatal ?? new Error('heap snapshot sink missing'));
+          return;
+        }
+        s.end((err) => {
+          if (err) reject(err instanceof Error ? err : new Error(String(err)));
+          else if (fatal) reject(fatal);
           else resolve();
         });
       });
-      // sink.end() already flushed+closed the file; don't destroy it in cleanup.
+      // end() flushed + closed the file successfully; don't destroy it below.
       sink = null;
-    } finally {
       cleanup();
+    } catch (err) {
+      cleanup();
+      // Wait for the sink to fully close before returning, so the caller's
+      // partial-file removal doesn't race a pending open/flush.
+      await destroySinkAndClose();
+      throw err instanceof Error ? err : new Error(String(err));
     }
   };
 }

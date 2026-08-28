@@ -541,6 +541,34 @@ describe('WindowHealthMonitor recovery policy', () => {
     monitor.detachWindow();
   });
 
+  it('re-arms via the floor when the heap dips below it then climbs past it again', async () => {
+    // threshold 55%, floor 3000 MB, limit 3586 MB. After a capture the heap
+    // drops to 2000 MB (56% — still ABOVE the 45% pct re-arm line, so pct alone
+    // would NOT re-arm) which is below the floor, then climbs past the floor
+    // again. The floor-based re-arm must fire a SECOND capture.
+    let usedMB = 3200;
+    let pct = 89;
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: usedMB, jsHeapLimitMB: 3586, jsHeapUsedPct: pct }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 55, triggerFloorMB: 3000 }),
+      onHeapSnapshotTrigger,
+    });
+
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    // Dip below the floor (2000 MB = 56%, above the 45% pct re-arm line).
+    usedMB = 2000;
+    pct = 56;
+    await new Promise((r) => setTimeout(r, 25));
+    // Climb past the floor again → second capture via floor re-arm.
+    usedMB = 3300;
+    pct = 92;
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(2));
+    monitor.detachWindow();
+  });
+
   it('falls back to the pct gate when used-MB is unavailable (no floor block)', async () => {
     // Hardened/non-Chromium renderer: performance.memory absent → jsHeapUsedMB
     // undefined but jsHeapUsedPct still derivable is impossible, so this exercises

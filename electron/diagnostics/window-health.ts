@@ -40,6 +40,10 @@ const MEMORY_BREAKDOWN_EVERY_N_TICKS = 5;
 // below the threshold before another snapshot can fire — prevents re-capturing
 // every tick while the heap sits pinned at/near 100%.
 const SNAPSHOT_REARM_HYSTERESIS_PCT = 10;
+// Absolute-MB counterpart to the pct hysteresis: the heap must fall this many MB
+// below the trigger floor before a floor-based re-arm. Prevents oscillation right
+// at the floor from re-firing every tick.
+const SNAPSHOT_REARM_FLOOR_MARGIN_MB = 256;
 /** Cooldown before re-arming a heap snapshot after a FAILED capture, so a persistently
  *  high heap gets retried (not latched off) without spamming attempts every heartbeat. */
 const SNAPSHOT_RETRY_COOLDOWN_MS = 60_000;
@@ -549,8 +553,19 @@ export class WindowHealthMonitor {
     if (!policy || !policy.enabled || !trigger || pct === undefined) return;
 
     const rearmBelow = Math.max(0, policy.thresholdPct - SNAPSHOT_REARM_HYSTERESIS_PCT);
-    // Re-arm once the heap has recovered well below the line.
-    if (!this.heapSnapshotArmed && pct <= rearmBelow) {
+    // Re-arm once the heap has recovered well below the line. BOTH gates
+    // (percentage AND the absolute floor) participate: a capture is blocked
+    // until used-MB is over the floor, so if the heap fell below the floor and
+    // then climbs past it again we must re-arm even when the percentage never
+    // dipped below the pct re-arm line (possible when the floor sits well under
+    // thresholdPct of a large limit). Re-arm if EITHER recovery condition holds.
+    const floorMB = policy.triggerFloorMB;
+    const rearmFloorMB =
+      floorMB !== undefined && floorMB > 0 ? Math.max(0, floorMB - SNAPSHOT_REARM_FLOOR_MARGIN_MB) : undefined;
+    const belowPctRearm = pct <= rearmBelow;
+    const belowFloorRearm =
+      rearmFloorMB !== undefined && sample.jsHeapUsedMB !== undefined && sample.jsHeapUsedMB <= rearmFloorMB;
+    if (!this.heapSnapshotArmed && (belowPctRearm || belowFloorRearm)) {
       this.heapSnapshotArmed = true;
     }
     // Re-arm after a FAILED capture's cooldown even if the heap is STILL over threshold —
@@ -567,7 +582,6 @@ export class WindowHealthMonitor {
     // one there crashed the renderer). Skip until the heap is near the real OOM
     // ceiling. When the used-MB is unknown (hardened/non-Chromium), fall back to
     // the percentage gate alone rather than blocking capture entirely.
-    const floorMB = policy.triggerFloorMB;
     if (floorMB !== undefined && floorMB > 0 && sample.jsHeapUsedMB !== undefined && sample.jsHeapUsedMB < floorMB) {
       return;
     }
