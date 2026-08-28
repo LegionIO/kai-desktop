@@ -359,11 +359,35 @@ export async function captureHeapSnapshot(
               /* best-effort late cleanup (file already gone → nothing to do) */
             }
           };
-          // Track this attempt's native promise so the caller's fence is released only
-          // after EVERY native attempt (initial + eviction/retry) has settled — not
+          // Track this attempt's native settlement so the caller's fence is released only
+          // after EVERY native attempt (initial + eviction/retry) has TRULY settled — not
           // per-attempt (which would clear the fence while the retry loop still runs a
           // capture on the same webContents). Also clean up a late-written file.
-          const settled = native.then(cleanupLate, cleanupLate);
+          //
+          // CRITICAL: `native` here is the CDP take() promise, which on the abort/timeout
+          // path returns/throws after ITS OWN bounded grace — carrying the STILL-pending
+          // real native command on `err.nativePending`. If we tracked only `native`, the
+          // tracked promise would settle at grace-expiry, NOT at true native completion,
+          // and the fence would release while the renderer's HeapProfiler.takeHeapSnapshot
+          // is still retained (→ a cooldown retry could overlap it). This bites the PRODUCTION
+          // path specifically: takeBounded's own `timeout` wins the outer Promise.race with
+          // HeapSnapshotTimeoutError (so runCapture never sees the native-pending error), but
+          // this tracked promise is the ONLY thing gating fence release. So when `native`
+          // rejects carrying a `nativePending`, CHAIN onto it — hold the fence to the real
+          // settle. cleanupLate still runs on the take()-level settle (that's when a late
+          // file could have been written / the sink torn down).
+          const settled = native.then(cleanupLate, (err) => {
+            cleanupLate();
+            const pending = nativePendingPromiseOf(err);
+            if (pending) {
+              // Swallow so an ignored nativePending never surfaces unhandled, and
+              // extend this attempt's tracked settlement until the real op finishes.
+              return pending.then(
+                () => undefined,
+                () => undefined,
+              );
+            }
+          });
           abandonedNatives.push(settled);
           // Whichever settles first wins; clear the timer in finally so a resolved
           // capture leaves no dangling handle.

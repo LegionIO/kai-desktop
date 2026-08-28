@@ -419,6 +419,66 @@ describe('captureHeapSnapshot', () => {
     expect(onNativeSettled).toHaveBeenCalledTimes(1);
   });
 
+  it('holds onNativeSettled to true native settle even when the OUTER timeout wins the race (production interleaving)', async () => {
+    // The production path always supplies a positive timeout. When it fires, the
+    // BOUNDED wrapper's own timer wins the outer Promise.race with
+    // HeapSnapshotTimeoutError BEFORE take() (the CDP seam) throws its
+    // grace-expiry HeapSnapshotNativePendingError — so runCapture's catch never
+    // sees the native-pending error. The wrapper's INTERNAL native-settlement
+    // tracking is then the only thing gating fence release, and it MUST chain onto
+    // the carried nativePending rather than settling at take()'s grace-expiry.
+    // Otherwise onNativeSettled fires while the real native op is still retained.
+    let resolveNative: (() => void) | undefined;
+    const nativePending = new Promise<void>((resolve) => {
+      resolveNative = resolve;
+    });
+    // take() ignores the abort and keeps "running" a while, then rejects with a
+    // native-pending error carrying the still-unsettled real native promise —
+    // exactly what makeCdpHeapSnapshotTake does after its own grace. It rejects
+    // AFTER the outer timeout has already fired.
+    const take = vi.fn(
+      (_filePath: string, _signal?: AbortSignal) =>
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => {
+            const err = new Error('heap snapshot native command still pending after 10ms grace') as Error & {
+              nativePending?: Promise<unknown>;
+            };
+            err.name = 'HeapSnapshotNativePendingError';
+            err.nativePending = nativePending;
+            reject(err);
+          }, 40); // > the 15ms outer timeout below, so the outer timeout wins first
+        }),
+    );
+    let settledFired = false;
+    const onNativeSettled = vi.fn(() => {
+      settledFired = true;
+    });
+
+    const capturePromise = captureHeapSnapshot(
+      logsDir,
+      take,
+      { maxCount: 3, maxTotalBytes: 0 },
+      new Date('2026-08-06T04:20:56.000Z'),
+      15, // positive timeout — the OUTER wrapper rejects with HeapSnapshotTimeoutError first
+      onNativeSettled,
+    );
+    // The outer timeout wins → captureHeapSnapshot rejects with the TIMEOUT error
+    // (not the native-pending error).
+    await expect(capturePromise).rejects.toBeInstanceOf(HeapSnapshotTimeoutError);
+    // The fence must still be HELD: take() hasn't even rejected yet, and the real
+    // native op is still pending.
+    expect(settledFired).toBe(false);
+    // Let take() reject (grace-expiry native-pending). The fence must STILL be held
+    // — the tracked settlement chains onto nativePending, which is unresolved.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(onNativeSettled).not.toHaveBeenCalled();
+    // Now the REAL native op settles → onNativeSettled finally fires.
+    resolveNative?.();
+    await nativePending;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(onNativeSettled).toHaveBeenCalledTimes(1);
+  });
+
   it('late timeout cleanup does not delete a DIFFERENT file that took the path', async () => {
     // After a timeout, the abandoned native settling triggers cleanupLate. If a
     // DIFFERENT file (different inode) now occupies filePath (a later capture
