@@ -176,7 +176,11 @@ describe('WindowHealthMonitor recovery policy', () => {
       isHeapHeartbeatEnabled?: () => boolean;
       getMaxLogBytes?: () => number;
       getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number; triggerFloorMB?: number } | null;
-      onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
+      onHeapSnapshotTrigger?: (
+        window: HealthWindow,
+        sample: RendererHeapSample,
+        onNativeSettled?: () => void,
+      ) => void | Promise<void>;
       getRendererRecoveryPolicy?: () => { reloadStalledRenderer: boolean; stallReloadMs: number } | null;
       skipLoad?: boolean;
     } = {},
@@ -479,6 +483,60 @@ describe('WindowHealthMonitor recovery policy', () => {
     pct = 60; // recover below threshold - hysteresis (85-10=75) → re-arm
     await new Promise((r) => setTimeout(r, 20));
     pct = 100; // climb again → second trigger
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(2));
+    monitor.detachWindow();
+  });
+
+  it('holds the single-flight fence when the trigger reports the native capture still pending', async () => {
+    // Deeper fence fix at the MONITOR layer: when the trigger rejects with a
+    // native-pending error (captureHeapSnapshot's take() returned after its grace
+    // but the renderer's HeapProfiler.takeHeapSnapshot is still retained), the
+    // monitor must NOT clear its single-flight fence — clearing would let cooldown
+    // start a 2nd concurrent capture. The fence is released ONLY when the native op
+    // truly settles, signalled via onNativeSettled. Model the same way the real
+    // captureHeapSnapshot behaves: reject now, invoke onNativeSettled later.
+    let pct = 100;
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: 3900, jsHeapLimitMB: 4000, jsHeapUsedPct: pct }));
+    let capturedSettle: (() => void) | undefined;
+    const onHeapSnapshotTrigger = vi.fn((_w, _s, onNativeSettled?: () => void) => {
+      capturedSettle = onNativeSettled;
+      // Reject asynchronously with a native-pending error (name-carrying, as the
+      // real CDP seam does). The monitor's catch must treat it like the timeout
+      // case: arm a retry but DO NOT clear the fence.
+      return Promise.reject(
+        Object.assign(new Error('heap snapshot native command still pending after 2000ms grace'), {
+          name: 'HeapSnapshotNativePendingError',
+          nativePending: new Promise<void>(() => {}), // still pending
+        }),
+      );
+    });
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 85 }),
+      onHeapSnapshotTrigger,
+    });
+
+    // First trigger fires and rejects native-pending.
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-heap-snapshot-failed');
+
+    // Drop the heap below the re-arm line and climb back — normally this would
+    // re-arm and fire a 2nd trigger. But the fence is HELD (native still pending),
+    // so no 2nd capture starts across many ticks.
+    pct = 60;
+    await new Promise((r) => setTimeout(r, 20));
+    pct = 100;
+    await new Promise((r) => setTimeout(r, 40)); // several ticks at 100%
+    expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1); // fence held → no 2nd capture
+
+    // The native op truly settles → fence released. A subsequent re-arm+climb can
+    // now fire a 2nd capture.
+    expect(capturedSettle).toBeTypeOf('function');
+    capturedSettle?.();
+    pct = 60;
+    await new Promise((r) => setTimeout(r, 20));
+    pct = 100;
     await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(2));
     monitor.detachWindow();
   });

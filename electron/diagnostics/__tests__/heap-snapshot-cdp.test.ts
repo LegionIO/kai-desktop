@@ -396,6 +396,51 @@ describe('makeCdpHeapSnapshotTake', () => {
     expect(fake.destroyed()).toBe(true); // sink torn down
   });
 
+  it('carries the still-pending native promise on the grace-win error so the caller can hold its fence to true settle', async () => {
+    // The deeper fence fix: when the grace wins (native still pending), take()
+    // returns promptly (no hang) BUT hands the still-unsettled native promise back
+    // on the error via `nativePending`. The caller (captureHeapSnapshot) folds it
+    // into the set it awaits before releasing the single-flight fence — so the
+    // fence survives to REAL native completion without take() blocking. Here the
+    // native settles well after the grace; the carried promise must resolve then.
+    const fake = makeFakeSink();
+    const ac = new AbortController();
+    let resolveNative: (() => void) | undefined;
+    let nativeSettled = false;
+    const dbgs = makeFakeDebugger({
+      onTake: () =>
+        new Promise<void>((resolve) => {
+          resolveNative = () => {
+            nativeSettled = true;
+            resolve();
+          };
+        }),
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => fake.sink,
+      nativeSettleGraceMs: 10, // small: the grace wins, native is still pending
+    });
+
+    const p = take('/tmp/snap.heapsnapshot', ac.signal);
+    setTimeout(() => ac.abort(), 5);
+    const err = await p.then(
+      () => {
+        throw new Error('take() should have rejected');
+      },
+      (e) => e as unknown,
+    );
+    expect(err).toBeInstanceOf(HeapSnapshotNativePendingError);
+    const pending = (err as HeapSnapshotNativePendingError).nativePending;
+    expect(pending).toBeInstanceOf(Promise);
+    // The native is still pending at throw time (grace won, not the native).
+    expect(nativeSettled).toBe(false);
+    // Settle the native now → the carried promise must resolve, which is what lets
+    // the caller release its fence at true completion.
+    resolveNative?.();
+    await expect(pending).resolves.toBeUndefined();
+    expect(nativeSettled).toBe(true);
+  });
+
   it('holds until the native command settles before rejecting on abort (fence integrity)', async () => {
     // R15: take() must NOT reject (which frees the caller's single-flight fence)
     // while the native sendCommand is still pending — a retry could then start a

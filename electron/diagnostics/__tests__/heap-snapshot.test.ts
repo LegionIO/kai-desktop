@@ -374,6 +374,51 @@ describe('captureHeapSnapshot', () => {
     expect(take).toHaveBeenCalledTimes(1); // NO retry — did not start a 2nd capture
   });
 
+  it('defers onNativeSettled until the carried native-pending promise settles (fence held to true completion)', async () => {
+    // The deeper fence fix: when take() throws a native-pending error carrying the
+    // still-unsettled native promise, captureHeapSnapshot must NOT fire
+    // onNativeSettled (which releases the monitor's single-flight fence) until that
+    // native promise actually settles — otherwise cooldown could start a 2nd
+    // concurrent capture while the first is still retained in the renderer.
+    let resolveNative: (() => void) | undefined;
+    const nativePending = new Promise<void>((resolve) => {
+      resolveNative = resolve;
+    });
+    const take = vi.fn(async () => {
+      const err = new Error('heap snapshot native command still pending after 10ms grace') as Error & {
+        nativePending?: Promise<unknown>;
+      };
+      err.name = 'HeapSnapshotNativePendingError';
+      err.nativePending = nativePending;
+      throw err;
+    });
+    let settledFired = false;
+    const onNativeSettled = vi.fn(() => {
+      settledFired = true;
+    });
+
+    const capturePromise = captureHeapSnapshot(
+      logsDir,
+      take,
+      { maxCount: 3, maxTotalBytes: 0 },
+      new Date('2026-08-06T04:20:56.000Z'),
+      0,
+      onNativeSettled,
+    );
+    // captureHeapSnapshot rejects promptly (take() didn't hang)...
+    await expect(capturePromise).rejects.toThrow(/still pending/);
+    // ...but the fence-release callback must NOT have fired yet — the native op is
+    // still pending, so the fence stays held.
+    await Promise.resolve(); // flush any microtasks
+    expect(settledFired).toBe(false);
+    expect(onNativeSettled).not.toHaveBeenCalled();
+    // Now the native op truly settles → onNativeSettled fires exactly once.
+    resolveNative?.();
+    await nativePending;
+    await new Promise((r) => setTimeout(r, 0)); // let the allSettled chain flush
+    expect(onNativeSettled).toHaveBeenCalledTimes(1);
+  });
+
   it('late timeout cleanup does not delete a DIFFERENT file that took the path', async () => {
     // After a timeout, the abandoned native settling triggers cleanupLate. If a
     // DIFFERENT file (different inode) now occupies filePath (a later capture

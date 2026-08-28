@@ -1,7 +1,7 @@
 import type { BrowserWindow, NativeImage, ProcessMetric, WebContents } from 'electron';
 import { appendBoundedLog } from './main-diagnostics.js';
 import { traceDiagnostic } from './debug-trace.js';
-import { HeapSnapshotTimeoutError } from './heap-snapshot.js';
+import { HeapSnapshotTimeoutError, nativePendingPromiseOf } from './heap-snapshot.js';
 
 const HEALTH_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 2_500;
@@ -638,6 +638,18 @@ export class WindowHealthMonitor {
           // reload's did-start-loading / attachWindow resets it + bumps the generation).
           // A retry is still armed for the persistently-high heap; the single-flight
           // fence at trigger prevents it from starting a second concurrent capture.
+          armRetry();
+          return;
+        }
+        // Native-pending rejection: captureHeapSnapshot's take() returned after its
+        // bounded grace, but the renderer's HeapProfiler.takeHeapSnapshot is STILL
+        // retained. captureHeapSnapshot has already folded that still-pending native
+        // promise into the set it awaits before firing onNativeSettled — so the fence
+        // will release on the TRUE native settle, not now. Clearing here would defeat
+        // that and let cooldown start a second concurrent capture. So do NOT clear;
+        // just arm a retry for the persistently-high heap (the fence blocks it from
+        // starting until the native op finishes). Same shape as the timeout branch.
+        if (nativePendingPromiseOf(error)) {
           armRetry();
           return;
         }

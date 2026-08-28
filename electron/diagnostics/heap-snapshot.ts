@@ -14,6 +14,12 @@
  */
 import { mkdirSync, readdirSync, statSync, rmSync, chmodSync, lstatSync } from 'fs';
 import { join } from 'path';
+import { nativePendingPromiseOf } from './heap-snapshot-cdp.js';
+
+// Re-export so consumers (window-health) can recognize a still-pending native
+// capture without importing the CDP module directly — keeps that layer's single
+// diagnostics import surface on heap-snapshot.ts.
+export { nativePendingPromiseOf } from './heap-snapshot-cdp.js';
 
 export interface HeapSnapshotRetention {
   /** Keep the newest N snapshots; evict oldest first. 0 = unlimited. */
@@ -367,6 +373,33 @@ export async function captureHeapSnapshot(
         }
       : take;
 
+  // Wrap every capture attempt so that if it rejects with an error carrying a
+  // still-pending NATIVE promise (HeapSnapshotNativePendingError from the CDP
+  // seam: take() returned after its bounded grace but the renderer's
+  // HeapProfiler.takeHeapSnapshot is STILL retained), we fold that promise into
+  // `abandonedNatives`. `notifyWhenAllNativesSettle` then waits for its TRUE
+  // settle before firing `onNativeSettled` — so the caller's single-flight fence
+  // is held until the native op actually finishes, WITHOUT take() itself hanging.
+  // This closes the fence-vs-hang tension: bounded return + fence held to real
+  // completion. Any `take` impl that doesn't carry the field is unaffected.
+  const runCapture = async (filePath: string): Promise<void> => {
+    try {
+      await takeBounded(filePath);
+    } catch (err) {
+      const pending = nativePendingPromiseOf(err);
+      if (pending) {
+        // Guard against unhandled rejection (the CDP seam pre-guards too; this is
+        // belt-and-suspenders for any other seam) and hold the fence to its settle.
+        const held = pending.then(
+          () => undefined,
+          () => undefined,
+        );
+        abandonedNatives.push(held);
+      }
+      throw err;
+    }
+  };
+
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
 
@@ -384,7 +417,7 @@ export async function captureHeapSnapshot(
   let firstErr: unknown;
   try {
     try {
-      await takeBounded(path);
+      await runCapture(path);
       captured = true;
     } catch (err) {
       firstErr = err;
@@ -423,7 +456,7 @@ export async function captureHeapSnapshot(
           break; // can't free the oldest (e.g. permission) — stop rather than spin
         }
         try {
-          await takeBounded(path);
+          await runCapture(path);
           captured = true;
         } catch (retryErr) {
           // If the retry's destination was not created by us (EEXIST from a

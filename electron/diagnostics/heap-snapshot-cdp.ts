@@ -96,12 +96,37 @@ export class CdpCaptureUnavailableError extends Error {
  * retry while the native op is still retained would run a second concurrent
  * multi-GB capture. Distinct type (not disk-space) so the evict-and-retry loop
  * skips it.
+ *
+ * Carries `nativePending`: the still-unsettled native command promise. `take()`
+ * returns promptly (bounded by the grace) so the CALLER is never blocked, but
+ * the caller's single-flight fence must not be released until the native op has
+ * TRULY settled — otherwise cooldown could start a second concurrent capture on
+ * the same renderer. captureHeapSnapshot reads this field and folds the promise
+ * into the set it awaits before firing `onNativeSettled`, so the fence is held
+ * to real completion WITHOUT `take()` hanging. The promise is pre-guarded
+ * against unhandled rejection at throw time, so a caller that ignores the field
+ * (any other `take` impl / a test) never triggers an unhandled rejection.
  */
 export class HeapSnapshotNativePendingError extends Error {
-  constructor(graceMs: number) {
+  /** The native HeapProfiler.takeHeapSnapshot promise, still unsettled when the
+   *  grace expired. Settles (resolve/reject) if/when the renderer finishes or
+   *  discards the command. */
+  readonly nativePending: Promise<unknown>;
+  constructor(graceMs: number, nativePending: Promise<unknown>) {
     super(`heap snapshot native command still pending after ${graceMs}ms grace`);
     this.name = 'HeapSnapshotNativePendingError';
+    this.nativePending = nativePending;
   }
+}
+
+/** Read a still-pending native promise carried on an error (see
+ *  {@link HeapSnapshotNativePendingError}). Returns the promise when the error
+ *  is a native-pending signal, else null. Kept as a structural check (not
+ *  `instanceof`) so the heap-snapshot.ts caller stays decoupled from the CDP
+ *  module and any `take` seam can opt in by carrying the same field. */
+export function nativePendingPromiseOf(err: unknown): Promise<unknown> | null {
+  const pending = (err as { nativePending?: unknown } | null | undefined)?.nativePending;
+  return pending && typeof (pending as { then?: unknown }).then === 'function' ? (pending as Promise<unknown>) : null;
 }
 
 const CHUNK_EVENT = 'HeapProfiler.addHeapSnapshotChunk';
@@ -445,7 +470,16 @@ export function makeCdpHeapSnapshotTake(
         ]);
       }
       if (graceWon) {
-        throw new HeapSnapshotNativePendingError(nativeSettleGraceMs);
+        // The native command is STILL pending. Rather than lose the caller's
+        // ability to hold its fence to real completion, hand the still-unsettled
+        // native promise back on the error. captureHeapSnapshot folds it into the
+        // set it awaits before releasing the single-flight fence — so the fence
+        // survives to true settle even though take() returns now. Pre-guard the
+        // promise so a caller that ignores the field never sees an unhandled
+        // rejection. `capture` is non-null here (graceWon requires it).
+        const pending = capture as Promise<unknown>;
+        pending.catch(() => {});
+        throw new HeapSnapshotNativePendingError(nativeSettleGraceMs, pending);
       }
       // Prefer the FIRST recorded fatal error over a raced/derived one: when a
       // sink ENOSPC triggers our detach, the abandoned sendCommand may reject
