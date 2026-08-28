@@ -159,10 +159,13 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
   // Harden the perms of every SURVIVING snapshot to 0600. A file written by a
   // PRIOR release (or the abandoned-native late writer) may be group/world
   // readable; heap dumps can contain credentials + conversation content, so
-  // tighten them during the sweep. Best-effort / POSIX-only.
-  for (const f of files) {
+  // tighten them during the sweep. Include `failed` (eviction-failed files that
+  // remain on disk) so a survivor isn't left too-open. Only touch REGULAR files
+  // — an eviction-failed entry could be a directory (chmod 0600 on a dir would
+  // make it untraversable). Best-effort / POSIX-only.
+  for (const f of [...files, ...failed]) {
     try {
-      chmodSync(f.path, 0o600);
+      if (statSync(f.path).isFile()) chmodSync(f.path, 0o600);
     } catch {
       /* best-effort */
     }

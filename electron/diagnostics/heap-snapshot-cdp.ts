@@ -341,18 +341,14 @@ export function makeCdpHeapSnapshotTake(
       // end()'s callback fired without error, but the stream emits 'close' just
       // after — and a close-time error (registered as fatal above) can still
       // arrive. Await close, then re-check fatal so a late failure is never
-      // reported as a successful capture. Bounded so a stream that never closes
-      // can't hang the capture.
+      // reported as a successful capture. Race fatalPromise only (NOT a silent
+      // success timeout): a silent timeout could resolve success before a
+      // late close error surfaced. The outer captureHeapSnapshot timeout aborts
+      // the signal — which rejects fatalPromise — if 'close' never arrives, so a
+      // wedged stream still can't hang this indefinitely.
       const closed = sinkClosed;
       if (closed) {
-        await Promise.race([
-          closed,
-          fatalPromise,
-          new Promise<void>((resolve) => {
-            const t = setTimeout(resolve, 2000);
-            (t as { unref?: () => void }).unref?.();
-          }),
-        ]);
+        await Promise.race([closed, fatalPromise]);
       }
       if (fatal) throw fatal;
       // Closed cleanly; nothing to destroy below.
