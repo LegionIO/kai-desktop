@@ -241,4 +241,47 @@ describe('makeCdpHeapSnapshotTake', () => {
     // ourselves (which could tear down a newer consumer's session).
     expect(dbgs.detachCalls()).toBe(0);
   });
+
+  it('rejects (does not hang) when the CDP command never settles after abort', async () => {
+    // The core R2 fix: if sendCommand never resolves NOR rejects (renderer wedged,
+    // detach doesn't settle the pending command), an abort must still unwind take()
+    // via the fatal-race — otherwise take() would stay pending forever, leaking the
+    // fd and never releasing the monitor's single-flight fence.
+    const fake = makeFakeSink();
+    const ac = new AbortController();
+    const dbgs = makeFakeDebugger({
+      onTake: () =>
+        new Promise<void>(() => {
+          // never settles
+        }),
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    const p = take('/tmp/snap.heapsnapshot', ac.signal);
+    // Abort after the capture command is in flight (and hung).
+    setTimeout(() => ac.abort(), 5);
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(dbgs.detachCalls()).toBe(1); // detached on abort
+    expect(fake.destroyed()).toBe(true); // sink torn down
+  });
+
+  it('prefers the recorded fatal (ENOSPC) over a raced detach-derived error', async () => {
+    // When the sink errors mid-capture, setFatal(ENOSPC) detaches, which may make
+    // the abandoned sendCommand reject with a generic "detached" error. take() must
+    // throw the ENOSPC (what the caller's disk-space eviction/retry keys on), not
+    // the generic one.
+    const fake = makeFakeSink();
+    const dbgs = makeFakeDebugger({
+      onTake: (emit) =>
+        new Promise<void>((_resolve, reject) => {
+          emit('partial');
+          fake.emit('error', new Error('ENOSPC no space left'));
+          // Simulate detach making the command reject with a generic error.
+          setTimeout(() => reject(new Error('target detached')), 5);
+        }),
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/ENOSPC/);
+  });
 });

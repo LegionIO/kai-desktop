@@ -133,9 +133,22 @@ export function makeCdpHeapSnapshotTake(
     let pendingBytes = 0;
     // Wakes the drain waiter when the sink drains OR a fatal condition arrives.
     let drainResolve: (() => void) | null = null;
+    // Rejects the moment a fatal condition is recorded, so the capture flow can
+    // race it against `sendCommand` and unwind IMMEDIATELY even when the native
+    // command never settles after detach (the hung-capture case the timeout must
+    // handle). Without this the flow would sit awaiting a promise that never
+    // settles, leaving take() pending forever.
+    let rejectFatal: ((err: Error) => void) | null = null;
+    const fatalPromise = new Promise<never>((_, reject) => {
+      rejectFatal = reject;
+    });
+    // Never let an unraced fatalPromise surface as an unhandled rejection (when
+    // the capture succeeds, nothing awaits it).
+    fatalPromise.catch(() => {});
 
     const setFatal = (err: Error): void => {
-      if (!fatal) fatal = err;
+      const first = !fatal;
+      if (first) fatal = err;
       // Detach IMMEDIATELY on a fatal condition so the renderer stops serializing
       // instead of grinding until the outer timeout.
       if (owned) {
@@ -150,6 +163,12 @@ export function makeCdpHeapSnapshotTake(
         const r = drainResolve;
         drainResolve = null;
         r();
+      }
+      // Reject the race promise so the awaiting capture flow unwinds now.
+      if (first && rejectFatal) {
+        const rej = rejectFatal;
+        rejectFatal = null;
+        rej(err);
       }
     };
 
@@ -234,6 +253,10 @@ export function makeCdpHeapSnapshotTake(
       if (signal) {
         onAbort = () => setFatal(new Error('heap snapshot capture aborted'));
         signal.addEventListener('abort', onAbort, { once: true });
+        // Close the race between the earlier `signal.aborted` check and adding
+        // the listener: if the abort fired in that window, the `{ once: true }`
+        // listener never runs, so re-check here and route it through setFatal.
+        if (signal.aborted) setFatal(new Error('heap snapshot capture aborted'));
       }
 
       // External detach (DevTools opened, target closed) — we no longer own the
@@ -268,6 +291,7 @@ export function makeCdpHeapSnapshotTake(
       };
       dbg.on('message', onMessage);
 
+      if (fatal) throw fatal;
       dbg.attach('1.3');
       owned = true;
 
@@ -278,27 +302,36 @@ export function makeCdpHeapSnapshotTake(
       }
       if (fatal) throw fatal;
 
-      // Drive the capture. This resolves once the renderer has emitted all
-      // chunks. reportProgress:false keeps protocol chatter minimal.
-      await dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
+      // Drive the capture. Resolves once the renderer has emitted all chunks.
+      // RACE it against fatalPromise so an abort / stream error / external detach
+      // unwinds this function IMMEDIATELY even if the native command never
+      // settles after we detach (the hung-capture case). The abandoned
+      // sendCommand's own rejection is swallowed so it never surfaces unhandled.
+      const capture = dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
+      capture.catch(() => {});
+      await Promise.race([capture, fatalPromise]);
 
       if (fatal) throw fatal;
 
       // Flush the sink and wait for the OS write to complete. end()'s callback
       // receives any final-write error (e.g. ENOSPC) — honor it rather than
-      // reporting a partial file as success.
-      await new Promise<void>((resolve, reject) => {
-        const s = sink;
-        if (!s) {
-          reject(fatal ?? new Error('heap snapshot sink missing'));
-          return;
-        }
-        s.end((err) => {
-          if (err) reject(err instanceof Error ? err : new Error(String(err)));
-          else if (fatal) reject(fatal);
-          else resolve();
-        });
-      });
+      // reporting a partial file as success. Race fatalPromise so a late error
+      // still unwinds if end() never calls back.
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          const s = sink;
+          if (!s) {
+            reject(fatal ?? new Error('heap snapshot sink missing'));
+            return;
+          }
+          s.end((err) => {
+            if (err) reject(err instanceof Error ? err : new Error(String(err)));
+            else if (fatal) reject(fatal);
+            else resolve();
+          });
+        }),
+        fatalPromise,
+      ]);
       // end() flushed + closed the file successfully; don't destroy it below.
       sink = null;
       cleanup();
@@ -307,7 +340,13 @@ export function makeCdpHeapSnapshotTake(
       // Wait for the sink to fully close before returning, so the caller's
       // partial-file removal doesn't race a pending open/flush.
       await destroySinkAndClose();
-      throw err instanceof Error ? err : new Error(String(err));
+      // Prefer the FIRST recorded fatal error over a raced/derived one: when a
+      // sink ENOSPC triggers our detach, the abandoned sendCommand may reject
+      // with a generic "target detached" error that would win the race — but the
+      // caller's disk-space eviction/retry path keys on the real ENOSPC. Throw
+      // the recorded fatal when present.
+      const toThrow = fatal ?? (err instanceof Error ? err : new Error(String(err)));
+      throw toThrow;
     }
   };
 }
