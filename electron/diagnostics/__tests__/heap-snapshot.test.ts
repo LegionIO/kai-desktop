@@ -9,6 +9,7 @@ import {
   chmodSync,
   statSync,
   symlinkSync,
+  readFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -390,5 +391,47 @@ describe('captureHeapSnapshot', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled);
     }
+  });
+
+  it('does NOT delete a pre-existing destination when take() fails EEXIST (O_EXCL collision)', async () => {
+    // The O_EXCL sink refuses a pre-existing path with EEXIST. The failure
+    // cleanup must NOT rmSync that path — it belongs to a real prior snapshot
+    // (or a symlink O_EXCL protected), not this attempt.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    // Pre-create the exact file take() will target (fixed date + we stub random).
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.123);
+    try {
+      const collidePath = join(dir, snapshotFileName(new Date('2026-08-06T04:20:56.000Z'), '-123'));
+      writeFileSync(collidePath, 'PRECIOUS');
+      const take = vi.fn(async () => {
+        const err = new Error('EEXIST: file already exists') as NodeJS.ErrnoException;
+        err.code = 'EEXIST';
+        throw err;
+      });
+
+      await expect(
+        captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 }, new Date('2026-08-06T04:20:56.000Z')),
+      ).rejects.toThrow(/EEXIST/);
+      // The pre-existing file is preserved (not deleted by failure cleanup).
+      expect(existsSync(collidePath)).toBe(true);
+      expect(readFileSync(collidePath, 'utf8')).toBe('PRECIOUS');
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
+
+  it('refuses to capture when the snapshot dir is a symlink', async () => {
+    // If `heap-snapshots` is a pre-planted symlink, dumps would land on / chmod
+    // its target. captureHeapSnapshot must reject before writing anything.
+    const realElsewhere = join(logsDir, 'elsewhere');
+    mkdirSync(realElsewhere);
+    symlinkSync(realElsewhere, heapSnapshotDir(logsDir));
+    const take = vi.fn(async (filePath: string) => writeFileSync(filePath, Buffer.alloc(10, 1)));
+
+    await expect(captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 })).rejects.toThrow(
+      /not a real directory|possible symlink/,
+    );
+    expect(take).not.toHaveBeenCalled(); // bailed before any capture
   });
 });

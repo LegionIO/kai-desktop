@@ -44,6 +44,19 @@ function isDiskSpaceError(err: unknown): boolean {
   return /ENOSPC|EDQUOT|no space|disk (is )?full|quota exceeded/i.test(msg);
 }
 
+/** Whether a capture error is the O_EXCL "path already exists" failure. When the
+ *  sink opens with O_CREAT|O_EXCL and the destination already exists (a real
+ *  snapshot from a same-second collision, or a pre-planted symlink), the open
+ *  fails EEXIST — and the destination was NOT created by this attempt, so the
+ *  failure-cleanup must NOT delete it (that would destroy exactly what O_EXCL
+ *  protected). */
+function isFileExistsError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  if (code === 'EEXIST') return true;
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return /EEXIST|file already exists/i.test(msg);
+}
+
 /** `~/.kai/logs/heap-snapshots` — colocated with the other diagnostic logs. */
 export function heapSnapshotDir(logsDir: string): string {
   return join(logsDir, 'heap-snapshots');
@@ -226,6 +239,21 @@ export async function captureHeapSnapshot(
   // 0700 so heap dumps (which can contain credentials + conversation content)
   // aren't group/world-traversable. Files themselves are written 0600 by the sink.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // The final-component O_NOFOLLOW on the sink only guards the FILE, not the
+  // snapshot DIRECTORY: if `heap-snapshots` is itself a pre-planted symlink,
+  // recursive mkdir succeeds through it and chmod/writes would land on the
+  // link's target (redirecting dumps outside the protected tree + chmodding the
+  // target). Refuse to proceed unless the dir is a REAL directory (lstat, not
+  // stat, so a symlink is rejected rather than followed).
+  let dirStat;
+  try {
+    dirStat = lstatSync(dir);
+  } catch (err) {
+    throw new Error(`heap snapshot dir is unusable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) {
+    throw new Error(`heap snapshot dir is not a real directory (possible symlink): ${dir}`);
+  }
   // mkdir's mode is create-only — a dir left 0755 by a PRIOR release keeps that
   // mode, so tighten an existing dir too (best-effort; POSIX-only).
   try {
@@ -333,7 +361,14 @@ export async function captureHeapSnapshot(
       firstErr = err;
     }
     if (!captured) {
-      // Remove the failed attempt's partial.
+      // Remove the failed attempt's partial — UNLESS the failure was EEXIST,
+      // which means our O_EXCL open refused a pre-existing destination we did
+      // NOT create; deleting it would destroy a real snapshot / the symlink
+      // O_EXCL was protecting. Surface EEXIST as-is (caller re-arms next tick
+      // with a fresh timestamp).
+      if (isFileExistsError(firstErr)) {
+        throw firstErr;
+      }
       try {
         rmSync(path, { force: true });
       } catch {
