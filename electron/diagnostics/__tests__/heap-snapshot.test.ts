@@ -8,6 +8,7 @@ import {
   mkdirSync,
   chmodSync,
   statSync,
+  symlinkSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -65,6 +66,21 @@ describe('enforceHeapSnapshotRetention', () => {
 
     const mode = statSync(join(dir, 'heap-20260101T000001.heapsnapshot')).mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+
+  it('does not chmod through a snapshot-named symlink (symlink-safety)', () => {
+    // A symlink named like a snapshot must NOT have its target chmodded — that
+    // would let anyone who can drop a symlink in the dir repoint our chmod.
+    makeSnap('heap-20260101T000000.heapsnapshot', 10, 0); // real, keeps retention non-trivial
+    const targetPath = join(dir, 'secret-target');
+    writeFileSync(targetPath, 'sensitive');
+    chmodSync(targetPath, 0o644);
+    symlinkSync(targetPath, join(dir, 'heap-20260101T000002.heapsnapshot'));
+
+    enforceHeapSnapshotRetention(dir, { maxCount: 5, maxTotalBytes: 0 });
+
+    // The symlink target keeps its original mode — lstat-guarded chmod skipped it.
+    expect(statSync(targetPath).mode & 0o777).toBe(0o644);
   });
 
   it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {

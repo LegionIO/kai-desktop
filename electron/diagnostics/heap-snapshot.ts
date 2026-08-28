@@ -12,7 +12,7 @@
  * The `takeHeapSnapshot(webContents, filePath)` seam is injected so the policy
  * (threshold, cooldown, retention sweep) is unit-testable without Electron.
  */
-import { mkdirSync, readdirSync, statSync, rmSync, chmodSync } from 'fs';
+import { mkdirSync, readdirSync, statSync, rmSync, chmodSync, lstatSync } from 'fs';
 import { join } from 'path';
 
 export interface HeapSnapshotRetention {
@@ -160,12 +160,15 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
   // PRIOR release (or the abandoned-native late writer) may be group/world
   // readable; heap dumps can contain credentials + conversation content, so
   // tighten them during the sweep. Include `failed` (eviction-failed files that
-  // remain on disk) so a survivor isn't left too-open. Only touch REGULAR files
-  // — an eviction-failed entry could be a directory (chmod 0600 on a dir would
-  // make it untraversable). Best-effort / POSIX-only.
+  // remain on disk) so a survivor isn't left too-open. Only touch REGULAR files,
+  // checked with lstat (NOT stat) so a snapshot-named SYMLINK is skipped rather
+  // than followed — chmod on a symlink target would let an attacker who can
+  // create a symlink in the dir repoint our chmod at an arbitrary file. Skips
+  // directories too (chmod 0600 on a dir would make it untraversable).
+  // Best-effort / POSIX-only.
   for (const f of [...files, ...failed]) {
     try {
-      if (statSync(f.path).isFile()) chmodSync(f.path, 0o600);
+      if (lstatSync(f.path).isFile()) chmodSync(f.path, 0o600);
     } catch {
       /* best-effort */
     }
