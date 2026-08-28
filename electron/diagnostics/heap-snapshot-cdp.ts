@@ -308,9 +308,12 @@ export function makeCdpHeapSnapshotTake(
       owned = true;
 
       // Re-check after attach: attaching can race a renderer teardown or a
-      // late-arriving abort.
+      // late-arriving abort. NOTE: the sink is already open by now, so this is a
+      // POST-OPEN failure — throw a PLAIN Error (not CdpCaptureUnavailableError,
+      // which the caller treats as "never created the file" and would skip
+      // deleting our 0-byte partial). The caller's cleanup must delete it.
       if (target.isDestroyed()) {
-        throw new CdpCaptureUnavailableError('webContents destroyed during attach');
+        throw new Error('heap snapshot capture aborted: webContents destroyed during attach');
       }
       if (fatal) throw fatal;
 

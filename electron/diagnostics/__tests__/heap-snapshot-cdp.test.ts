@@ -168,6 +168,37 @@ describe('makeCdpHeapSnapshotTake', () => {
     expect(dbgs.attachCalls()).toBe(0);
   });
 
+  it('rejects a POST-attach destruction with a PLAIN error (not CdpCaptureUnavailableError)', async () => {
+    // The sink is already open by the time we re-check isDestroyed() after
+    // attach — so this is a POST-OPEN failure and must NOT be classified as
+    // "never created the file" (which would make the caller skip deleting our
+    // 0-byte partial). It must be a plain Error, and we must detach (we owned it).
+    const fake = makeFakeSink();
+    let destroyed = false;
+    const dbgs = makeFakeDebugger({});
+    // Flip destroyed=true the moment we attach, so the post-attach check trips.
+    const target: CdpCaptureTarget = {
+      isDestroyed: () => destroyed,
+      debugger: {
+        ...dbgs.dbg,
+        attach: (v?: string) => {
+          dbgs.dbg.attach(v);
+          destroyed = true;
+        },
+      },
+    };
+    const take = makeCdpHeapSnapshotTake(target, { createSink: () => fake.sink });
+
+    const err = await take('/tmp/snap.heapsnapshot').then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(CdpCaptureUnavailableError);
+    expect(String(err.message)).toMatch(/destroyed during attach/);
+    expect(dbgs.detachCalls()).toBe(1); // we owned the session → detached
+  });
+
   it('detaches and rejects immediately when the sink errors mid-capture', async () => {
     const fake = makeFakeSink();
     let detachedDuringTake = false;
