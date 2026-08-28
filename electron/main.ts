@@ -983,7 +983,7 @@ const windowHealthMonitor = new WindowHealthMonitor({
       // Bound each capture: if a renderer under pressure stalls mid-capture the
       // CDP takeHeapSnapshot may not settle — the timeout turns that hang into a
       // reject so the failure path (partial cleanup + detach + re-arm) runs.
-      hs?.captureTimeoutMs ?? 30000,
+      hs?.captureTimeoutMs ?? 120000,
       // Release the monitor's single-flight fence exactly when the NATIVE capture
       // settles (incl. a late settle after the timeout), so a still-hung capture
       // can never overlap a retry.

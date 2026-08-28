@@ -1289,14 +1289,16 @@ export const appConfigSchema = z.object({
                 .max(53687091200) // 50 GiB hard ceiling
                 .default(6442450944), // 6 GiB
               /**
-               * Hard timeout for a single capture. A renderer at the V8 heap
-               * limit dies mid-serialization and `takeHeapSnapshot` then never
-               * resolves NOR rejects — without this bound the await hangs forever,
-               * the failure path never runs, and a 0-byte partial is left on disk.
-               * On timeout the capture rejects so cleanup + re-arm engage. Generous
-               * enough for a healthy multi-hundred-MB heap; bounded 5–120 s.
+               * Hard timeout for a single capture. A wedged capture that neither
+               * resolves nor rejects must not hang the await forever; on timeout
+               * the capture rejects so cleanup + re-arm engage. Default 120 s
+               * (the max): capture fires only at/above `triggerFloorMB` (3 GB by
+               * default), and streaming a multi-GB snapshot to disk over CDP can
+               * take well over the old 30 s — too tight a bound would repeatedly
+               * time out and delete every partial, producing NO diagnostic.
+               * Bounded 5–120 s.
                */
-              captureTimeoutMs: z.number().int().min(5000).max(120000).default(30000),
+              captureTimeoutMs: z.number().int().min(5000).max(120000).default(120000),
             })
             .default({
               enabled: false,
@@ -1304,7 +1306,7 @@ export const appConfigSchema = z.object({
               triggerFloorMB: 3000,
               maxCount: 3,
               maxTotalBytes: 6442450944,
-              captureTimeoutMs: 30000,
+              captureTimeoutMs: 120000,
             }),
         })
         .default({
@@ -1316,7 +1318,7 @@ export const appConfigSchema = z.object({
             triggerFloorMB: 3000,
             maxCount: 3,
             maxTotalBytes: 6442450944,
-            captureTimeoutMs: 30000,
+            captureTimeoutMs: 120000,
           },
         }),
       /**
@@ -1365,7 +1367,7 @@ export const appConfigSchema = z.object({
           triggerFloorMB: 3000,
           maxCount: 3,
           maxTotalBytes: 6442450944,
-          captureTimeoutMs: 30000,
+          captureTimeoutMs: 120000,
         },
       },
       rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },

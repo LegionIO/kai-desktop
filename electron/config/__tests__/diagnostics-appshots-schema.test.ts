@@ -23,7 +23,7 @@ describe('diagnostics debug trace schema', () => {
         triggerFloorMB: 3000,
         maxCount: 3,
         maxTotalBytes: 6442450944,
-        captureTimeoutMs: 30000,
+        captureTimeoutMs: 120000,
       },
     });
   });
@@ -36,7 +36,7 @@ describe('diagnostics debug trace schema', () => {
       triggerFloorMB: 3000,
       maxCount: 3,
       maxTotalBytes: 6442450944,
-      captureTimeoutMs: 30000,
+      captureTimeoutMs: 120000,
     });
   });
 
