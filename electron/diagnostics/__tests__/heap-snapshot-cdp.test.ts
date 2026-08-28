@@ -344,7 +344,9 @@ describe('makeCdpHeapSnapshotTake', () => {
     // The core R2 fix: if sendCommand never resolves NOR rejects (renderer wedged,
     // detach doesn't settle the pending command), an abort must still unwind take()
     // via the fatal-race — otherwise take() would stay pending forever, leaking the
-    // fd and never releasing the monitor's single-flight fence.
+    // fd and never releasing the monitor's single-flight fence. The native-settle
+    // grace (R15) bounds how long we hold before releasing when the command never
+    // settles; use a tiny grace here so the test is fast.
     const fake = makeFakeSink();
     const ac = new AbortController();
     const dbgs = makeFakeDebugger({
@@ -353,7 +355,10 @@ describe('makeCdpHeapSnapshotTake', () => {
           // never settles
         }),
     });
-    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => fake.sink,
+      nativeSettleGraceMs: 10,
+    });
 
     const p = take('/tmp/snap.heapsnapshot', ac.signal);
     // Abort after the capture command is in flight (and hung).
@@ -361,6 +366,36 @@ describe('makeCdpHeapSnapshotTake', () => {
     await expect(p).rejects.toThrow(/aborted/);
     expect(dbgs.detachCalls()).toBe(1); // detached on abort
     expect(fake.destroyed()).toBe(true); // sink torn down
+  });
+
+  it('holds until the native command settles before rejecting on abort (fence integrity)', async () => {
+    // R15: take() must NOT reject (which frees the caller's single-flight fence)
+    // while the native sendCommand is still pending — a retry could then start a
+    // 2nd concurrent snapshot. Here the native command settles 50ms AFTER abort;
+    // take() must not reject until then (grace is large so the command wins).
+    const fake = makeFakeSink();
+    const ac = new AbortController();
+    let nativeSettled = false;
+    const dbgs = makeFakeDebugger({
+      onTake: () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            nativeSettled = true;
+            resolve();
+          }, 50);
+        }),
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => fake.sink,
+      nativeSettleGraceMs: 2000, // large: the native settle should win, not the grace
+    });
+
+    const p = take('/tmp/snap.heapsnapshot', ac.signal);
+    setTimeout(() => ac.abort(), 5); // abort well before the native settles
+    await expect(p).rejects.toThrow(/aborted/);
+    // By the time take() rejected, the native command had actually settled — the
+    // fence was held, not released early.
+    expect(nativeSettled).toBe(true);
   });
 
   it('prefers the recorded fatal (ENOSPC) over a raced detach-derived error', async () => {

@@ -69,6 +69,10 @@ export interface CdpCaptureDeps {
   /** Max bytes allowed to sit unflushed in the sink before we abort the capture
    *  rather than let the main-process buffer grow unbounded. Default 64 MiB. */
   maxPendingBytes?: number;
+  /** Grace (ms) to wait for the native capture command to settle after detach,
+   *  on the fatal/abort path, before releasing (so the caller's single-flight
+   *  fence isn't freed while the native op is still retained). Default 2000. */
+  nativeSettleGraceMs?: number;
 }
 
 /**
@@ -119,6 +123,7 @@ export function makeCdpHeapSnapshotTake(
       return createWriteStream('', { fd, encoding: 'utf8' }) as unknown as ChunkSink;
     });
   const maxPendingBytes = deps.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
+  const nativeSettleGraceMs = deps.nativeSettleGraceMs ?? 2000;
 
   return async (filePath: string, signal?: AbortSignal): Promise<void> => {
     if (target.isDestroyed()) {
@@ -139,6 +144,13 @@ export function makeCdpHeapSnapshotTake(
     // Resolves when the sink emits 'close'. Registered at sink creation so a
     // synchronous close during destroy() is never missed.
     let sinkClosed: Promise<void> | null = null;
+    // The native HeapProfiler.takeHeapSnapshot promise, hoisted so the fatal/
+    // abort path can await ITS settlement before take() returns — otherwise the
+    // caller (captureHeapSnapshot) releases its single-flight fence while the
+    // native op is still retained in the renderer, and a retry could start a
+    // SECOND concurrent snapshot. Detach (our cancellation lever) settles it in
+    // the normal case; a bounded grace covers a truly-unkillable command.
+    let capture: Promise<unknown> | null = null;
     let onMessage: ((...args: unknown[]) => void) | null = null;
     let onDetach: ((...args: unknown[]) => void) | null = null;
     let onAbort: (() => void) | null = null;
@@ -322,9 +334,10 @@ export function makeCdpHeapSnapshotTake(
       // unwinds this function IMMEDIATELY even if the native command never
       // settles after we detach (the hung-capture case). The abandoned
       // sendCommand's own rejection is swallowed so it never surfaces unhandled.
-      const capture = dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
-      capture.catch(() => {});
-      await Promise.race([capture, fatalPromise]);
+      const capturePromise = dbg.sendCommand('HeapProfiler.takeHeapSnapshot', { reportProgress: false });
+      capture = capturePromise;
+      capturePromise.catch(() => {});
+      await Promise.race([capturePromise, fatalPromise]);
 
       if (fatal) throw fatal;
 
@@ -368,6 +381,27 @@ export function makeCdpHeapSnapshotTake(
       // Wait for the sink to fully close before returning, so the caller's
       // partial-file removal doesn't race a pending open/flush.
       await destroySinkAndClose();
+      // FENCE INTEGRITY: take() rejected via the fatalPromise race, but the
+      // native HeapProfiler.takeHeapSnapshot may still be retained in the
+      // renderer. The caller releases its single-flight fence when THIS promise
+      // settles — so do NOT settle until the native op has actually finished,
+      // or a retry could start a SECOND concurrent multi-GB snapshot. cleanup()
+      // already detached (our cancellation lever), which settles the pending
+      // command in the normal case; bound the wait so a truly-unkillable command
+      // can't hang take() forever (the fence then releases after the grace,
+      // accepting a small overlap window over an indefinite hang).
+      if (capture) {
+        await Promise.race([
+          capture.then(
+            () => undefined,
+            () => undefined,
+          ),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, nativeSettleGraceMs);
+            (t as { unref?: () => void }).unref?.();
+          }),
+        ]);
+      }
       // Prefer the FIRST recorded fatal error over a raced/derived one: when a
       // sink ENOSPC triggers our detach, the abandoned sendCommand may reject
       // with a generic "target detached" error that would win the race — but the
