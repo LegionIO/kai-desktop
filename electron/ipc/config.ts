@@ -335,6 +335,7 @@ function getDefaultConfig() {
         heapSnapshot: {
           enabled: false,
           thresholdPct: 85,
+          triggerFloorMB: 3000,
           maxCount: 3,
           maxTotalBytes: 6442450944,
           captureTimeoutMs: 30000,

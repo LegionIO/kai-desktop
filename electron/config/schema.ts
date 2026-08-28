@@ -1269,6 +1269,16 @@ export const appConfigSchema = z.object({
               enabled: z.boolean().default(false),
               /** Fire once the renderer heap is at/above this % of the V8 limit. */
               thresholdPct: z.number().int().min(50).max(99).default(85),
+              /**
+               * Absolute-MB FLOOR gating capture: a snapshot fires only when the
+               * heap is BOTH ≥ thresholdPct AND ≥ this many MB. Without a floor,
+               * slow idle drift into the 55–65% band on a large V8 limit trips a
+               * heavy capture pointlessly (and, historically, dangerously — the
+               * capture itself crashed the renderer). Set to a value close to the
+               * real OOM ceiling so only a genuine climb captures. Default 3000 MB
+               * (~84% of the typical ~3.5 GB limit). Bounded 256 MB–16 GiB.
+               */
+              triggerFloorMB: z.number().int().min(256).max(16384).default(3000),
               /** Retain the newest N snapshots (evict oldest first). 0 = unlimited. */
               maxCount: z.number().int().min(0).max(50).default(3),
               /** Cap total snapshot bytes on disk (evict oldest first). 0 = unlimited. */
@@ -1291,6 +1301,7 @@ export const appConfigSchema = z.object({
             .default({
               enabled: false,
               thresholdPct: 85,
+              triggerFloorMB: 3000,
               maxCount: 3,
               maxTotalBytes: 6442450944,
               captureTimeoutMs: 30000,
@@ -1302,6 +1313,7 @@ export const appConfigSchema = z.object({
           heapSnapshot: {
             enabled: false,
             thresholdPct: 85,
+            triggerFloorMB: 3000,
             maxCount: 3,
             maxTotalBytes: 6442450944,
             captureTimeoutMs: 30000,
@@ -1350,6 +1362,7 @@ export const appConfigSchema = z.object({
         heapSnapshot: {
           enabled: false,
           thresholdPct: 85,
+          triggerFloorMB: 3000,
           maxCount: 3,
           maxTotalBytes: 6442450944,
           captureTimeoutMs: 30000,

@@ -20,6 +20,7 @@ describe('diagnostics debug trace schema', () => {
       heapSnapshot: {
         enabled: false,
         thresholdPct: 85,
+        triggerFloorMB: 3000,
         maxCount: 3,
         maxTotalBytes: 6442450944,
         captureTimeoutMs: 30000,
@@ -32,6 +33,7 @@ describe('diagnostics debug trace schema', () => {
     expect(diagnostics.memoryDiagnostics.heapSnapshot).toEqual({
       enabled: false,
       thresholdPct: 85,
+      triggerFloorMB: 3000,
       maxCount: 3,
       maxTotalBytes: 6442450944,
       captureTimeoutMs: 30000,
@@ -54,6 +56,22 @@ describe('diagnostics debug trace schema', () => {
     expect(() =>
       appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { captureTimeoutMs: 120001 } } }),
     ).toThrow();
+  });
+
+  it('rejects an out-of-range heap-snapshot trigger floor', () => {
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { triggerFloorMB: 255 } } }),
+    ).toThrow();
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { triggerFloorMB: 16385 } } }),
+    ).toThrow();
+  });
+
+  it('accepts a custom in-range heap-snapshot trigger floor', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse({
+      memoryDiagnostics: { heapSnapshot: { triggerFloorMB: 2500 } },
+    });
+    expect(diagnostics.memoryDiagnostics.heapSnapshot.triggerFloorMB).toBe(2500);
   });
 
   it('defaults renderer recovery to stalled-reload on / 30s / gpu-hardening off', () => {

@@ -30,6 +30,12 @@ const HEAP_PRESSURE_USED_PCT = 90;
 // trajectory approaching the next abort is always on disk. 60s balances signal
 // density against the cost of a trivial executeJavaScript round-trip.
 const HEAP_HEARTBEAT_INTERVAL_MS = 60_000;
+// Emit the heavier per-process memory breakdown every Nth heartbeat (not every
+// tick — a full app-metrics snapshot each minute would bloat window-health.log).
+// At the 60s heartbeat this is every ~5 min, dense enough to attribute a
+// multi-hour idle heap climb to a specific process (renderer vs a plugin
+// utility) without dominating the log.
+const MEMORY_BREAKDOWN_EVERY_N_TICKS = 5;
 // Once a snapshot fires at thresholdPct, the heap must fall this many points
 // below the threshold before another snapshot can fire — prevents re-capturing
 // every tick while the heap sits pinned at/near 100%.
@@ -101,7 +107,7 @@ export interface WindowHealthMonitorOptions {
    * (minus hysteresis) — so a heap wedged at 100% captures ONE snapshot, not one
    * per tick. Read per tick so the GUI toggle applies without a relaunch.
    */
-  getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number } | null;
+  getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number; triggerFloorMB?: number } | null;
   /**
    * Invoked (fire-and-forget) when the heartbeat decides a snapshot is due. The
    * monitor passes the attached window; main.ts performs the actual capture +
@@ -326,6 +332,12 @@ export interface RendererHeapSample {
   jsHeapTotalMB?: number;
   jsHeapLimitMB?: number;
   jsHeapUsedPct?: number;
+  /** Total DOM nodes in the document — a leak that never releases old chat
+   *  turns/images shows up here as a monotonic climb even while JS heap looks
+   *  flat between GCs. Sampled cheaply (document.getElementsByTagName('*').length). */
+  domNodes?: number;
+  /** #root subtree node count — isolates the app's own tree from browser chrome. */
+  rootNodes?: number;
   error?: string;
 }
 
@@ -346,14 +358,19 @@ export async function sampleRendererHeap(window: HealthWindow): Promise<Renderer
     const mem = (await withTimeout(
       contents.executeJavaScript(
         `(() => { const m = (performance && performance.memory) || {};
-          return { u: m.usedJSHeapSize, t: m.totalJSHeapSize, l: m.jsHeapSizeLimit }; })()`,
+          let domNodes, rootNodes;
+          try { domNodes = document.getElementsByTagName('*').length; } catch {}
+          try { rootNodes = document.getElementById('root')?.getElementsByTagName('*').length; } catch {}
+          return { u: m.usedJSHeapSize, t: m.totalJSHeapSize, l: m.jsHeapSizeLimit, dn: domNodes, rn: rootNodes }; })()`,
         true,
-      ) as Promise<{ u?: unknown; t?: unknown; l?: unknown }>,
+      ) as Promise<{ u?: unknown; t?: unknown; l?: unknown; dn?: unknown; rn?: unknown }>,
       PROBE_TIMEOUT_MS,
       'renderer heap sample',
-    )) as { u?: unknown; t?: unknown; l?: unknown };
+    )) as { u?: unknown; t?: unknown; l?: unknown; dn?: unknown; rn?: unknown };
     const bytesToMB = (v: unknown): number | undefined =>
       typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v / (1024 * 1024)) : undefined;
+    const toCount = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
     const jsHeapUsedMB = bytesToMB(mem.u);
     const jsHeapTotalMB = bytesToMB(mem.t);
     const jsHeapLimitMB = bytesToMB(mem.l);
@@ -361,7 +378,14 @@ export async function sampleRendererHeap(window: HealthWindow): Promise<Renderer
       jsHeapUsedMB !== undefined && jsHeapLimitMB !== undefined && jsHeapLimitMB > 0
         ? Math.round((jsHeapUsedMB / jsHeapLimitMB) * 100)
         : undefined;
-    return { jsHeapUsedMB, jsHeapTotalMB, jsHeapLimitMB, jsHeapUsedPct };
+    return {
+      jsHeapUsedMB,
+      jsHeapTotalMB,
+      jsHeapLimitMB,
+      jsHeapUsedPct,
+      domNodes: toCount(mem.dn),
+      rootNodes: toCount(mem.rn),
+    };
   } catch (error) {
     return { error: errorMessage(error) };
   }
@@ -410,6 +434,9 @@ export class WindowHealthMonitor {
   private readonly isHeapHeartbeatEnabled: () => boolean;
   private heapHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heapHeartbeatRunning = false;
+  // Monotonic heartbeat tick counter, used to emit the heavier per-process memory
+  // breakdown only every Nth tick (the plain heap heartbeat runs every tick).
+  private heapHeartbeatTick = 0;
   // Latch so a heap wedged over the threshold captures ONE snapshot, not one per
   // tick. Armed again only after the heap drops `SNAPSHOT_REARM_HYSTERESIS_PCT`
   // below the threshold (so oscillation around the line doesn't re-fire).
@@ -534,6 +561,16 @@ export class WindowHealthMonitor {
       this.heapSnapshotRetryAfter = 0;
     }
     if (!this.heapSnapshotArmed || pct < policy.thresholdPct) return;
+    // Absolute-MB floor: a snapshot fires only when the heap is BOTH over
+    // thresholdPct AND genuinely large. Slow idle drift into the 55–65% band on
+    // a large V8 limit is not worth a heavy capture (and, historically, running
+    // one there crashed the renderer). Skip until the heap is near the real OOM
+    // ceiling. When the used-MB is unknown (hardened/non-Chromium), fall back to
+    // the percentage gate alone rather than blocking capture entirely.
+    const floorMB = policy.triggerFloorMB;
+    if (floorMB !== undefined && floorMB > 0 && sample.jsHeapUsedMB !== undefined && sample.jsHeapUsedMB < floorMB) {
+      return;
+    }
     // Single-flight fence: never START a capture while one is still in flight. The
     // heap heartbeat fires every ~Ns, and hysteresis re-arm could otherwise trigger a
     // second capture while a slow one is mid-write — two concurrent takeHeapSnapshot
@@ -550,6 +587,7 @@ export class WindowHealthMonitor {
       jsHeapLimitMB: sample.jsHeapLimitMB,
       jsHeapUsedPct: pct,
       thresholdPct: policy.thresholdPct,
+      triggerFloorMB: policy.triggerFloorMB,
     });
     // Arm a retry window on ANY capture failure (including a TIMEOUT) so a
     // still-high heap gets another attempt rather than being latched off forever.
@@ -576,24 +614,23 @@ export class WindowHealthMonitor {
     // one's fence. This is what makes a still-hung capture unable to overlap a retry.
     const onNativeSettled = clearInFlight;
     try {
-      void Promise.resolve(trigger(window, sample, onNativeSettled))
-        .then(clearInFlight, (error) => {
-          this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
-          if (error instanceof HeapSnapshotTimeoutError) {
-            // The BOUNDED wrapper rejected, but the NATIVE takeHeapSnapshot may still be
-            // running. Do NOT clear the fence on a fixed timer — that could let a retry
-            // overlap a still-running native capture. The fence is released ONLY when the
-            // native op truly settles (onNativeSettled) OR the renderer is replaced (a
-            // reload's did-start-loading / attachWindow resets it + bumps the generation).
-            // A retry is still armed for the persistently-high heap; the single-flight
-            // fence at trigger prevents it from starting a second concurrent capture.
-            armRetry();
-            return;
-          }
-          // Non-timeout failure: the capture truly settled → clear + allow a prompt retry.
-          clearInFlight();
+      void Promise.resolve(trigger(window, sample, onNativeSettled)).then(clearInFlight, (error) => {
+        this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+        if (error instanceof HeapSnapshotTimeoutError) {
+          // The BOUNDED wrapper rejected, but the NATIVE takeHeapSnapshot may still be
+          // running. Do NOT clear the fence on a fixed timer — that could let a retry
+          // overlap a still-running native capture. The fence is released ONLY when the
+          // native op truly settles (onNativeSettled) OR the renderer is replaced (a
+          // reload's did-start-loading / attachWindow resets it + bumps the generation).
+          // A retry is still armed for the persistently-high heap; the single-flight
+          // fence at trigger prevents it from starting a second concurrent capture.
           armRetry();
-        });
+          return;
+        }
+        // Non-timeout failure: the capture truly settled → clear + allow a prompt retry.
+        clearInFlight();
+        armRetry();
+      });
     } catch (error) {
       // Synchronous throw from trigger() — the capture never became in-flight.
       clearInFlight();
@@ -763,15 +800,35 @@ export class WindowHealthMonitor {
         this.log('renderer-heap-heartbeat', { error: sample.error });
         return;
       }
-      // Only the used-MB and derived % are logged per tick; a full process
-      // metric snapshot every 60s would bloat the log. checkHeapPressure adds
-      // the flagged, metric-bearing event when a threshold trips.
+      // The used-MB, derived %, and cheap DOM-node counts are logged every tick;
+      // a full process metric snapshot every 60s would bloat the log, so it is
+      // emitted separately every Nth tick (renderer-memory-breakdown below).
+      // checkHeapPressure adds the flagged, metric-bearing event when a threshold trips.
       this.log('renderer-heap-heartbeat', {
         jsHeapUsedMB: sample.jsHeapUsedMB,
         jsHeapTotalMB: sample.jsHeapTotalMB,
         jsHeapLimitMB: sample.jsHeapLimitMB,
         jsHeapUsedPct: sample.jsHeapUsedPct,
+        domNodes: sample.domNodes,
+        rootNodes: sample.rootNodes,
       });
+      // Periodic per-process memory breakdown: attributes a slow idle heap climb
+      // to a specific process. getProcessMetrics is a synchronous main-process
+      // call (app.getAppMetrics) — cheap enough at this cadence. Guarded so a
+      // metrics failure never breaks the heartbeat.
+      this.heapHeartbeatTick += 1;
+      if (this.heapHeartbeatTick % MEMORY_BREAKDOWN_EVERY_N_TICKS === 0) {
+        try {
+          this.log('renderer-memory-breakdown', {
+            tick: this.heapHeartbeatTick,
+            jsHeapUsedMB: sample.jsHeapUsedMB,
+            domNodes: sample.domNodes,
+            processes: metricSnapshot(this.options.getProcessMetrics()),
+          });
+        } catch {
+          /* metrics best-effort — never let it break the heartbeat */
+        }
+      }
       this.checkHeapPressure('heartbeat', 0, sample);
       this.maybeTriggerHeapSnapshot(window, sample);
     } catch {

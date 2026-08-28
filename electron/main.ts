@@ -42,6 +42,7 @@ import {
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
 import { captureHeapSnapshot } from './diagnostics/heap-snapshot.js';
+import { makeCdpHeapSnapshotTake } from './diagnostics/heap-snapshot-cdp.js';
 import { initDiagnosticTrace, sweepDiagnosticTraceRetention, traceDiagnostic } from './diagnostics/debug-trace.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
@@ -937,7 +938,7 @@ const windowHealthMonitor = new WindowHealthMonitor({
     try {
       const hs = readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.heapSnapshot;
       if (!hs?.enabled) return null;
-      return { enabled: true, thresholdPct: hs.thresholdPct ?? 85 };
+      return { enabled: true, thresholdPct: hs.thresholdPct ?? 85, triggerFloorMB: hs.triggerFloorMB ?? 3000 };
     } catch {
       return null;
     }
@@ -956,7 +957,8 @@ const windowHealthMonitor = new WindowHealthMonitor({
     }
   },
   // Capture a renderer heap snapshot + enforce retention when the heartbeat
-  // decides one is due. Heavy (multi-GB write + GC pause) but rare (latched).
+  // decides one is due. Streamed via CDP (see makeCdpHeapSnapshotTake) so it
+  // does not double the renderer RSS; rare (latched behind the trigger floor).
   onHeapSnapshotTrigger: async (win, _sample, onNativeSettled) => {
     const hs = (() => {
       try {
@@ -966,14 +968,21 @@ const windowHealthMonitor = new WindowHealthMonitor({
       }
     })();
     const started = Date.now();
+    // Capture via the Chrome DevTools Protocol (streamed to disk) rather than
+    // webContents.takeHeapSnapshot(): the in-renderer serializer transiently
+    // ~doubles the renderer RSS on a multi-GB heap and blocks its main thread —
+    // observed to crash the renderer (SIGTRAP) at ~62% heap while producing only
+    // 0-byte files. The CDP path streams chunks out, so RSS does not double and
+    // the capture is detach-cancellable under memory pressure.
+    const webContents = (win as unknown as { webContents: Electron.WebContents }).webContents;
     const result = await captureHeapSnapshot(
       join(APP_HOME, 'logs'),
-      (filePath) => (win as unknown as { webContents: Electron.WebContents }).webContents.takeHeapSnapshot(filePath),
+      makeCdpHeapSnapshotTake(webContents),
       { maxCount: hs?.maxCount ?? 3, maxTotalBytes: hs?.maxTotalBytes ?? 6442450944 },
       new Date(),
-      // Bound each capture: a renderer at the heap limit dies mid-serialization
-      // and takeHeapSnapshot then never settles — the timeout turns that hang
-      // into a reject so the failure path (partial cleanup + re-arm) runs.
+      // Bound each capture: if a renderer under pressure stalls mid-capture the
+      // CDP takeHeapSnapshot may not settle — the timeout turns that hang into a
+      // reject so the failure path (partial cleanup + detach + re-arm) runs.
       hs?.captureTimeoutMs ?? 30000,
       // Release the monitor's single-flight fence exactly when the NATIVE capture
       // settles (incl. a late settle after the timeout), so a still-hung capture

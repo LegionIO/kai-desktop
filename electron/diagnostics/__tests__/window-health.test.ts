@@ -175,7 +175,7 @@ describe('WindowHealthMonitor recovery policy', () => {
       heapHeartbeatIntervalMs?: number;
       isHeapHeartbeatEnabled?: () => boolean;
       getMaxLogBytes?: () => number;
-      getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number } | null;
+      getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number; triggerFloorMB?: number } | null;
       onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
       getRendererRecoveryPolicy?: () => { reloadStalledRenderer: boolean; stallReloadMs: number } | null;
       skipLoad?: boolean;
@@ -495,6 +495,87 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(2));
     expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('does not trigger a snapshot below the absolute MB floor even when over thresholdPct', async () => {
+    // The overnight crash: heap at 62% of a large limit (2222/3586 MB) tripped a
+    // capture that then crashed the renderer. With a 3000 MB floor, a heap that is
+    // over the % threshold but under the floor must NOT fire.
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: 2222, jsHeapLimitMB: 3586, jsHeapUsedPct: 62 }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      // thresholdPct 55 (crossed at 62%) but floor 3000 MB (NOT crossed at 2222).
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 55, triggerFloorMB: 3000 }),
+      onHeapSnapshotTrigger,
+    });
+
+    await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(2));
+    expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('triggers once the heap climbs past BOTH the pct threshold and the MB floor', async () => {
+    let usedMB = 2222;
+    let pct = 62;
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: usedMB, jsHeapLimitMB: 3586, jsHeapUsedPct: pct }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 55, triggerFloorMB: 3000 }),
+      onHeapSnapshotTrigger,
+    });
+
+    // Under the floor → no capture.
+    await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(2));
+    expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
+
+    // Climb past the floor → exactly one capture.
+    usedMB = 3200;
+    pct = 89;
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    expect(readFileSync(logPath, 'utf-8')).toContain('"triggerFloorMB":3000');
+    monitor.detachWindow();
+  });
+
+  it('falls back to the pct gate when used-MB is unavailable (no floor block)', async () => {
+    // Hardened/non-Chromium renderer: performance.memory absent → jsHeapUsedMB
+    // undefined but jsHeapUsedPct still derivable is impossible, so this exercises
+    // the branch where used-MB is undefined and the floor is skipped.
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: undefined, jsHeapLimitMB: 3586, jsHeapUsedPct: 90 }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 55, triggerFloorMB: 3000 }),
+      onHeapSnapshotTrigger,
+    });
+
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    monitor.detachWindow();
+  });
+
+  it('emits a periodic renderer-memory-breakdown with per-process metrics and DOM nodes', async () => {
+    const heapSampler = vi.fn(async () => ({
+      jsHeapUsedMB: 900,
+      jsHeapLimitMB: 3586,
+      jsHeapUsedPct: 25,
+      domNodes: 12345,
+      rootNodes: 12000,
+    }));
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5 });
+
+    // Every tick carries the cheap DOM counts.
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-heap-heartbeat'));
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('"domNodes":12345'));
+
+    // The heavier breakdown appears only every Nth tick (N=5). Wait for it.
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-memory-breakdown'), {
+      timeout: 2000,
+    });
     monitor.detachWindow();
   });
 

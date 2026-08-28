@@ -56,6 +56,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           heapSnapshot?: {
             enabled?: boolean;
             thresholdPct?: number;
+            triggerFloorMB?: number;
             maxCount?: number;
             maxTotalBytes?: number;
           };
@@ -84,8 +85,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
   // toggle would merge against the stale intermediate array.
   useEffect(() => {
     if (!scopeOverride) return;
-    const same =
-      propScopes.length === scopeOverride.length && propScopes.every((s) => scopeOverride.includes(s));
+    const same = propScopes.length === scopeOverride.length && propScopes.every((s) => scopeOverride.includes(s));
     if (same) setScopeOverride(null);
   }, [propScopes, scopeOverride]);
   const effectiveScopes = scopeOverride ?? propScopes;
@@ -470,10 +470,11 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             </p>
           )}
           <p className="mt-1 text-[10px] text-muted-foreground">
-            When the renderer heap crosses the threshold, one <span className="font-mono">.heapsnapshot</span> is written
-            to <span className="font-mono">~/.kai/logs/heap-snapshots/</span> — it names the objects retaining memory,
-            which the size graph alone can’t. Snapshots are large (roughly the size of the heap, often multiple GB) and
-            writing one briefly pauses the app, so it fires at most once per climb.
+            When the renderer heap crosses the threshold, one <span className="font-mono">.heapsnapshot</span> is
+            written to <span className="font-mono">~/.kai/logs/heap-snapshots/</span> — it names the objects retaining
+            memory, which the size graph alone can’t. The snapshot is streamed to disk (via the DevTools protocol) so it
+            does not duplicate the heap in memory; it fires at most once per climb, and only when the heap is both over
+            the threshold and above the absolute floor below.
           </p>
           <div className="mt-3 grid gap-3 sm:grid-cols-3">
             <label className="text-[11px] text-muted-foreground">
@@ -488,6 +489,23 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
                   void updateConfig(
                     'diagnostics.memoryDiagnostics.heapSnapshot.thresholdPct',
                     Math.min(99, Math.max(50, Number(event.target.value) || 85)),
+                  )
+                }
+                className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+              />
+            </label>
+            <label className="text-[11px] text-muted-foreground">
+              Floor (MB)
+              <input
+                type="number"
+                min={256}
+                max={16384}
+                disabled={!heapSnapshot?.enabled}
+                value={heapSnapshot?.triggerFloorMB ?? 3000}
+                onChange={(event) =>
+                  void updateConfig(
+                    'diagnostics.memoryDiagnostics.heapSnapshot.triggerFloorMB',
+                    Math.min(16384, Math.max(256, Number(event.target.value) || 3000)),
                   )
                 }
                 className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
@@ -537,17 +555,14 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
       </div>
 
       {/* Renderer recovery hardening */}
-      <div
-        className="rounded-xl border border-border/70 bg-card/60 p-4"
-        data-setting-id="diagnostics.rendererRecovery"
-      >
+      <div className="rounded-xl border border-border/70 bg-card/60 p-4" data-setting-id="diagnostics.rendererRecovery">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h4 className="text-xs font-semibold">Renderer recovery</h4>
             <p className="mt-1 max-w-2xl text-[11px] text-muted-foreground">
               Hardening for a renderer that comes unloaded during a display reconfigure or GPU context loss (e.g.
-              docking/undocking a monitor) and then sits wedged — a distinct failure from high-memory crashes. Auto-reload
-              revives a renderer that has stayed unloaded past the stall window instead of leaving it dead.
+              docking/undocking a monitor) and then sits wedged — a distinct failure from high-memory crashes.
+              Auto-reload revives a renderer that has stayed unloaded past the stall window instead of leaving it dead.
             </p>
           </div>
         </div>
@@ -593,9 +608,10 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             onChange={(value) => void updateConfig('diagnostics.rendererRecovery.gpuContextLossHardening', value)}
           />
           <p className="mt-1 text-[10px] text-muted-foreground">
-            Keeps canvas/image rasterization in-process so losing the GPU process during a display change can’t crash the
-            renderer’s decode path. Changes app-wide GPU behavior (a small rendering-performance tradeoff) and only takes
-            effect after you fully quit and reopen the app. Off by default — enable only if display-change crashes recur.
+            Keeps canvas/image rasterization in-process so losing the GPU process during a display change can’t crash
+            the renderer’s decode path. Changes app-wide GPU behavior (a small rendering-performance tradeoff) and only
+            takes effect after you fully quit and reopen the app. Off by default — enable only if display-change crashes
+            recur.
           </p>
           {rendererRecovery?.gpuContextLossHardening && (
             <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-600 dark:text-amber-400">
@@ -605,7 +621,6 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           )}
         </div>
       </div>
-
 
       {/* Health summary card */}
       <div className="rounded-xl border border-border/70 bg-card/60 p-4">
