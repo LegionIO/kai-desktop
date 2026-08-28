@@ -31,7 +31,7 @@
  * timeout in captureHeapSnapshot aborts `signal`, which detaches + tears down
  * here rather than merely abandoning the promise.
  */
-import { createWriteStream } from 'fs';
+import { createWriteStream, openSync, constants as fsConstants } from 'fs';
 
 /** Minimal debugger surface we use — kept structural so tests can fake it. */
 export interface CdpDebugger {
@@ -98,8 +98,23 @@ export function makeCdpHeapSnapshotTake(
   target: CdpCaptureTarget,
   deps: CdpCaptureDeps = {},
 ): (filePath: string, signal?: AbortSignal) => Promise<void> {
+  // Default sink: open the fd ourselves with O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW
+  // rather than let createWriteStream use flags:'w' (which FOLLOWS a symlink and
+  // TRUNCATES its target). The path is somewhat predictable (timestamp + small
+  // random suffix), so a pre-planted symlink there could otherwise redirect our
+  // write. O_EXCL fails if the path already exists (symlink or file); O_NOFOLLOW
+  // fails if the final component is a symlink. Mode 0600. On the rare same-name
+  // collision the capture fails cleanly and the caller re-arms.
   const createSink =
-    deps.createSink ?? ((p: string) => createWriteStream(p, { encoding: 'utf8', mode: 0o600 }) as unknown as ChunkSink);
+    deps.createSink ??
+    ((p: string) => {
+      const fd = openSync(
+        p,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      return createWriteStream('', { fd, encoding: 'utf8' }) as unknown as ChunkSink;
+    });
   const maxPendingBytes = deps.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
 
   return async (filePath: string, signal?: AbortSignal): Promise<void> => {

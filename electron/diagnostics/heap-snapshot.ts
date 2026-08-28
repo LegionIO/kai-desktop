@@ -77,10 +77,15 @@ function listSnapshots(dir: string): SnapshotFile[] {
     if (!SNAPSHOT_RE.test(name)) continue;
     const path = join(dir, name);
     try {
-      const st = statSync(path);
+      // lstat (NOT stat) so a snapshot-named SYMLINK is not followed: otherwise
+      // its target's size/mtime would drive eviction (a huge or future-dated
+      // target could evict real snapshots while the symlink survives), and later
+      // chmod could touch the target. Only real regular files are inventory.
+      const st = lstatSync(path);
+      if (!st.isFile()) continue;
       out.push({ name, path, bytes: st.size, mtimeMs: st.mtimeMs });
     } catch {
-      /* file vanished between readdir and stat — skip */
+      /* file vanished between readdir and lstat — skip */
     }
   }
   // Oldest first (front = eviction candidate).

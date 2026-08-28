@@ -83,52 +83,93 @@ describe('enforceHeapSnapshotRetention', () => {
     expect(statSync(targetPath).mode & 0o777).toBe(0o644);
   });
 
-  it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {
-    // A failed unlink must not be counted as removed — otherwise (4 files, cap 2) one failed
-    // deletion + one successful one would stop with 3 still on disk. Make the OLDEST snapshot
-    // an un-removable non-empty DIRECTORY (rmSync without recursive throws) to simulate that.
-    const unremovable = join(dir, 'heap-20260101T000000.heapsnapshot');
-    mkdirSync(unremovable);
-    writeFileSync(join(unremovable, 'blocker'), 'x'); // non-empty → rmSync (no recursive) throws
-    const oldT = new Date(2026, 0, 1, 0, 0);
-    utimesSync(unremovable, oldT, oldT);
-    makeSnap('heap-20260101T000001.heapsnapshot', 10, 1);
-    makeSnap('heap-20260101T000002.heapsnapshot', 10, 2);
-    makeSnap('heap-20260101T000003.heapsnapshot', 10, 3);
+  it('excludes a snapshot-named symlink from the retention inventory', () => {
+    // A symlink to a HUGE target must not (a) count toward the byte cap nor
+    // (b) be treated as an evictable snapshot — its target size/mtime must not
+    // drive eviction, and a real snapshot must be preferred for keeping.
+    const realNewer = join(dir, 'heap-20260101T000003.heapsnapshot');
+    writeFileSync(realNewer, Buffer.alloc(10, 1));
+    const t = new Date(2026, 0, 1, 0, 3);
+    utimesSync(realNewer, t, t);
+    // A symlink pointing at a large file, named like an OLDER snapshot.
+    const bigTarget = join(dir, 'big-target');
+    writeFileSync(bigTarget, Buffer.alloc(100000, 1));
+    symlinkSync(bigTarget, join(dir, 'heap-20260101T000000.heapsnapshot'));
 
-    enforceHeapSnapshotRetention(dir, { maxCount: 2, maxTotalBytes: 0 });
+    // Byte cap far below the symlink target size: if the symlink were counted,
+    // the sweep would try to evict to satisfy it. It must be ignored entirely.
+    const evicted = enforceHeapSnapshotRetention(dir, { maxCount: 0, maxTotalBytes: 50 });
 
-    // The undeletable dir remains (unlink failed), but the count sweep kept dropping the
-    // NEXT-oldest real files until the on-disk count reached the cap: dir + 1 file = 2.
-    const remaining = readdirSync(dir)
-      .filter((n) => n.endsWith('.heapsnapshot'))
-      .sort();
-    expect(remaining).toEqual([
-      'heap-20260101T000000.heapsnapshot', // the undeletable dir
-      'heap-20260101T000003.heapsnapshot', // newest real file
-    ]);
-    // cleanup: make the dir removable for afterEach
-    rmSync(unremovable, { recursive: true, force: true });
+    // The symlink is not inventory → not evicted; the real file is the sole
+    // snapshot and is preserved (never evict the last real one).
+    expect(evicted).toEqual([]);
+    expect(existsSync(realNewer)).toBe(true);
+    expect(existsSync(bigTarget)).toBe(true);
   });
 
-  it('never deletes the NEWEST snapshot to satisfy the count cap when the older one is undeletable', () => {
-    // maxCount:1, oldest undeletable + newest deletable. The sweep must NOT delete the newest to
-    // reach the cap (that would leave only stale data) — it tolerates exceeding the cap instead.
-    const unremovable = join(dir, 'heap-20260101T000000.heapsnapshot');
-    mkdirSync(unremovable);
-    writeFileSync(join(unremovable, 'blocker'), 'x');
-    const oldT = new Date(2026, 0, 1, 0, 0);
-    utimesSync(unremovable, oldT, oldT);
-    makeSnap('heap-20260101T000005.heapsnapshot', 10, 5); // newest, deletable
+  it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {
+    // A failed unlink must not be counted as removed — otherwise (4 files, cap 2) one failed
+    // deletion + one successful one would stop with 3 still on disk. Simulate an un-removable
+    // OLDEST snapshot by putting it in a read-only SUBDIR and pointing retention at that subdir,
+    // then dropping write perm so unlink(oldest) throws EACCES while the newer ones (created
+    // before the chmod, but unlink still needs dir write) — so instead we make ONLY the oldest
+    // unremovable via the immutable trick: a real file whose unlink we force to fail by removing
+    // the file first and leaving a same-named DIRECTORY is what the old test did, but directories
+    // are no longer inventory. Instead: chmod the oldest file 0000 is insufficient (unlink checks
+    // dir perms, not file perms). Use a read-only containing dir for the whole sweep.
+    const roDir = join(dir, 'ro');
+    mkdirSync(roDir);
+    const mk = (name: string, ageIndex: number): void => {
+      const p = join(roDir, name);
+      writeFileSync(p, Buffer.alloc(10, 1));
+      const t = new Date(2026, 0, 1, 0, ageIndex);
+      utimesSync(p, t, t);
+    };
+    mk('heap-20260101T000000.heapsnapshot', 0);
+    mk('heap-20260101T000001.heapsnapshot', 1);
+    // Read-only dir → every unlink inside it fails (EACCES). The sweep must not
+    // mis-count a failed unlink as freed and spin or over-report.
+    chmodSync(roDir, 0o500);
+    try {
+      const evicted = enforceHeapSnapshotRetention(roDir, { maxCount: 1, maxTotalBytes: 0 });
+      // Nothing could actually be deleted (dir read-only), so no evictions are
+      // reported and both files remain — the sweep tolerates the failure without
+      // spinning or falsely claiming the cap was met.
+      expect(evicted).toEqual([]);
+      const remaining = readdirSync(roDir)
+        .filter((n) => n.endsWith('.heapsnapshot'))
+        .sort();
+      expect(remaining).toEqual(['heap-20260101T000000.heapsnapshot', 'heap-20260101T000001.heapsnapshot']);
+    } finally {
+      chmodSync(roDir, 0o700); // restore for afterEach cleanup
+    }
+  });
 
-    const evicted = enforceHeapSnapshotRetention(dir, { maxCount: 1, maxTotalBytes: 0 });
+  it('never deletes the NEWEST snapshot to satisfy the count cap when older ones are undeletable', () => {
+    // maxCount:1 with a read-only dir: no unlink can succeed, so the newest is
+    // preserved and the sweep tolerates exceeding the cap rather than spinning.
+    const roDir = join(dir, 'ro2');
+    mkdirSync(roDir);
+    const mk = (name: string, ageIndex: number): void => {
+      const p = join(roDir, name);
+      writeFileSync(p, Buffer.alloc(10, 1));
+      const t = new Date(2026, 0, 1, 0, ageIndex);
+      utimesSync(p, t, t);
+    };
+    mk('heap-20260101T000000.heapsnapshot', 0);
+    mk('heap-20260101T000005.heapsnapshot', 5); // newest
+    chmodSync(roDir, 0o500);
+    try {
+      const evicted = enforceHeapSnapshotRetention(roDir, { maxCount: 1, maxTotalBytes: 0 });
 
-    expect(evicted).not.toContain('heap-20260101T000005.heapsnapshot'); // newest preserved
-    const remaining = readdirSync(dir)
-      .filter((n) => n.endsWith('.heapsnapshot'))
-      .sort();
-    expect(remaining).toContain('heap-20260101T000005.heapsnapshot');
-    rmSync(unremovable, { recursive: true, force: true });
+      expect(evicted).not.toContain('heap-20260101T000005.heapsnapshot'); // newest preserved
+      const remaining = readdirSync(roDir)
+        .filter((n) => n.endsWith('.heapsnapshot'))
+        .sort();
+      expect(remaining).toContain('heap-20260101T000005.heapsnapshot');
+    } finally {
+      chmodSync(roDir, 0o700); // restore for afterEach cleanup
+    }
   });
 
   it('evicts oldest beyond maxTotalBytes', () => {

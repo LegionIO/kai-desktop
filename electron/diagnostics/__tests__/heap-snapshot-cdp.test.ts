@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, symlinkSync, existsSync, readFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { makeCdpHeapSnapshotTake, CdpCaptureUnavailableError } from '../heap-snapshot-cdp';
 import type { CdpCaptureTarget, CdpDebugger } from '../heap-snapshot-cdp';
 
@@ -300,5 +303,41 @@ describe('makeCdpHeapSnapshotTake', () => {
     const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/EIO close-time/);
+  });
+});
+
+describe('makeCdpHeapSnapshotTake default sink (real fs)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'kai-cdp-sink-'));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('writes the snapshot 0600 via the real O_EXCL|O_NOFOLLOW sink', async () => {
+    const dbgs = makeFakeDebugger({ onTake: async (emit) => emit('{"ok":1}') });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg)); // no injected sink → real fs
+    const path = join(dir, 'heap-real.heapsnapshot');
+
+    await take(path);
+
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, 'utf8')).toBe('{"ok":1}');
+  });
+
+  it('refuses to write through a pre-existing symlink at the target path', async () => {
+    // A pre-planted symlink named like the (predictable) snapshot path must NOT
+    // be followed + its target truncated. O_EXCL|O_NOFOLLOW makes the open fail.
+    const secret = join(dir, 'secret');
+    writeFileSync(secret, 'do-not-touch');
+    const linkPath = join(dir, 'heap-attack.heapsnapshot');
+    symlinkSync(secret, linkPath);
+    const dbgs = makeFakeDebugger({ onTake: async (emit) => emit('{}') });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg));
+
+    await expect(take(linkPath)).rejects.toBeTruthy();
+    // The symlink's target is untouched — never followed/truncated.
+    expect(readFileSync(secret, 'utf8')).toBe('do-not-touch');
+    // We never attached a debugger for a capture that couldn't even open its sink.
+    expect(dbgs.detachCalls()).toBe(0);
   });
 });
