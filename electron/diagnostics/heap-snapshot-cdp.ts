@@ -89,6 +89,21 @@ export class CdpCaptureUnavailableError extends Error {
   }
 }
 
+/**
+ * Thrown when the fatal/abort path's bounded native-settle GRACE expired while
+ * the native HeapProfiler.takeHeapSnapshot was still pending in the renderer.
+ * The caller (captureHeapSnapshot) MUST treat this as non-retryable: starting a
+ * retry while the native op is still retained would run a second concurrent
+ * multi-GB capture. Distinct type (not disk-space) so the evict-and-retry loop
+ * skips it.
+ */
+export class HeapSnapshotNativePendingError extends Error {
+  constructor(graceMs: number) {
+    super(`heap snapshot native command still pending after ${graceMs}ms grace`);
+    this.name = 'HeapSnapshotNativePendingError';
+  }
+}
+
 const CHUNK_EVENT = 'HeapProfiler.addHeapSnapshotChunk';
 const DEFAULT_MAX_PENDING_BYTES = 64 * 1024 * 1024;
 
@@ -397,28 +412,40 @@ export function makeCdpHeapSnapshotTake(
       // or a retry could start a SECOND concurrent multi-GB snapshot. cleanup()
       // already detached (our cancellation lever), which settles the pending
       // command in the normal case; bound the wait so a truly-unkillable command
-      // can't hang take() forever (the fence then releases after the grace,
-      // accepting a small overlap window over an indefinite hang).
+      // can't hang take() forever.
       //
-      // Why the residual grace-exceeded window is SAFE (defense in depth, so the
-      // bounded hold is the right call over an unbounded hang):
-      //  1. A retry reuses the SAME `path`; the sink opens O_CREAT|O_EXCL, so if
-      //     the abandoned op still holds/created that file the retry open fails
-      //     EEXIST and stops (destinationNotOurs) — it can't clobber or double up.
-      //  2. The window-health single-flight fence release (onNativeSettled) is
-      //     generation-guarded and also released on renderer replacement, and the
-      //     persistently-high-heap retry sits behind a 60s cooldown (>> grace).
+      // If the grace WINS (native still pending), we can NOT rely on the caller's
+      // retry being harmless: the in-call ENOSPC evict-and-retry uses a FRESH
+      // random-suffix path (so O_EXCL wouldn't collide with the abandoned op),
+      // and the 60s monitor cooldown is on the timeout path, not that retry. So
+      // a grace-win must actively PREVENT the retry — we throw
+      // HeapSnapshotNativePendingError, which captureHeapSnapshot treats as
+      // "do not retry", keeping the bounded hold without risking a concurrent
+      // capture. (The window-health single-flight fence is also generation-
+      // guarded + released on renderer replacement as an additional backstop.)
+      // FENCE INTEGRITY (see below): hold until the native command settles,
+      // bounded by the grace. Track WHICH won — if the grace won, the native op
+      // is STILL pending in the renderer, so we must NOT let the caller start a
+      // retry (a fresh-path O_EXCL open would NOT collide, and the 60s monitor
+      // cooldown is on the timeout path, not the in-call ENOSPC retry — so a
+      // retry here would run a SECOND concurrent multi-GB capture). Signal that
+      // by throwing HeapSnapshotNativePendingError, which captureHeapSnapshot
+      // treats as "do not retry", regardless of the underlying fatal.
+      let graceWon = false;
       if (capture) {
-        await Promise.race([
+        graceWon = await Promise.race([
           capture.then(
-            () => undefined,
-            () => undefined,
+            () => false,
+            () => false,
           ),
-          new Promise<void>((resolve) => {
-            const t = setTimeout(resolve, nativeSettleGraceMs);
+          new Promise<boolean>((resolve) => {
+            const t = setTimeout(() => resolve(true), nativeSettleGraceMs);
             (t as { unref?: () => void }).unref?.();
           }),
         ]);
+      }
+      if (graceWon) {
+        throw new HeapSnapshotNativePendingError(nativeSettleGraceMs);
       }
       // Prefer the FIRST recorded fatal error over a raced/derived one: when a
       // sink ENOSPC triggers our detach, the abandoned sendCommand may reject

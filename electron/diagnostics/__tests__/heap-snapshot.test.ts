@@ -353,6 +353,27 @@ describe('captureHeapSnapshot', () => {
     }
   });
 
+  it('does NOT retry when take() reports the native command still pending (grace exceeded)', async () => {
+    // If the grace expires with the native op still pending, take() throws
+    // HeapSnapshotNativePendingError. captureHeapSnapshot must NOT enter the
+    // evict-and-retry loop (a retry would start a 2nd concurrent capture) — even
+    // with existing snapshots present that would otherwise be eviction fodder.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'heap-20260806T000000.heapsnapshot'), Buffer.alloc(10, 1));
+    writeFileSync(join(dir, 'heap-20260806T000100.heapsnapshot'), Buffer.alloc(10, 1));
+    const take = vi.fn(async () => {
+      const err = new Error('heap snapshot native command still pending after 2000ms grace');
+      err.name = 'HeapSnapshotNativePendingError';
+      throw err;
+    });
+
+    await expect(captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 })).rejects.toThrow(
+      /still pending/,
+    );
+    expect(take).toHaveBeenCalledTimes(1); // NO retry — did not start a 2nd capture
+  });
+
   it('late timeout cleanup does not delete a DIFFERENT file that took the path', async () => {
     // After a timeout, the abandoned native settling triggers cleanupLate. If a
     // DIFFERENT file (different inode) now occupies filePath (a later capture

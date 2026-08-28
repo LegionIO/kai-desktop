@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { makeCdpHeapSnapshotTake, CdpCaptureUnavailableError } from '../heap-snapshot-cdp';
+import {
+  makeCdpHeapSnapshotTake,
+  CdpCaptureUnavailableError,
+  HeapSnapshotNativePendingError,
+} from '../heap-snapshot-cdp';
 import type { CdpCaptureTarget, CdpDebugger } from '../heap-snapshot-cdp';
 
 /** In-memory sink modeling the fs.WriteStream slice we depend on. `writeOk`
@@ -384,7 +388,10 @@ describe('makeCdpHeapSnapshotTake', () => {
     const p = take('/tmp/snap.heapsnapshot', ac.signal);
     // Abort after the capture command is in flight (and hung).
     setTimeout(() => ac.abort(), 5);
-    await expect(p).rejects.toThrow(/aborted/);
+    // The native never settles → the grace wins → take() rejects with
+    // HeapSnapshotNativePendingError (which the caller treats as non-retryable,
+    // so no second concurrent capture starts). It does NOT hang.
+    await expect(p).rejects.toBeInstanceOf(HeapSnapshotNativePendingError);
     expect(dbgs.detachCalls()).toBe(1); // detached on abort
     expect(fake.destroyed()).toBe(true); // sink torn down
   });
