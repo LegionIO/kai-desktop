@@ -478,4 +478,32 @@ describe('captureHeapSnapshot', () => {
     );
     expect(take).not.toHaveBeenCalled(); // bailed before any capture
   });
+
+  it('does NOT delete a pre-existing destination when take() fails PREFLIGHT (never opened the sink)', async () => {
+    // A CdpCaptureUnavailableError (destroyed target / debugger attached /
+    // aborted) rejects BEFORE the sink is opened — no file of ours exists at
+    // `path`, so any same-name file there is someone else's. The failure
+    // cleanup must not delete it.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.777);
+    try {
+      const collidePath = join(dir, snapshotFileName(new Date('2026-08-06T04:20:56.000Z'), '-777'));
+      writeFileSync(collidePath, 'PREEXISTING');
+      const take = vi.fn(async () => {
+        // Mimic makeCdpHeapSnapshotTake's preflight rejection (matched by name).
+        const err = new Error('heap snapshot capture unavailable: webContents destroyed');
+        err.name = 'CdpCaptureUnavailableError';
+        throw err;
+      });
+
+      await expect(
+        captureHeapSnapshot(logsDir, take, { maxCount: 3, maxTotalBytes: 0 }, new Date('2026-08-06T04:20:56.000Z')),
+      ).rejects.toThrow(/capture unavailable/);
+      expect(existsSync(collidePath)).toBe(true);
+      expect(readFileSync(collidePath, 'utf8')).toBe('PREEXISTING');
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
 });

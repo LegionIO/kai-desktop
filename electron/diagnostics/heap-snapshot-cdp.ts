@@ -58,6 +58,9 @@ interface ChunkSink {
   destroy(err?: Error): void;
   on(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void): void;
   off?(event: 'error' | 'drain' | 'close', listener: (err?: Error) => void): void;
+  /** Bytes CURRENTLY buffered but not yet flushed (Writable.writableLength).
+   *  Used to bound the real backlog, not cumulative traffic. */
+  readonly writableLength?: number;
 }
 
 export interface CdpCaptureDeps {
@@ -146,11 +149,6 @@ export function makeCdpHeapSnapshotTake(
     // An external `detach` event (DevTools opened, target closed) flips this so
     // cleanup does NOT detach a session we no longer own.
     let owned = false;
-    // Unflushed bytes handed to the sink but not yet drained — bounded so a slow
-    // disk can't let the main-process buffer grow without limit.
-    let pendingBytes = 0;
-    // Wakes the drain waiter when the sink drains OR a fatal condition arrives.
-    let drainResolve: (() => void) | null = null;
     // Rejects the moment a fatal condition is recorded, so the capture flow can
     // race it against `sendCommand` and unwind IMMEDIATELY even when the native
     // command never settles after detach (the hung-capture case the timeout must
@@ -176,11 +174,6 @@ export function makeCdpHeapSnapshotTake(
         } catch {
           /* best-effort */
         }
-      }
-      if (drainResolve) {
-        const r = drainResolve;
-        drainResolve = null;
-        r();
       }
       // Reject the race promise so the awaiting capture flow unwinds now.
       if (first && rejectFatal) {
@@ -261,14 +254,6 @@ export function makeCdpHeapSnapshotTake(
         // late write/close failure is never mistaken for a successful capture.
         sink!.on('error', (err) => setFatal(err instanceof Error ? err : new Error(String(err))));
       });
-      sink.on('drain', () => {
-        pendingBytes = 0;
-        if (drainResolve) {
-          const r = drainResolve;
-          drainResolve = null;
-          r();
-        }
-      });
 
       // Abort (timeout from captureHeapSnapshot, or caller cancel) → detach now.
       if (signal) {
@@ -298,11 +283,17 @@ export function makeCdpHeapSnapshotTake(
         try {
           const ok = sink.write(chunk);
           if (!ok) {
-            // Backpressure: bytes are queued in the sink until 'drain'. Track the
-            // outstanding volume and abort if it exceeds the cap rather than let
-            // the main-process buffer grow without bound.
-            pendingBytes += Buffer.byteLength(chunk, 'utf8');
-            if (pendingBytes > maxPendingBytes) {
+            // Backpressure: the sink is above its high-water mark. Bound the
+            // capture on the ACTUAL currently-buffered bytes (writableLength),
+            // NOT a cumulative counter — write() keeps returning false while the
+            // backlog drains, so a running-total would falsely trip on a healthy
+            // multi-GB capture whose real backlog stays small. Abort only when
+            // the true unflushed backlog exceeds the cap. If writableLength is
+            // unavailable (a fake sink), fall back to the incoming chunk size as
+            // a conservative floor rather than an unbounded sum.
+            const buffered =
+              typeof sink.writableLength === 'number' ? sink.writableLength : Buffer.byteLength(chunk, 'utf8');
+            if (buffered > maxPendingBytes) {
               setFatal(new Error(`heap snapshot sink backpressure exceeded ${maxPendingBytes} bytes`));
             }
           }

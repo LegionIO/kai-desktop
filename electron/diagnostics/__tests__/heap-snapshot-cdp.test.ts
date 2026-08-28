@@ -6,12 +6,14 @@ import { makeCdpHeapSnapshotTake, CdpCaptureUnavailableError } from '../heap-sna
 import type { CdpCaptureTarget, CdpDebugger } from '../heap-snapshot-cdp';
 
 /** In-memory sink modeling the fs.WriteStream slice we depend on. `writeOk`
- *  controls backpressure (false = buffer full). */
+ *  controls backpressure (false = buffer full); `writableLength` accumulates the
+ *  bytes written while backpressured, modeling a real stalled backlog. */
 function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error; closeErr?: Error } = {}) {
   const chunks: string[] = [];
   const listeners: Record<string, Array<(err?: Error) => void>> = { error: [], drain: [], close: [] };
   let ended = false;
   let destroyed = false;
+  let backlog = 0;
   const emit = (event: string, err?: Error) => listeners[event]?.forEach((l) => l(err));
   return {
     chunks,
@@ -21,7 +23,14 @@ function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error; closeErr?: Erro
     sink: {
       write(chunk: string) {
         chunks.push(chunk);
-        return opts.writeOk ?? true;
+        const ok = opts.writeOk ?? true;
+        // A real Writable accumulates unflushed bytes in writableLength while
+        // it's above the high-water mark.
+        if (!ok) backlog += Buffer.byteLength(chunk, 'utf8');
+        return ok;
+      },
+      get writableLength() {
+        return backlog;
       },
       end(cb: (err?: Error | null) => void) {
         ended = true;
@@ -231,6 +240,55 @@ describe('makeCdpHeapSnapshotTake', () => {
     });
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/backpressure/);
+    expect(dbgs.detachCalls()).toBe(1);
+  });
+
+  it('does NOT abort a backpressured capture whose real backlog stays under the cap', async () => {
+    // write() returns false (above high-water mark) on EVERY chunk, but the
+    // stream keeps draining so writableLength stays small. The abort must key on
+    // the REAL buffered bytes (writableLength), not a cumulative running total —
+    // otherwise a healthy multi-GB capture would falsely trip. Here a sink that
+    // always reports writableLength=100 must let many false-write chunks through.
+    let closeCount = 0;
+    const chunks: string[] = [];
+    const listeners: Record<string, Array<(err?: Error) => void>> = { error: [], drain: [], close: [] };
+    const emit = (e: string) => listeners[e]?.forEach((l) => l());
+    const constBacklogSink = {
+      write(c: string) {
+        chunks.push(c);
+        return false; // always "buffer full"
+      },
+      get writableLength() {
+        return 100; // real backlog is tiny + constant (stream is draining)
+      },
+      end(cb: (err?: Error | null) => void) {
+        cb(null);
+        setTimeout(() => {
+          closeCount++;
+          emit('close');
+        }, 0);
+      },
+      destroy() {
+        setTimeout(() => emit('close'), 0);
+      },
+      on(e: 'error' | 'drain' | 'close', l: (err?: Error) => void) {
+        listeners[e]?.push(l);
+      },
+      off() {},
+    };
+    const dbgs = makeFakeDebugger({
+      onTake: async (emit2) => {
+        for (let i = 0; i < 50; i++) emit2('z'.repeat(1000)); // 50 KB cumulative
+      },
+    });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), {
+      createSink: () => constBacklogSink as never,
+      maxPendingBytes: 256, // far below the 50 KB cumulative, but writableLength=100 < 256
+    });
+
+    await take('/tmp/snap.heapsnapshot'); // resolves — no false backpressure abort
+    expect(chunks.length).toBe(50);
+    expect(closeCount).toBe(1);
     expect(dbgs.detachCalls()).toBe(1);
   });
 

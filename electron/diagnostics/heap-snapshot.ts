@@ -44,17 +44,22 @@ function isDiskSpaceError(err: unknown): boolean {
   return /ENOSPC|EDQUOT|no space|disk (is )?full|quota exceeded/i.test(msg);
 }
 
-/** Whether a capture error is the O_EXCL "path already exists" failure. When the
- *  sink opens with O_CREAT|O_EXCL and the destination already exists (a real
- *  snapshot from a same-second collision, or a pre-planted symlink), the open
- *  fails EEXIST — and the destination was NOT created by this attempt, so the
- *  failure-cleanup must NOT delete it (that would destroy exactly what O_EXCL
- *  protected). */
-function isFileExistsError(err: unknown): boolean {
+/** Whether a capture error proves the destination was NOT created by THIS
+ *  attempt — so the failure-cleanup must NOT delete it (that would destroy a
+ *  pre-existing same-name snapshot / symlink, or a concurrent writer's file):
+ *   - EEXIST: the sink's O_CREAT|O_EXCL open refused a pre-existing path.
+ *   - CdpCaptureUnavailableError: a PREFLIGHT failure (destroyed target /
+ *     debugger already attached / aborted before start) that rejects BEFORE the
+ *     sink is ever opened — so no file of ours exists at `path`, and any file
+ *     that IS there is someone else's. Matched by name to avoid importing the
+ *     CDP module into this policy layer. */
+function destinationNotOurs(err: unknown): boolean {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   if (code === 'EEXIST') return true;
+  const name = (err as { name?: unknown } | null | undefined)?.name;
+  if (name === 'CdpCaptureUnavailableError') return true;
   const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
-  return /EEXIST|file already exists/i.test(msg);
+  return /EEXIST|file already exists|capture unavailable/i.test(msg);
 }
 
 /** `~/.kai/logs/heap-snapshots` — colocated with the other diagnostic logs. */
@@ -361,12 +366,12 @@ export async function captureHeapSnapshot(
       firstErr = err;
     }
     if (!captured) {
-      // Remove the failed attempt's partial — UNLESS the failure was EEXIST,
-      // which means our O_EXCL open refused a pre-existing destination we did
-      // NOT create; deleting it would destroy a real snapshot / the symlink
-      // O_EXCL was protecting. Surface EEXIST as-is (caller re-arms next tick
-      // with a fresh timestamp).
-      if (isFileExistsError(firstErr)) {
+      // Remove the failed attempt's partial — UNLESS the destination was not
+      // created by this attempt (EEXIST from O_EXCL, or a PREFLIGHT
+      // capture-unavailable failure that rejects before the sink is opened).
+      // Deleting then would destroy a pre-existing snapshot / symlink / another
+      // writer's file. Surface such errors as-is (caller re-arms next tick).
+      if (destinationNotOurs(firstErr)) {
         throw firstErr;
       }
       try {
@@ -397,10 +402,11 @@ export async function captureHeapSnapshot(
           await takeBounded(path);
           captured = true;
         } catch (retryErr) {
-          // If the retry failed EEXIST, the destination pre-existed (a concurrent
-          // writer / real file / symlink) and was NOT created by us — do NOT
-          // rmSync it. EEXIST is also non-space, so surface it (stop evicting).
-          if (isFileExistsError(retryErr)) {
+          // If the retry's destination was not created by us (EEXIST from a
+          // concurrent writer / real file / symlink, or a preflight
+          // capture-unavailable failure), do NOT rmSync it — surface as-is
+          // (also non-space, so stop evicting).
+          if (destinationNotOurs(retryErr)) {
             throw retryErr;
           }
           try {
