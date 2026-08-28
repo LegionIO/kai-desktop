@@ -118,6 +118,9 @@ export function makeCdpHeapSnapshotTake(
     }
 
     let sink: ChunkSink | null = null;
+    // Resolves when the sink emits 'close'. Registered at sink creation so a
+    // synchronous close during destroy() is never missed.
+    let sinkClosed: Promise<void> | null = null;
     let onMessage: ((...args: unknown[]) => void) | null = null;
     let onDetach: ((...args: unknown[]) => void) | null = null;
     let onAbort: (() => void) | null = null;
@@ -208,37 +211,40 @@ export function makeCdpHeapSnapshotTake(
     };
 
     // Destroy the sink and wait for its 'close' so the caller's post-reject
-    // unlink can't race an async file open/flush into a zero-byte orphan.
-    const destroySinkAndClose = (): Promise<void> =>
-      new Promise<void>((resolve) => {
-        const s = sink;
-        if (!s) {
-          resolve();
-          return;
-        }
-        sink = null;
-        let done = false;
-        const finish = (): void => {
-          if (done) return;
-          done = true;
-          resolve();
-        };
-        try {
-          s.on('close', finish);
-          s.destroy();
-        } catch {
-          finish();
-          return;
-        }
-        // Safety net: never hang forever waiting for 'close'.
-        const t = setTimeout(finish, 2000);
-        (t as { unref?: () => void }).unref?.();
-      });
+    // unlink can't race an async file open/flush into a zero-byte orphan. Awaits
+    // the close promise registered at sink creation (below) rather than adding a
+    // 'close' listener HERE — the stream can emit 'close' synchronously during
+    // destroy(), before a late-added listener would see it, so registering the
+    // listener up front is the only race-free way to observe it.
+    const destroySinkAndClose = (): Promise<void> => {
+      const s = sink;
+      if (!s || !sinkClosed) return Promise.resolve();
+      sink = null;
+      try {
+        s.destroy();
+      } catch {
+        /* best-effort */
+      }
+      // Safety net: never hang forever waiting for 'close'.
+      return Promise.race([
+        sinkClosed,
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 2000);
+          (t as { unref?: () => void }).unref?.();
+        }),
+      ]);
+    };
 
     try {
       sink = createSink(filePath);
-      sink.on('error', (err) => {
-        setFatal(err instanceof Error ? err : new Error(String(err)));
+      // Register the close/error completion promise IMMEDIATELY, so a synchronous
+      // 'close' during destroy() (or a late close-time error) is always observed.
+      sinkClosed = new Promise<void>((resolve) => {
+        const done = (): void => resolve();
+        sink!.on('close', done);
+        // A close-time error still ends in 'close'; also capture it as fatal so a
+        // late write/close failure is never mistaken for a successful capture.
+        sink!.on('error', (err) => setFatal(err instanceof Error ? err : new Error(String(err))));
       });
       sink.on('drain', () => {
         pendingBytes = 0;
@@ -332,7 +338,24 @@ export function makeCdpHeapSnapshotTake(
         }),
         fatalPromise,
       ]);
-      // end() flushed + closed the file successfully; don't destroy it below.
+      // end()'s callback fired without error, but the stream emits 'close' just
+      // after — and a close-time error (registered as fatal above) can still
+      // arrive. Await close, then re-check fatal so a late failure is never
+      // reported as a successful capture. Bounded so a stream that never closes
+      // can't hang the capture.
+      const closed = sinkClosed;
+      if (closed) {
+        await Promise.race([
+          closed,
+          fatalPromise,
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 2000);
+            (t as { unref?: () => void }).unref?.();
+          }),
+        ]);
+      }
+      if (fatal) throw fatal;
+      // Closed cleanly; nothing to destroy below.
       sink = null;
       cleanup();
     } catch (err) {

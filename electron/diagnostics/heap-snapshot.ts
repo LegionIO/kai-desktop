@@ -12,7 +12,7 @@
  * The `takeHeapSnapshot(webContents, filePath)` seam is injected so the policy
  * (threshold, cooldown, retention sweep) is unit-testable without Electron.
  */
-import { mkdirSync, readdirSync, statSync, rmSync } from 'fs';
+import { mkdirSync, readdirSync, statSync, rmSync, chmodSync } from 'fs';
 import { join } from 'path';
 
 export interface HeapSnapshotRetention {
@@ -156,6 +156,18 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
     }
   }
 
+  // Harden the perms of every SURVIVING snapshot to 0600. A file written by a
+  // PRIOR release (or the abandoned-native late writer) may be group/world
+  // readable; heap dumps can contain credentials + conversation content, so
+  // tighten them during the sweep. Best-effort / POSIX-only.
+  for (const f of files) {
+    try {
+      chmodSync(f.path, 0o600);
+    } catch {
+      /* best-effort */
+    }
+  }
+
   return evicted;
 }
 
@@ -203,6 +215,13 @@ export async function captureHeapSnapshot(
   // 0700 so heap dumps (which can contain credentials + conversation content)
   // aren't group/world-traversable. Files themselves are written 0600 by the sink.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdir's mode is create-only — a dir left 0755 by a PRIOR release keeps that
+  // mode, so tighten an existing dir too (best-effort; POSIX-only).
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort on platforms without POSIX perms */
+  }
 
   // Native promises from every bounded attempt (initial + eviction/retry). The fence
   // release (onNativeSettled) waits for ALL of them so a retry can't overlap.

@@ -4,7 +4,7 @@ import type { CdpCaptureTarget, CdpDebugger } from '../heap-snapshot-cdp';
 
 /** In-memory sink modeling the fs.WriteStream slice we depend on. `writeOk`
  *  controls backpressure (false = buffer full). */
-function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error } = {}) {
+function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error; closeErr?: Error } = {}) {
   const chunks: string[] = [];
   const listeners: Record<string, Array<(err?: Error) => void>> = { error: [], drain: [], close: [] };
   let ended = false;
@@ -23,6 +23,12 @@ function makeFakeSink(opts: { writeOk?: boolean; endErr?: Error } = {}) {
       end(cb: (err?: Error | null) => void) {
         ended = true;
         cb(opts.endErr ?? null);
+        // fs streams emit 'close' just after end() flushes. A close-time error
+        // (e.g. late fsync failure) arrives right before 'close'.
+        setTimeout(() => {
+          if (opts.closeErr) emit('error', opts.closeErr);
+          emit('close');
+        }, 0);
       },
       destroy() {
         destroyed = true;
@@ -283,5 +289,16 @@ describe('makeCdpHeapSnapshotTake', () => {
     const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
 
     await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/ENOSPC/);
+  });
+
+  it('rejects when a close-time error arrives after end() succeeded', async () => {
+    // end()'s callback reports success, but the stream then emits an error just
+    // before 'close' (e.g. a late fsync failure). The capture must NOT be
+    // reported successful — the post-end close+fatal re-check catches it.
+    const fake = makeFakeSink({ closeErr: new Error('EIO close-time flush') });
+    const dbgs = makeFakeDebugger({ onTake: async (emit) => emit('{}') });
+    const take = makeCdpHeapSnapshotTake(makeTarget(dbgs.dbg), { createSink: () => fake.sink });
+
+    await expect(take('/tmp/snap.heapsnapshot')).rejects.toThrow(/EIO close-time/);
   });
 });

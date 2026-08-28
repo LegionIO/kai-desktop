@@ -1,4 +1,14 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync, utimesSync, mkdirSync } from 'fs';
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  utimesSync,
+  mkdirSync,
+  chmodSync,
+  statSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -43,6 +53,18 @@ describe('enforceHeapSnapshotRetention', () => {
 
     expect(evicted.sort()).toEqual(['heap-20260101T000000.heapsnapshot', 'heap-20260101T000001.heapsnapshot']);
     expect(readdirSync(dir).sort()).toEqual(['heap-20260101T000002.heapsnapshot', 'heap-20260101T000003.heapsnapshot']);
+  });
+
+  it('tightens surviving snapshots to 0600 (hardens files left too-open by a prior release)', () => {
+    makeSnap('heap-20260101T000000.heapsnapshot', 10, 0);
+    makeSnap('heap-20260101T000001.heapsnapshot', 10, 1);
+    // Simulate a world/group-readable file from before the 0600 change.
+    chmodSync(join(dir, 'heap-20260101T000001.heapsnapshot'), 0o644);
+
+    enforceHeapSnapshotRetention(dir, { maxCount: 5, maxTotalBytes: 0 });
+
+    const mode = statSync(join(dir, 'heap-20260101T000001.heapsnapshot')).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 
   it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {
