@@ -390,6 +390,15 @@ export function makeCdpHeapSnapshotTake(
       // command in the normal case; bound the wait so a truly-unkillable command
       // can't hang take() forever (the fence then releases after the grace,
       // accepting a small overlap window over an indefinite hang).
+      //
+      // Why the residual grace-exceeded window is SAFE (defense in depth, so the
+      // bounded hold is the right call over an unbounded hang):
+      //  1. A retry reuses the SAME `path`; the sink opens O_CREAT|O_EXCL, so if
+      //     the abandoned op still holds/created that file the retry open fails
+      //     EEXIST and stops (destinationNotOurs) — it can't clobber or double up.
+      //  2. The window-health single-flight fence release (onNativeSettled) is
+      //     generation-guarded and also released on renderer replacement, and the
+      //     persistently-high-heap retry sits behind a 60s cooldown (>> grace).
       if (capture) {
         await Promise.race([
           capture.then(
