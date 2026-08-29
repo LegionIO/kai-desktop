@@ -446,7 +446,7 @@ describe('captureHeapSnapshot', () => {
             err.name = 'HeapSnapshotNativePendingError';
             err.nativePending = nativePending;
             reject(err);
-          }, 40); // > the 15ms outer timeout below, so the outer timeout wins first
+          }, 150); // >> the 30ms outer timeout below; wide gap so load jitter can't reorder
         }),
     );
     let settledFired = false;
@@ -459,7 +459,7 @@ describe('captureHeapSnapshot', () => {
       take,
       { maxCount: 3, maxTotalBytes: 0 },
       new Date('2026-08-06T04:20:56.000Z'),
-      15, // positive timeout — the OUTER wrapper rejects with HeapSnapshotTimeoutError first
+      30, // positive timeout — the OUTER wrapper rejects with HeapSnapshotTimeoutError first
       onNativeSettled,
     );
     // The outer timeout wins → captureHeapSnapshot rejects with the TIMEOUT error
@@ -468,9 +468,11 @@ describe('captureHeapSnapshot', () => {
     // The fence must still be HELD: take() hasn't even rejected yet, and the real
     // native op is still pending.
     expect(settledFired).toBe(false);
-    // Let take() reject (grace-expiry native-pending). The fence must STILL be held
-    // — the tracked settlement chains onto nativePending, which is unresolved.
-    await new Promise((r) => setTimeout(r, 60));
+    // Let take() reject (grace-expiry native-pending) and give the tracked chain
+    // ample time. The fence must STILL be held — the tracked settlement chains onto
+    // nativePending, which is unresolved. Wide margin (well past take()'s 150ms
+    // rejection) so this is robust under full-suite load.
+    await new Promise((r) => setTimeout(r, 300));
     expect(onNativeSettled).not.toHaveBeenCalled();
     // Now the REAL native op settles → onNativeSettled finally fires.
     resolveNative?.();
