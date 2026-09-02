@@ -6,6 +6,7 @@ export type BrowserDataScope = 'global' | 'conversation';
 export type BrowserControlPolicy = 'allow' | 'ask' | 'deny';
 export type BrowserPasswordAccess = 'user-only' | 'ask' | 'automatic';
 export type BrowserSearchProvider = 'duckduckgo' | 'google' | 'bing';
+export type BrowserScriptedInteractionMode = 'blocking' | 'dismissible' | 'bypassed';
 export type BrowserTabOwner = 'user' | 'assistant';
 
 export type BrowserTab = {
@@ -21,8 +22,23 @@ export type BrowserTab = {
   muted: boolean;
   discarded: boolean;
   /** Kai evaluated caller-provided JavaScript in the current document. The
-   * native page stays detached until a new top-level document commits. */
+   * page stays visible so the user can watch the assistant, but its physical
+   * input handling and run-end lifetime depend on `scriptedInteractionMode`. */
   reloadRequired: boolean;
+  /** Resolved policy governing how this script-tainted page treats the user.
+   * Mirrors `config.browser.scriptedPageInteraction` and is read live so the
+   * banner matches exactly what the main process is currently enforcing. */
+  scriptedInteractionMode: BrowserScriptedInteractionMode;
+  /** True once the user's physical input into a locked tainted page has been
+   * blocked at least once (deferred warning: hover never sets this). The
+   * renderer only shows the reload banner while this is true. */
+  scriptedWarningActive: boolean;
+  /** Whether the reload banner should offer a Dismiss action (only in
+   * `dismissible` mode, before the user has dismissed the current taint). */
+  scriptedWarningDismissable: boolean;
+  /** Monotonic identity of the current script taint. The renderer echoes this
+   * back on dismiss so a stale click cannot unlock a re-tainted document. */
+  scriptedTaintEpoch: number;
   active: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
@@ -834,6 +850,16 @@ export type BrowserBridge = {
   menuAction: (conversationId: string, action: BrowserMenuAction) => Promise<void>;
   reorderTabs: (conversationId: string, orderedTabIds: string[]) => Promise<void>;
   navigate: (conversationId: string, tabId: string, input: string) => Promise<void>;
+  /** Dismiss the reload warning on a script-tainted tab so the user may
+   * interact with it (only honored in `dismissible` mode). The documentToken +
+   * taintEpoch identify the exact tainted document so a stale click cannot
+   * unlock a replacement or a newly re-tainted page. */
+  dismissScriptedWarning: (
+    conversationId: string,
+    tabId: string,
+    documentToken: string,
+    taintEpoch: number,
+  ) => Promise<void>;
   mount: (conversationId: string, bounds: BrowserBounds | null) => Promise<void>;
   setChromeFocus: (conversationId: string, focused: boolean) => Promise<void>;
   find: (

@@ -10,6 +10,7 @@ type BrowserConfig = {
   readAccess?: 'allow' | 'ask' | 'deny';
   structuredActions?: 'allow' | 'ask' | 'deny';
   scriptInjection?: 'allow' | 'ask' | 'deny';
+  scriptedPageInteraction?: 'blocking' | 'dismissible' | 'bypassed';
   passwordAccess?: 'user-only' | 'ask' | 'automatic';
   offerToSavePasswords?: boolean;
   searchProvider?: 'duckduckgo' | 'google' | 'bing';
@@ -144,6 +145,26 @@ export const BrowserSettings: FC<SettingsProps & { conversationId: string | null
           value={browser.scriptInjection ?? 'allow'}
           onChange={(value) => void updateConfig('browser.scriptInjection', value)}
         />
+        <div data-setting-id="browser.scriptedPageInteraction">
+          <label htmlFor="browser-scripted-interaction" className="mb-1 block text-[10px] text-muted-foreground">
+            After the AI runs JavaScript on a page
+          </label>
+          <select
+            id="browser-scripted-interaction"
+            className={settingsSelectClass}
+            value={browser.scriptedPageInteraction ?? 'blocking'}
+            onChange={(event) => void updateConfig('browser.scriptedPageInteraction', event.target.value)}
+          >
+            <option value="blocking">Block my interaction until I reload (default)</option>
+            <option value="dismissible">Warn me, allow interaction after I dismiss</option>
+            <option value="bypassed">Allow interaction — show a caution icon only</option>
+          </select>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            The live page stays visible in every mode so you can watch the AI. A page the AI has scripted may keep
+            hidden listeners running; “Allow interaction” lets you type into it and keeps it alive after the AI finishes
+            — proceed with caution.
+          </p>
+        </div>
         <Toggle
           id="browser.aiAllowPrivateNetwork"
           label="Allow AI navigation to direct private-network IPs and localhost"

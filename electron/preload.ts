@@ -1085,6 +1085,8 @@ const appAPI = {
       ipcRenderer.invoke('browser:reorder-tabs', conversationId, orderedTabIds),
     navigate: (conversationId: string, tabId: string, input: string) =>
       ipcRenderer.invoke('browser:navigate', conversationId, tabId, input),
+    dismissScriptedWarning: (conversationId: string, tabId: string, documentToken: string, taintEpoch: number) =>
+      ipcRenderer.invoke('browser:dismiss-scripted-warning', conversationId, tabId, documentToken, taintEpoch),
     mount: (conversationId: string, bounds: BrowserBounds | null) =>
       ipcRenderer.invoke('browser:mount', conversationId, bounds),
     setChromeFocus: (conversationId: string, focused: boolean) =>

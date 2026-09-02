@@ -140,6 +140,7 @@ function buildDefaultStub(): AppLike {
       menuAction: async () => undefined,
       reorderTabs: async () => undefined,
       navigate: async () => undefined,
+      dismissScriptedWarning: async () => undefined,
       mount: async () => undefined,
       setChromeFocus: async () => undefined,
       find: async () => undefined,

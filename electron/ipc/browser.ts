@@ -91,6 +91,11 @@ export function registerBrowserHandlers(
   handle('browser:navigate', (conversationId: string, tabId: string, input: string) =>
     getBrowserManager().navigate(conversationId, tabId, input),
   );
+  handle(
+    'browser:dismiss-scripted-warning',
+    (conversationId: string, tabId: string, documentToken: string, taintEpoch: number) =>
+      getBrowserManager().dismissScriptedWarning(conversationId, tabId, documentToken, taintEpoch),
+  );
   handleWithEvent(
     'browser:mount',
     (event, conversationId: string, bounds: BrowserBounds | null) => {

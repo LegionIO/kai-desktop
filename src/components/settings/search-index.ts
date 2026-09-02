@@ -78,6 +78,23 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     keywords: ['evaluate', 'injected scripts', 'allow', 'ask', 'deny'],
   },
   {
+    id: 'browser.scriptedPageInteraction',
+    label: 'After the AI runs JavaScript on a page',
+    section: 'browser',
+    keywords: [
+      'reload',
+      'javascript',
+      'overlay',
+      'warning',
+      'banner',
+      'watch',
+      'block',
+      'dismiss',
+      'bypass',
+      'caution',
+    ],
+  },
+  {
     id: 'browser.passwordAccess',
     label: 'AI saved-password access',
     section: 'browser',

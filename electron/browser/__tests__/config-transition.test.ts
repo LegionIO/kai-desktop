@@ -12,6 +12,7 @@ function config(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
     structuredActions: 'allow',
     scriptInjection: 'allow',
     passwordAccess: 'user-only',
+    scriptedPageInteraction: 'blocking',
     offerToSavePasswords: true,
     searchProvider: 'duckduckgo',
     aiAllowPrivateNetwork: false,

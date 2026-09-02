@@ -125,6 +125,7 @@ import {
   shouldFocusBrowserChrome,
 } from './shortcuts.js';
 import type { BrowserAwareApplicationMenuCommand, BrowserAwareEditCommand } from './edit-menu.js';
+import { clipboardCommandWritesIntoPage } from './edit-menu.js';
 import {
   assistantMayControlTab,
   assistantPopupOwner,
@@ -620,6 +621,16 @@ type InternalTab = {
     kind?: 'pointerdown' | 'keydown' | 'wheel' | 'input' | 'touchstart';
   } | null;
   scriptTainted: boolean;
+  /** Monotonic identity of the current script taint, bumped every time the tab
+   * becomes script-tainted. A dismissal is keyed to the epoch it was made
+   * against so a stale click cannot unlock a re-tainted document. */
+  scriptTaintEpoch: number;
+  /** The `scriptTaintEpoch` the user dismissed the reload warning for, in
+   * `dismissible` mode. `null` when the current taint has not been dismissed. */
+  scriptWarningDismissedEpoch: number | null;
+  /** Set once the user's physical input into a locked tainted page has been
+   * blocked at least once. Drives the deferred warning; hover never sets it. */
+  scriptWarningPresented: boolean;
   privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
   /** Irreversible document-start membrane that prevents a remote page from
    * opening native print UI while this renderer is assistant-controlled. */
@@ -1571,6 +1582,7 @@ export class BrowserManager {
   private structuredActionsPolicy: AppConfig['browser']['structuredActions'];
   private scriptInjectionPolicy: AppConfig['browser']['scriptInjection'];
   private passwordAccessPolicy: AppConfig['browser']['passwordAccess'];
+  private scriptedPageInteractionPolicy: AppConfig['browser']['scriptedPageInteraction'];
   private aiAllowPrivateNetwork: boolean;
   private hostRendererAuthorityGeneration = 0;
   private hostRendererAuthorityAvailable = false;
@@ -1594,6 +1606,7 @@ export class BrowserManager {
     this.structuredActionsPolicy = browserConfig.structuredActions ?? 'allow';
     this.scriptInjectionPolicy = browserConfig.scriptInjection ?? 'allow';
     this.passwordAccessPolicy = browserConfig.passwordAccess ?? 'user-only';
+    this.scriptedPageInteractionPolicy = browserConfig.scriptedPageInteraction ?? 'blocking';
     this.aiAllowPrivateNetwork = browserConfig.aiAllowPrivateNetwork ?? false;
     this.validatingProxy = new BrowserValidatingProxy((url) =>
       session.fromPartition(browserSystemProxyResolverPartition()).resolveProxy(url),
@@ -1879,6 +1892,20 @@ export class BrowserManager {
    * the full DOM + CDP scan also covers populated password fields in closed
    * author shadow roots. */
   dispatchClipboardCommand(contents: WebContents, command: BrowserAwareEditCommand): boolean {
+    // Single chokepoint for every clipboard route into a managed page: keyboard
+    // shortcut, application-menu Edit role, and context-menu item all funnel
+    // here. On a locked, script-tainted page, refuse writes INTO the page
+    // (paste / cut) — that is the user-secret-entry vector the shield closes —
+    // and claim the command (return true) so no caller falls back to the
+    // unguarded native `contents[command]()`. Copy reads out and is allowed.
+    if (clipboardCommandWritesIntoPage(command)) {
+      const tabId = this.webContentsToTab.get(contents.id);
+      const tab = tabId ? this.tabs.get(tabId) : undefined;
+      if (tab && tab.view?.webContents === contents && this.userInputBlockedForTaint(tab)) {
+        if (this.presentScriptedWarning(tab)) this.emitTabs(tab.shell.conversationId);
+        return true;
+      }
+    }
     return this.dispatchGuardedClipboardOperation(contents, () => contents[command](), undefined, true);
   }
 
@@ -2320,6 +2347,18 @@ export class BrowserManager {
     this.structuredActionsPolicy = nextStructuredActions;
     this.scriptInjectionPolicy = nextScriptInjection;
     this.passwordAccessPolicy = nextPasswordAccess;
+    const previousScriptedPageInteraction = this.scriptedPageInteractionPolicy;
+    this.scriptedPageInteractionPolicy = config.scriptedPageInteraction ?? this.scriptedPageInteractionPolicy;
+    if (previousScriptedPageInteraction !== this.scriptedPageInteractionPolicy) {
+      // The resolved mode is emitted per tab and enforced live. Re-emit every
+      // script-tainted tab so its banner/lock presentation tracks the new
+      // policy immediately (tightening re-locks; loosening unlocks going
+      // forward). Enforcement paths read the field live, so no snapshot exists
+      // to become stale.
+      for (const tab of this.tabs.values()) {
+        if (tab.scriptTainted || tab.shell.reloadRequired) changedConversations.add(tab.shell.conversationId);
+      }
+    }
     this.aiAllowPrivateNetwork = config.aiAllowPrivateNetwork ?? this.aiAllowPrivateNetwork;
     for (const tab of this.tabs.values()) {
       if (tab.view && !tab.view.webContents.isDestroyed()) {
@@ -3165,8 +3204,18 @@ export class BrowserManager {
       if (tab.aiControlOwnerId === runId) {
         tab.aiControlOwnerId = null;
         tab.aiControlGeneration = null;
-        if ((tab.scriptTainted || tab.assistantNativeUiNewDocumentGuard || dialogsDisabledForRun) && tab.view) {
-          const guardedOnly = !tab.scriptTainted && !!(tab.assistantNativeUiNewDocumentGuard || dialogsDisabledForRun);
+        // The native-UI/dialog membranes are irreversible and always require a
+        // teardown. A script taint requires teardown too — EXCEPT when the user
+        // has opted, per mode, to keep the scripted page alive and interactive
+        // (`bypassed`, or a `dismissible` tab dismissed for its current taint).
+        // That is a deliberate, user-accepted risk: the retained renderer can
+        // still hold AI-installed timers/workers/listeners/authenticated
+        // fetches. `blocking` (default) and an undismissed `dismissible` keep
+        // the historical teardown.
+        const guardForcesTeardown = !!(tab.assistantNativeUiNewDocumentGuard || dialogsDisabledForRun);
+        const scriptTaintForcesTeardown = tab.scriptTainted && !this.scriptedRendererMayPersist(tab);
+        if ((scriptTaintForcesTeardown || guardForcesTeardown) && tab.view) {
+          const guardedOnly = !scriptTaintForcesTeardown && guardForcesTeardown;
           // Arbitrary evaluation can leave timers, dedicated workers, event
           // listeners, and authenticated fetches alive in the page. A
           // Script-evaluated pages can retain arbitrary timers, workers, and
@@ -5158,9 +5207,9 @@ export class BrowserManager {
     contents: WebContents,
     event: Electron.Event,
     inputType: Electron.InputEvent['type'],
-  ): void {
+  ): boolean {
     const pending = this.pendingSyntheticInputs.get(contents.id);
-    if (!pending || pending.tabId !== tab.shell.id || pending.expectedType !== inputType) return;
+    if (!pending || pending.tabId !== tab.shell.id || pending.expectedType !== inputType) return false;
     this.pendingSyntheticInputs.delete(contents.id);
     try {
       this.publishAutomationGestureArm(contents, pending.arm);
@@ -5168,6 +5217,7 @@ export class BrowserManager {
       pending.error = error instanceof Error ? error : new Error(String(error));
       event.preventDefault();
     }
+    return true;
   }
 
   private releaseAiNetworkRestrictionForUser(tab: InternalTab): void {
@@ -6281,7 +6331,82 @@ export class BrowserManager {
       url: boundedBrowserUrl(tab.shell.url),
       active,
       documentToken,
+      // Derive scripted-interaction presentation from live policy + per-tab
+      // taint state so the renderer banner exactly matches what main enforces.
+      scriptedInteractionMode: this.scriptedPageInteractionPolicy,
+      scriptedWarningActive: this.scriptedWarningActiveForTab(tab),
+      scriptedWarningDismissable: this.scriptedWarningDismissableForTab(tab),
+      scriptedTaintEpoch: tab.scriptTaintEpoch,
     };
+  }
+
+  /** Whether the user has opted (per mode) to keep a script-tainted renderer
+   * alive past the assistant run instead of the historical teardown. Only
+   * `bypassed`, or a `dismissible` tab dismissed for its current taint epoch.
+   * A user-accepted risk: retained arbitrary JS can keep timers/workers/
+   * listeners/authenticated fetches alive. `blocking` never persists. */
+  private scriptedRendererMayPersist(tab: InternalTab): boolean {
+    switch (this.scriptedPageInteractionPolicy) {
+      case 'bypassed':
+        return true;
+      case 'dismissible':
+        return tab.scriptWarningDismissedEpoch === tab.scriptTaintEpoch;
+      case 'blocking':
+      default:
+        return false;
+    }
+  }
+
+  /** Live policy check: does the user's own physical input reach this tainted
+   * page? `blocking` always shields; `dismissible` shields until the user has
+   * dismissed the current taint; `bypassed` never shields. Non-tainted tabs are
+   * never shielded. Read live (never snapshotted) so a tightened policy
+   * immediately re-locks an already-tainted tab. */
+  private userInputBlockedForTaint(tab: InternalTab): boolean {
+    if (!tab.scriptTainted && !tab.shell.reloadRequired) return false;
+    switch (this.scriptedPageInteractionPolicy) {
+      case 'bypassed':
+        return false;
+      case 'dismissible':
+        return tab.scriptWarningDismissedEpoch !== tab.scriptTaintEpoch;
+      case 'blocking':
+      default:
+        return true;
+    }
+  }
+
+  /** The renderer shows the reload banner only once a physical interaction has
+   * actually been blocked (deferred warning). `bypassed` never shows a banner. */
+  private scriptedWarningActiveForTab(tab: InternalTab): boolean {
+    return this.userInputBlockedForTaint(tab) && tab.scriptWarningPresented;
+  }
+
+  private scriptedWarningDismissableForTab(tab: InternalTab): boolean {
+    return (
+      (tab.scriptTainted || tab.shell.reloadRequired) &&
+      this.scriptedPageInteractionPolicy === 'dismissible' &&
+      tab.scriptWarningDismissedEpoch !== tab.scriptTaintEpoch
+    );
+  }
+
+  /** Single chokepoint clearing every script-taint latch. Call only from a
+   * genuine top-level document commit/reload — never from scope reset, origin
+   * sanitation, or profile clearing, which have their own reasons to touch
+   * `reloadRequired` and must not silently unlock a still-scripted renderer. */
+  private clearScriptedTaint(tab: InternalTab): void {
+    tab.scriptTainted = false;
+    tab.shell.reloadRequired = false;
+    tab.scriptWarningDismissedEpoch = null;
+    tab.scriptWarningPresented = false;
+  }
+
+  /** Record that a physical user interaction was blocked on a locked tainted
+   * tab, so the deferred warning becomes visible. Returns true if the banner
+   * presentation newly changed (caller re-emits). */
+  private presentScriptedWarning(tab: InternalTab): boolean {
+    if (tab.scriptWarningPresented) return false;
+    tab.scriptWarningPresented = true;
+    return true;
   }
 
   getState(conversationId: string): BrowserManagerState {
@@ -6626,6 +6751,10 @@ export class BrowserManager {
             muted: false,
             discarded: false,
             reloadRequired: false,
+            scriptedInteractionMode: this.scriptedPageInteractionPolicy,
+            scriptedWarningActive: false,
+            scriptedWarningDismissable: false,
+            scriptedTaintEpoch: 0,
             active: false,
             canGoBack: false,
             canGoForward: false,
@@ -6658,6 +6787,9 @@ export class BrowserManager {
             popupGesture: null,
             assistantGesture: null,
             scriptTainted: false,
+            scriptTaintEpoch: 0,
+            scriptWarningDismissedEpoch: null,
+            scriptWarningPresented: false,
             trustedUserNavigation: false,
             trustedUserNavigationTarget: null,
             trustedUserNavigationRequestId: null,
@@ -7589,14 +7721,10 @@ export class BrowserManager {
     userSelectedFallback = false,
   ): void {
     const tab = tabId ? this.tabs.get(tabId) : undefined;
-    if (
-      !tab ||
-      this.mountedConversationId !== conversationId ||
-      !this.mountedBounds ||
-      !this.browserEnabled ||
-      tab.scriptTainted ||
-      tab.shell.reloadRequired
-    ) {
+    // A script-tainted neighbor stays visible (see attachActiveView): the user
+    // watches the assistant while physical input is shielded elsewhere. Only the
+    // absence of a mountable renderer forces the fallback/blank path here.
+    if (!tab || this.mountedConversationId !== conversationId || !this.mountedBounds || !this.browserEnabled) {
       const presentationTransition = tab && userSelectedFallback ? this.prepareTabForUserPresentation(tab) : null;
       if (presentationTransition) {
         void presentationTransition.then(
@@ -7715,6 +7843,35 @@ export class BrowserManager {
       throw new Error('Tab reorder must include every tab in this chat exactly once.');
     }
     this.tabOrder.set(conversationId, [...orderedTabIds]);
+    this.emitTabs(conversationId);
+  }
+
+  /** Dismiss the reload warning on a script-tainted tab so the user may
+   * interact with it. Only honored in `dismissible` mode. The documentToken +
+   * taintEpoch must match the live tainted document, so a stale click cannot
+   * unlock a replacement or a page that was re-tainted after the banner was
+   * shown. Any mismatch is a silent no-op. */
+  async dismissScriptedWarning(
+    conversationId: string,
+    tabId: string,
+    documentToken: string,
+    taintEpoch: number,
+  ): Promise<void> {
+    const tab = this.tabs.get(tabId);
+    if (!tab || tab.shell.conversationId !== conversationId) return;
+    if (this.scriptedPageInteractionPolicy !== 'dismissible') return;
+    if (!tab.scriptTainted && !tab.shell.reloadRequired) return;
+    if (tab.scriptTaintEpoch !== taintEpoch) return;
+    const contents = tab.view?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    let currentToken: string | undefined;
+    try {
+      currentToken = this.browserPageLeaseToken(this.captureBrowserPageLease(tab, contents));
+    } catch {
+      return;
+    }
+    if (!currentToken || currentToken !== documentToken) return;
+    tab.scriptWarningDismissedEpoch = tab.scriptTaintEpoch;
     this.emitTabs(conversationId);
   }
 
@@ -8376,7 +8533,11 @@ export class BrowserManager {
     if (!win || win.isDestroyed()) return;
     const active = this.activeTabs.get(conversationId);
     const tab = active ? this.tabs.get(active) : null;
-    if (!tab?.view || tab.scriptTainted || tab.shell.reloadRequired) {
+    // A script-tainted page stays visible so the user can watch the assistant;
+    // physical user input is shielded at the input-event/menu chokepoints
+    // instead of by blanking the surface. Only refuse to attach when there is no
+    // renderer to show.
+    if (!tab?.view) {
       this.detachAttachedView();
       return;
     }
@@ -9231,6 +9392,10 @@ export class BrowserManager {
       // this callback returns. Keep that renderer detached and make turn
       // cleanup reclaim it even if the shell is later marked Keep open.
       reloadRequired: scriptCreatedPopup,
+      scriptedInteractionMode: this.scriptedPageInteractionPolicy,
+      scriptedWarningActive: false,
+      scriptedWarningDismissable: false,
+      scriptedTaintEpoch: scriptCreatedPopup ? 1 : 0,
       active: false,
       canGoBack: false,
       canGoForward: false,
@@ -9268,6 +9433,9 @@ export class BrowserManager {
       popupGesture: null,
       assistantGesture: null,
       scriptTainted: scriptCreatedPopup,
+      scriptTaintEpoch: scriptCreatedPopup ? 1 : 0,
+      scriptWarningDismissedEpoch: null,
+      scriptWarningPresented: false,
       trustedUserNavigation: false,
       trustedUserNavigationTarget: null,
       trustedUserNavigationRequestId: null,
@@ -9609,8 +9777,9 @@ export class BrowserManager {
         }
       }
       if (scriptedHistoryEvicted && !tab.privateNetworkNewDocumentGuard) {
-        tab.scriptTainted = false;
-        tab.shell.reloadRequired = false;
+        // A genuine top-level commit is the one place every script-taint latch
+        // clears together (taint, reload warning, dismissal epoch, presented).
+        this.clearScriptedTaint(tab);
       }
       tab.popupGesture = null;
       tab.assistantGesture = null;
@@ -9801,15 +9970,40 @@ export class BrowserManager {
         event.preventDefault();
         return;
       }
-      this.handlePendingSyntheticInput(tab, contents, event, input.type);
+      const synthetic = this.handlePendingSyntheticInput(tab, contents, event, input.type);
+      // Real (non-automation) pointer input into a locked, script-tainted page is
+      // shielded: swallow it and surface the deferred reload warning. Assistant
+      // synthetic input carried its one-shot token and is exempt. Hover/move is
+      // not delivered as before-mouse-event pointer presses we block here — this
+      // fires on button/wheel activity, matching "user started interacting".
+      if (!synthetic && this.userInputBlockedForTaint(tab)) {
+        event.preventDefault();
+        if (this.presentScriptedWarning(tab)) this.emitTabs(tab.shell.conversationId);
+      }
     });
     contents.on('before-input-event', (event, input) => {
       if (!ownsContents()) {
         event.preventDefault();
         return;
       }
-      this.handlePendingSyntheticInput(tab, contents, event, input.type as Electron.InputEvent['type']);
+      const synthetic = this.handlePendingSyntheticInput(
+        tab,
+        contents,
+        event,
+        input.type as Electron.InputEvent['type'],
+      );
+      // Recovery/navigation shortcuts (Reload, Focus URL, Back/Forward, Stop) and
+      // the clipboard chokepoint run first so the user can always escape a locked
+      // page; handlePageShortcut calls preventDefault for anything it claims.
       this.handlePageShortcut(tab, contents, event, input);
+      if (event.defaultPrevented || synthetic) return;
+      // Any remaining physical keystroke into a locked, script-tainted page is
+      // shielded (keydown/keyup/char, including IME/composition commits, which
+      // arrive as input events). Assistant synthetic input is exempt above.
+      if (this.userInputBlockedForTaint(tab)) {
+        event.preventDefault();
+        if (this.presentScriptedWarning(tab)) this.emitTabs(tab.shell.conversationId);
+      }
     });
   }
 
@@ -11351,9 +11545,10 @@ export class BrowserManager {
     const clipboardCommand = input.type === 'keyDown' ? resolveClipboardShortcutCommand(shortcutKeys) : null;
     if (clipboardCommand) {
       event.preventDefault();
-      // The event belongs to a manager-created page, so failure to claim it is
-      // treated as a stale identity and remains blocked rather than falling
-      // through to Chromium's unguarded native shortcut.
+      // dispatchClipboardCommand is the single chokepoint that denies paste/cut
+      // into a locked script-tainted page; failure to claim is treated as a
+      // stale identity and remains blocked rather than falling through to
+      // Chromium's unguarded native shortcut.
       this.dispatchClipboardCommand(contents, clipboardCommand);
       return;
     }
@@ -11590,10 +11785,14 @@ export class BrowserManager {
       menu.append(new MenuItem({ type: 'separator' }));
     }
     if (params.isEditable) {
+      // On a locked, script-tainted page, disable the clipboard writes INTO the
+      // page (Cut/Paste). Copy/Select All read out and stay enabled. This
+      // mirrors the enforcement in dispatchClipboardCommand so the menu is honest.
+      const clipboardWriteBlocked = this.userInputBlockedForTaint(tab);
       menu.append(
         new MenuItem({
           label: 'Cut',
-          enabled: params.editFlags.canCut && !tab.shell.sensitive,
+          enabled: params.editFlags.canCut && !tab.shell.sensitive && !clipboardWriteBlocked,
           click: () => runClipboardCommand('cut'),
         }),
       );
@@ -11607,7 +11806,7 @@ export class BrowserManager {
       menu.append(
         new MenuItem({
           label: 'Paste',
-          enabled: params.editFlags.canPaste && !tab.shell.sensitive,
+          enabled: params.editFlags.canPaste && !tab.shell.sensitive && !clipboardWriteBlocked,
           click: () => runClipboardCommand('paste'),
         }),
       );
@@ -11971,6 +12170,18 @@ export class BrowserManager {
       // concurrent with an active assistant operation. (The page preload
       // suppresses unmatched derived `input` events so checkbox/radio follow-up
       // does not overwrite the initiating assistant provenance.)
+      //
+      // On a locked, script-tainted page this trusted gesture (hover excluded —
+      // only pointerdown/keydown/wheel/touchstart are reported here) is exactly
+      // the "user started interacting" signal that reveals the deferred reload
+      // warning. Do NOT grant it popup/login-save provenance while shielded: the
+      // physical event itself is being swallowed at before-input/before-mouse.
+      if (this.userInputBlockedForTaint(tab)) {
+        if (this.presentScriptedWarning(tab)) this.emitTabs(tab.shell.conversationId);
+        tab.lastUsedAt = at;
+        event.returnValue = false;
+        return;
+      }
       tab.trustedGestureGeneration = (tab.trustedGestureGeneration ?? 0) + 1;
       tab.popupGesture = {
         source: 'user',
@@ -14009,7 +14220,16 @@ export class BrowserManager {
   private quarantineScriptedTab(tab: InternalTab): void {
     tab.scriptTainted = true;
     tab.shell.reloadRequired = true;
-    if (this.attachedView === tab.view) this.detachAttachedView();
+    tab.scriptTaintEpoch += 1;
+    // A fresh taint re-locks the page regardless of any prior dismissal, and the
+    // deferred warning starts hidden until the user actually tries to interact.
+    tab.scriptWarningDismissedEpoch = null;
+    tab.scriptWarningPresented = false;
+    // The page deliberately stays attached so the user can watch the assistant
+    // drive it. Physical user input is instead shielded at the input-event and
+    // menu chokepoints via userInputBlockedForTaint(); assistant synthetic input
+    // (carrying a valid automation token) continues to flow. In `bypassed` mode
+    // nothing is shielded. See run-end teardown for the renderer-lifetime policy.
     this.emitTabs(tab.shell.conversationId);
   }
 

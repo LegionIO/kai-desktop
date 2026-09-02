@@ -1,6 +1,15 @@
 import type { WebContents } from 'electron';
 
 export type BrowserAwareEditCommand = 'cut' | 'copy' | 'paste';
+
+/** Clipboard edit commands that write the user's clipboard contents INTO the
+ * page (as opposed to `copy`, which reads out of it). These are the ones a
+ * locked, script-tainted page must refuse so the user cannot paste a secret
+ * into a page whose JavaScript the assistant has run. */
+export function clipboardCommandWritesIntoPage(command: BrowserAwareEditCommand): boolean {
+  return command === 'paste' || command === 'cut';
+}
+
 export type BrowserAwareApplicationMenuCommand =
   | 'find'
   | 'reload'

@@ -127,6 +127,7 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       structuredActionsPolicy: 'allow',
       scriptInjectionPolicy: 'allow',
       passwordAccessPolicy: 'user-only',
+      scriptedPageInteractionPolicy: 'blocking',
       aiAllowPrivateNetwork: false,
       startupDownloadReconciliation: Promise.resolve(),
       getWindow: () => null,
@@ -10633,7 +10634,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
   });
 
-  it('quarantines a scripted page before evaluation and keeps it detached after failure', async () => {
+  it('quarantines a scripted page before evaluation while keeping it visible', async () => {
     const view = { webContents: { isDestroyed: () => false } };
     const tab = {
       shell: {
@@ -10650,15 +10651,22 @@ describe('browser manager renderer lifecycle', () => {
       generation: 3,
       assistantScriptDepth: 0,
       scriptTainted: false,
+      scriptTaintEpoch: 0,
+      scriptWarningDismissedEpoch: null,
+      scriptWarningPresented: false,
     };
     const detachAttachedView = vi.fn();
     const emitTabs = vi.fn();
     const installPrivateNetworkNewDocumentGuard = vi.fn(async () => undefined);
     const markScriptCleanupOrigin = vi.fn();
     const evaluateWithDeadline = vi.fn(async () => {
+      // The page is quarantined (tainted + reload latch + epoch bump) but stays
+      // ATTACHED so the user can watch the assistant; physical input is shielded
+      // elsewhere rather than by blanking the surface.
       expect(tab.scriptTainted).toBe(true);
       expect(tab.shell.reloadRequired).toBe(true);
-      expect(detachAttachedView).toHaveBeenCalledOnce();
+      expect(tab.scriptTaintEpoch).toBe(1);
+      expect(detachAttachedView).not.toHaveBeenCalled();
       throw new Error('script failed');
     });
     const manager = managerWithoutConstructor({
@@ -10680,6 +10688,7 @@ describe('browser manager renderer lifecycle', () => {
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
       setAutomationOverlay: vi.fn(async () => undefined),
       storeForScope: () => ({ markScriptCleanupOrigin }),
+      scriptedPageInteractionPolicy: 'blocking',
       tabs: new Map([[tab.shell.id, tab]]),
       withAssistantControl: (
         _tab: unknown,
@@ -10693,6 +10702,7 @@ describe('browser manager renderer lifecycle', () => {
     );
     expect(tab.scriptTainted).toBe(true);
     expect(tab.shell.reloadRequired).toBe(true);
+    expect(detachAttachedView).not.toHaveBeenCalled();
     expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledWith(tab, view.webContents, undefined, {});
     expect(markScriptCleanupOrigin).toHaveBeenCalledWith('https://example.com');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
@@ -26924,5 +26934,219 @@ describe('browser manager renderer lifecycle', () => {
         selector: 's'.repeat(8 * 1024 + 1),
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe('browser scripted-page interaction modes', () => {
+  type ScriptedMode = 'blocking' | 'dismissible' | 'bypassed';
+
+  function scriptedTab(overrides: Record<string, unknown> = {}) {
+    return {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        reloadRequired: true,
+      },
+      view: { webContents: { isDestroyed: () => false } },
+      scriptTainted: true,
+      scriptTaintEpoch: 1,
+      scriptWarningDismissedEpoch: null as number | null,
+      scriptWarningPresented: false,
+      aiActionDepth: 0,
+      ...overrides,
+    };
+  }
+
+  function managerForMode(mode: ScriptedMode, tab: ReturnType<typeof scriptedTab>, emitTabs = vi.fn()) {
+    return managerWithoutConstructor({
+      scriptedPageInteractionPolicy: mode,
+      emitTabs,
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      tabs: new Map([[tab.shell.id, tab]]),
+      webContentsToTab: new Map([[42, tab.shell.id]]),
+    });
+  }
+
+  describe('userInputBlockedForTaint', () => {
+    it('shields physical input in blocking mode', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('blocking', tab);
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(true);
+    });
+
+    it('never shields in bypassed mode', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('bypassed', tab);
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(false);
+    });
+
+    it('shields dismissible until the current taint epoch is dismissed', () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 3, scriptWarningDismissedEpoch: null });
+      const manager = managerForMode('dismissible', tab);
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(true);
+      tab.scriptWarningDismissedEpoch = 3;
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(false);
+    });
+
+    it('re-locks a dismissible tab that is re-tainted after dismissal', () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 3, scriptWarningDismissedEpoch: 3 });
+      const manager = managerForMode('dismissible', tab);
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(false);
+      // A new evaluation bumps the epoch; the stale dismissal no longer applies.
+      tab.scriptTaintEpoch = 4;
+      expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(true);
+    });
+
+    it('does not shield a non-tainted tab in any mode', () => {
+      const tab = scriptedTab({
+        scriptTainted: false,
+        shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user', reloadRequired: false },
+      });
+      for (const mode of ['blocking', 'dismissible', 'bypassed'] as const) {
+        const manager = managerForMode(mode, tab);
+        expect(invokePrivate(manager, 'userInputBlockedForTaint', tab)).toBe(false);
+      }
+    });
+  });
+
+  describe('scriptedRendererMayPersist (run-end teardown gate)', () => {
+    it('blocking never persists the scripted renderer', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('blocking', tab);
+      expect(invokePrivate(manager, 'scriptedRendererMayPersist', tab)).toBe(false);
+    });
+
+    it('bypassed always persists', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('bypassed', tab);
+      expect(invokePrivate(manager, 'scriptedRendererMayPersist', tab)).toBe(true);
+    });
+
+    it('dismissible persists only once dismissed for the current epoch', () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 2, scriptWarningDismissedEpoch: null });
+      const manager = managerForMode('dismissible', tab);
+      expect(invokePrivate(manager, 'scriptedRendererMayPersist', tab)).toBe(false);
+      tab.scriptWarningDismissedEpoch = 2;
+      expect(invokePrivate(manager, 'scriptedRendererMayPersist', tab)).toBe(true);
+    });
+  });
+
+  describe('deferred warning', () => {
+    it('presentScriptedWarning flips warningPresented once and reports the change', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('blocking', tab);
+      expect(invokePrivate(manager, 'presentScriptedWarning', tab)).toBe(true);
+      expect(tab.scriptWarningPresented).toBe(true);
+      expect(invokePrivate(manager, 'presentScriptedWarning', tab)).toBe(false);
+    });
+
+    it('scriptedWarningActiveForTab is false until an interaction is presented', () => {
+      const tab = scriptedTab();
+      const manager = managerForMode('blocking', tab);
+      expect(invokePrivate(manager, 'scriptedWarningActiveForTab', tab)).toBe(false);
+      invokePrivate(manager, 'presentScriptedWarning', tab);
+      expect(invokePrivate(manager, 'scriptedWarningActiveForTab', tab)).toBe(true);
+    });
+
+    it('bypassed never activates the banner even after a presented interaction', () => {
+      const tab = scriptedTab({ scriptWarningPresented: true });
+      const manager = managerForMode('bypassed', tab);
+      expect(invokePrivate(manager, 'scriptedWarningActiveForTab', tab)).toBe(false);
+    });
+  });
+
+  describe('scriptedWarningDismissableForTab', () => {
+    it('is only true for an undismissed dismissible tab', () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 1, scriptWarningDismissedEpoch: null });
+      expect(invokePrivate(managerForMode('dismissible', tab), 'scriptedWarningDismissableForTab', tab)).toBe(true);
+      expect(invokePrivate(managerForMode('blocking', tab), 'scriptedWarningDismissableForTab', tab)).toBe(false);
+      expect(invokePrivate(managerForMode('bypassed', tab), 'scriptedWarningDismissableForTab', tab)).toBe(false);
+      tab.scriptWarningDismissedEpoch = 1;
+      expect(invokePrivate(managerForMode('dismissible', tab), 'scriptedWarningDismissableForTab', tab)).toBe(false);
+    });
+  });
+
+  describe('clearScriptedTaint', () => {
+    it('resets every taint latch together', () => {
+      const tab = scriptedTab({ scriptWarningDismissedEpoch: 1, scriptWarningPresented: true });
+      const manager = managerForMode('blocking', tab);
+      invokePrivate(manager, 'clearScriptedTaint', tab);
+      expect(tab.scriptTainted).toBe(false);
+      expect(tab.shell.reloadRequired).toBe(false);
+      expect(tab.scriptWarningDismissedEpoch).toBe(null);
+      expect(tab.scriptWarningPresented).toBe(false);
+    });
+  });
+
+  describe('quarantineScriptedTab', () => {
+    it('taints and bumps the epoch without detaching the view', () => {
+      const tab = scriptedTab({
+        scriptTainted: false,
+        scriptTaintEpoch: 0,
+        shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user', reloadRequired: false },
+      });
+      const detachAttachedView = vi.fn();
+      const emitTabs = vi.fn();
+      const manager = managerWithoutConstructor({
+        scriptedPageInteractionPolicy: 'blocking',
+        attachedView: tab.view,
+        detachAttachedView,
+        emitTabs,
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      invokePrivate(manager, 'quarantineScriptedTab', tab);
+      expect(tab.scriptTainted).toBe(true);
+      expect(tab.shell.reloadRequired).toBe(true);
+      expect(tab.scriptTaintEpoch).toBe(1);
+      expect(detachAttachedView).not.toHaveBeenCalled();
+      expect(emitTabs).toHaveBeenCalledWith('chat-1');
+    });
+  });
+
+  describe('dismissScriptedWarning', () => {
+    function tokenizedManager(mode: ScriptedMode, tab: ReturnType<typeof scriptedTab>, emitTabs = vi.fn()) {
+      return managerWithoutConstructor({
+        scriptedPageInteractionPolicy: mode,
+        emitTabs,
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        tabs: new Map([[tab.shell.id, tab]]),
+        captureBrowserPageLease: () => ({}),
+        browserPageLeaseToken: () => 'doc-token-current',
+      });
+    }
+
+    it('dismisses when token + epoch match in dismissible mode', async () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 5 });
+      const emitTabs = vi.fn();
+      const manager = tokenizedManager('dismissible', tab, emitTabs);
+      await manager.dismissScriptedWarning('chat-1', 'tab-1', 'doc-token-current', 5);
+      expect(tab.scriptWarningDismissedEpoch).toBe(5);
+      expect(emitTabs).toHaveBeenCalledWith('chat-1');
+    });
+
+    it('is a no-op on a stale taint epoch', async () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 6 });
+      const manager = tokenizedManager('dismissible', tab);
+      await manager.dismissScriptedWarning('chat-1', 'tab-1', 'doc-token-current', 5);
+      expect(tab.scriptWarningDismissedEpoch).toBe(null);
+    });
+
+    it('is a no-op on a stale document token', async () => {
+      const tab = scriptedTab({ scriptTaintEpoch: 5 });
+      const manager = tokenizedManager('dismissible', tab);
+      await manager.dismissScriptedWarning('chat-1', 'tab-1', 'doc-token-old', 5);
+      expect(tab.scriptWarningDismissedEpoch).toBe(null);
+    });
+
+    it('is ignored outside dismissible mode', async () => {
+      for (const mode of ['blocking', 'bypassed'] as const) {
+        const tab = scriptedTab({ scriptTaintEpoch: 5 });
+        const manager = tokenizedManager(mode, tab);
+        await manager.dismissScriptedWarning('chat-1', 'tab-1', 'doc-token-current', 5);
+        expect(tab.scriptWarningDismissedEpoch).toBe(null);
+      }
+    });
   });
 });

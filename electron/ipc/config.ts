@@ -263,6 +263,7 @@ function getDefaultConfig() {
       structuredActions: 'allow' as const,
       scriptInjection: 'allow' as const,
       passwordAccess: 'user-only' as const,
+      scriptedPageInteraction: 'blocking' as const,
       offerToSavePasswords: true,
       searchProvider: 'duckduckgo' as const,
       aiAllowPrivateNetwork: false,
@@ -1173,6 +1174,7 @@ function failClosedBrowserConfig(config: AppConfig): AppConfig {
       structuredActions: 'deny',
       scriptInjection: 'deny',
       passwordAccess: 'user-only',
+      scriptedPageInteraction: 'blocking',
       aiAllowPrivateNetwork: false,
     },
   };

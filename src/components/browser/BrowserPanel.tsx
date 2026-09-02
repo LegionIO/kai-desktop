@@ -625,14 +625,11 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   };
   const browserEnabled = browserConfig.enabled ?? true;
   const overlayOpen = menuOpen || siteInfoOpen || !!tabMenu || (urlFocused && suggestions.length > 0);
+  // A script-tainted page stays visible in every mode so the user can watch the
+  // assistant; the main process shields physical input instead of blanking the
+  // surface. So reloadRequired no longer hides the native view here.
   const nativeVisible =
-    browserEnabled &&
-    managerView === null &&
-    !overlayOpen &&
-    !!active &&
-    !active?.reloadRequired &&
-    available === true &&
-    !!conversationId;
+    browserEnabled && managerView === null && !overlayOpen && !!active && available === true && !!conversationId;
 
   const dismissBrowserMenu = useCallback(() => {
     browserMenuPreviewRequestRef.current += 1;
@@ -1598,6 +1595,20 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     [browser, conversationId],
   );
 
+  const dismissScriptedWarning = useCallback(
+    async (tab: BrowserTab) => {
+      // Echo the exact tainted-document identity (token + epoch) so a stale
+      // click cannot unlock a replacement or re-tainted page; main re-validates.
+      if (!browser || !conversationId || !tab.documentToken) return;
+      await browser
+        .dismissScriptedWarning(conversationId, tab.id, tab.documentToken, tab.scriptedTaintEpoch)
+        .catch(() => {
+          // A rejected dismissal simply leaves the page locked; no user-facing error.
+        });
+    },
+    [browser, conversationId],
+  );
+
   const closeTab = useCallback(
     (tab: BrowserTab, restoreFocus: boolean) => {
       if (!browser || !conversationId) return;
@@ -2251,6 +2262,18 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
             >
               <StarIcon className={cn('h-3.5 w-3.5', currentBookmarked && 'fill-amber-400 text-amber-400')} />
             </button>
+            {active?.reloadRequired && !active?.scriptedWarningActive && (
+              // Subtle persistent indicator that the assistant ran JavaScript on
+              // this page. Shown in `bypassed` mode (no banner) and before any
+              // blocked interaction has surfaced the full warning strip.
+              <span
+                className="ml-1 shrink-0 text-amber-500"
+                title="Kai ran JavaScript in this page — proceed with caution."
+                aria-label="Kai ran JavaScript in this page — proceed with caution"
+              >
+                <ShieldAlertIcon className="h-3.5 w-3.5" />
+              </span>
+            )}
           </div>
           {urlFocused && suggestions.length > 0 && (
             <div
@@ -2603,6 +2626,46 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         </div>
       )}
 
+      {!managerView && active?.scriptedWarningActive && (
+        // Rendered OUTSIDE data-browser-native-surface as a chrome strip: a
+        // renderer overlay intersecting the native WebContentsView would force
+        // it to detach (blank). This strip takes its own vertical space above
+        // the surface instead, so the live page stays visible below it.
+        <div
+          role="alert"
+          data-native-browser-overlay-ignore
+          className="flex shrink-0 flex-wrap items-center gap-2 border-b border-amber-500/40 bg-amber-50 px-3 py-2 text-xs dark:bg-amber-950/40"
+        >
+          <ShieldAlertIcon className="h-4 w-4 shrink-0 text-amber-500" />
+          <span className="min-w-0 flex-1 text-amber-900 dark:text-amber-200">
+            Kai ran JavaScript in this page. Reload it or navigate to a new URL before interacting with it.
+          </span>
+          <button
+            type="button"
+            className="rounded-md bg-primary px-2.5 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            onClick={() => void command(active, 'reload')}
+          >
+            Reload page
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-border bg-background px-2.5 py-1 text-xs hover:bg-accent"
+            onClick={focusOmnibox}
+          >
+            Enter another URL
+          </button>
+          {active.scriptedWarningDismissable && (
+            <button
+              type="button"
+              className="rounded-md px-2.5 py-1 text-xs text-muted-foreground hover:bg-accent"
+              onClick={() => void dismissScriptedWarning(active)}
+            >
+              Interact anyway
+            </button>
+          )}
+        </div>
+      )}
+
       <div
         id={viewportId}
         ref={viewportRef}
@@ -2666,36 +2729,6 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
             >
               Open a new tab
             </button>
-          </div>
-        )}
-        {!managerView && active?.reloadRequired && (
-          <div
-            role="alert"
-            className="flex h-full flex-col items-center justify-center gap-3 bg-background p-6 text-center"
-          >
-            <ShieldAlertIcon className="h-7 w-7 text-amber-500" />
-            <div>
-              <p className="text-sm font-medium">Reload required</p>
-              <p className="mt-1 max-w-sm text-xs text-muted-foreground">
-                Kai ran JavaScript in this page. Reload it or navigate to a new URL before interacting with it.
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              <button
-                type="button"
-                className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
-                onClick={() => void command(active, 'reload')}
-              >
-                Reload page
-              </button>
-              <button
-                type="button"
-                className="rounded-md border border-border bg-background px-3 py-1.5 text-xs hover:bg-accent"
-                onClick={focusOmnibox}
-              >
-                Enter another URL
-              </button>
-            </div>
           </div>
         )}
       </div>

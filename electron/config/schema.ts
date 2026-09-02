@@ -316,6 +316,15 @@ const browserConfigSchema = z
     offerToSavePasswords: z.boolean().default(true),
     searchProvider: z.enum(['duckduckgo', 'google', 'bing']).default('duckduckgo'),
     aiAllowPrivateNetwork: z.boolean().default(false),
+    // How a page the assistant has script-tainted treats the user afterward.
+    // The live page stays visible in every mode so the user can watch the AI;
+    // this only governs the reload warning and whether the user's own input
+    // reaches the tainted page. `blocking` (default) preserves the historical
+    // protection: physical input is shielded and the scripted renderer is torn
+    // down at run-end. `bypassed` (and a dismissed `dismissible`) keep the
+    // renderer alive and interactive — a user-accepted risk, because arbitrary
+    // page JS can leave listeners/timers/workers/authenticated fetches alive.
+    scriptedPageInteraction: z.enum(['blocking', 'dismissible', 'bypassed']).default('blocking'),
     idleDiscardMinutes: z.number().int().min(1).max(1440).default(10),
     maxTabsPerConversation: z.number().int().min(1).max(100).default(20),
     showBookmarksBar: z.boolean().default(false),
@@ -330,6 +339,7 @@ const browserConfigSchema = z
     offerToSavePasswords: true,
     searchProvider: 'duckduckgo',
     aiAllowPrivateNetwork: false,
+    scriptedPageInteraction: 'blocking',
     idleDiscardMinutes: 10,
     maxTabsPerConversation: 20,
     showBookmarksBar: false,
