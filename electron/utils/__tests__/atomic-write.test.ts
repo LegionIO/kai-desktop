@@ -12,7 +12,25 @@ import {
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { atomicWriteFile, atomicWriteFileSync } from '../atomic-write.js';
+import { atomicWriteFile, atomicWriteFileSync, isUnsupportedDirFsyncError } from '../atomic-write.js';
+
+describe('isUnsupportedDirFsyncError (dir-fsync log classification)', () => {
+  it('classifies as unsupported only the errnos that mean "directory fsync unsupported"', () => {
+    for (const code of ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF', 'EISDIR']) {
+      expect(isUnsupportedDirFsyncError(Object.assign(new Error(code), { code }))).toBe(true);
+    }
+  });
+
+  it('does NOT classify access-control or genuine I/O failures as "unsupported"', () => {
+    // These get the "failed (write already committed)" log message; NONE propagate
+    // — the dir-fsync is best-effort AFTER the rename has committed the write (R28P25).
+    for (const code of ['EACCES', 'EPERM', 'EIO', 'ENOSPC', 'EROFS', 'EDQUOT', undefined]) {
+      expect(isUnsupportedDirFsyncError(Object.assign(new Error(String(code)), code ? { code } : {}))).toBe(false);
+    }
+    expect(isUnsupportedDirFsyncError('not an error')).toBe(false);
+    expect(isUnsupportedDirFsyncError(undefined)).toBe(false);
+  });
+});
 
 describe('atomicWriteFileSync', () => {
   let dir: string;
@@ -49,6 +67,14 @@ describe('atomicWriteFileSync', () => {
     const dest = join(dir, 'bin');
     atomicWriteFileSync(dest, new Uint8Array([1, 2, 3]));
     expect([...readFileSync(dest)]).toEqual([1, 2, 3]);
+  });
+
+  it('writes durably with fsync:true (contents + no temp leftover)', () => {
+    const dest = join(dir, 'durable.json');
+    atomicWriteFileSync(dest, '{"durable":true}', { fsync: true });
+    expect(readFileSync(dest, 'utf-8')).toBe('{"durable":true}');
+    const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp-'));
+    expect(leftovers).toEqual([]);
   });
 
   it('throws and cleans up the temp file when the destination dir is missing', () => {
@@ -104,5 +130,15 @@ describe('atomicWriteFileSync', () => {
     expect(readFileSync(dest, 'utf8')).toBe('{"async":true}');
     expect(readdirSync(dir).filter((file) => file.includes('.tmp-'))).toEqual([]);
     if (process.platform !== 'win32') expect(statSync(dest).mode & 0o777).toBe(0o600);
+  });
+
+  it('async atomicWriteFile honors { fsync: true } (durable write, correct contents, no residue) (R28P49)', async () => {
+    const dest = join(dir, 'async-durable.json');
+    // fsync durability isn't directly observable, but the write must still land
+    // correctly and leave no temp file — proving the sync()+dir-fsync path runs
+    // without corrupting the write or throwing on a normal filesystem.
+    await atomicWriteFile(dest, '{"durable":true}', { fsync: true });
+    expect(readFileSync(dest, 'utf8')).toBe('{"durable":true}');
+    expect(readdirSync(dir).filter((file) => file.includes('.tmp-'))).toEqual([]);
   });
 });

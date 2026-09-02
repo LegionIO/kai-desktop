@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, opendirSync, readSync, type BigIntStats } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readSync,
+  statSync,
+  type BigIntStats,
+} from 'node:fs';
 import { join, relative } from 'node:path';
 import type { PluginManifest, PluginPermission, ExecScopeDeclaration, AllowedBinary } from './types.js';
 
@@ -328,6 +338,41 @@ export function getPluginIntegrity(pluginDir: string, fallbackName?: string): Pl
   };
 }
 
+/**
+ * Existence classification that distinguishes "genuinely absent" (ENOENT) from
+ * "present but UNREADABLE" (transient EIO/EACCES/EMFILE/…). Plain `existsSync`
+ * collapses BOTH to `false`, which on faithful-discovery / cleanup-protection paths
+ * silently treats an unreadable directory as absent (R39P1/R40P1). Shared by the
+ * plugin manager's discovery and the bundled-plugin bootstrap so both fail closed on
+ * an unconfirmed path rather than proceeding as if it were missing.
+ */
+export function pathAvailability(p: string): 'present' | 'absent' | 'error' {
+  try {
+    statSync(p);
+    return 'present';
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? 'absent' : 'error';
+  }
+}
+
+/**
+ * Transient filesystem errno set — failures a retry (next launch) can plausibly
+ * clear, as opposed to a DETERMINISTIC content defect (malformed JSON, a size/name
+ * limit) that will fail identically forever. Used to decide whether a manifest-read
+ * failure should mark discovery INCOMPLETE (and thereby block app updates until a
+ * clean launch): only transient failures should — a deterministic one must not wedge
+ * updates with no recovery path (R40P1#structured). Checks the error AND its `cause`
+ * because plugin-integrity wraps some low-level fs errors.
+ */
+const TRANSIENT_FS_CODES = new Set(['EIO', 'EACCES', 'EPERM', 'EMFILE', 'ENFILE', 'EBUSY', 'EAGAIN', 'ETIMEDOUT']);
+export function isTransientFsError(err: unknown): boolean {
+  const codeOf = (e: unknown): string | undefined =>
+    e && typeof e === 'object' ? (e as NodeJS.ErrnoException).code : undefined;
+  if (codeOf(err) && TRANSIENT_FS_CODES.has(codeOf(err)!)) return true;
+  const cause = err && typeof err === 'object' ? (err as { cause?: unknown }).cause : undefined;
+  return !!codeOf(cause) && TRANSIENT_FS_CODES.has(codeOf(cause)!);
+}
+
 export function arePermissionSetsEqual(left: readonly string[] = [], right: readonly string[] = []): boolean {
   if (left.length !== right.length) return false;
 
@@ -366,6 +411,36 @@ export function isLegacyInferredBrowserPermissionSnapshot(
 export function approvalPermissionsMatch(approved: readonly string[] | undefined, current: readonly string[]): boolean {
   if (!approved) return !current.includes('browser:authenticated-session');
   return arePermissionSetsEqual(approved, current);
+}
+
+/**
+ * Permission-match decision for the DEFERRED (owed-cleanup) integrity path.
+ *
+ * A deferred required plugin's OLD on-disk generation is trusted against its
+ * PREVIOUSLY-PERSISTED record (hash+version already verified by the caller) rather
+ * than the newer catalog/bundle. Beyond an exact permission match we also accept the
+ * single rollout migration where the persisted snapshot predates the host-inferred
+ * authenticated-Browser permission and the manifest adds exactly that one permission
+ * (R31P2). Rejecting that delta would leave the owed plugin unloadable — its cleanup
+ * hook never registers, installs stay blocked, and the debt is discarded at the
+ * give-up cap. Because the sole added permission IS the authenticated-Browser one,
+ * the caller's `ensurePluginApproved` still gates activation behind a fresh consent
+ * prompt, so this tolerance never bypasses consent.
+ *
+ * `base` selects the non-legacy comparison: marketplace records use exact set equality
+ * (`exact`), bundled approvals use `approvalPermissionsMatch` (`approval`).
+ */
+export function deferredPermissionsTrusted(
+  persisted: readonly string[] | undefined,
+  manifest: readonly string[],
+  base: 'exact' | 'approval',
+): boolean {
+  const baseOk =
+    base === 'exact'
+      ? !!persisted && arePermissionSetsEqual(persisted, manifest)
+      : approvalPermissionsMatch(persisted, manifest);
+  if (baseOk) return true;
+  return isLegacyInferredBrowserPermissionSnapshot(persisted, manifest);
 }
 
 // ─── Scope Parsing Helpers ──────────────────────────────────────────────────

@@ -157,6 +157,20 @@ describe('utility-process plugin API compatibility proxy', () => {
     });
   });
 
+  it('rejects a plugin-lifecycle config write (pluginSystem.disabledPlugins) before updating the mirror (R41P2)', () => {
+    // A plugin must never write pluginSystem lifecycle state directly (it could disable
+    // itself mid-update-freeze). The utility proxy must reject it BEFORE mutating its
+    // synchronous mirror, so the plugin never observes a successful write / stale
+    // read-after-write — matching the main-process authority guard.
+    const { api, calls } = setup(['config:read', 'config:write']);
+    expect(() => api.config.set('pluginSystem.disabledPlugins', ['self'])).toThrow();
+    expect(api.config.get()).toEqual({ ui: { theme: 'dark' } });
+    expect(calls).toEqual([]);
+    // A nested lifecycle path is likewise rejected.
+    expect(() => api.config.set('pluginSystem.disabledPlugins.0', 'self')).toThrow();
+    expect(calls).toEqual([]);
+  });
+
   it('routes task sync calls asynchronously and registers a disposable change hook', async () => {
     const { api, calls, transport } = setup();
     const handler = vi.fn();

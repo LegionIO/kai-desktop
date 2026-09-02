@@ -735,7 +735,7 @@ type AppAPI = {
   };
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;
-    install: () => Promise<void>;
+    install: () => Promise<{ ok: boolean; error?: string; surfaced?: boolean; started?: boolean }>;
     onStatus: (
       callback: (status: {
         state: string;
@@ -746,6 +746,7 @@ type AppAPI = {
         bytesPerSecond?: number;
         mode?: 'full' | 'differential';
         fullSize?: number;
+        error?: string;
       }) => void,
     ) => () => void;
   };

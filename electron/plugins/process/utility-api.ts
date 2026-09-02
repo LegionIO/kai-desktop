@@ -12,6 +12,7 @@ import type { UtilityTransport } from './utility-transport.js';
 import { zodSchemaToJsonSchema } from './wire.js';
 import { isAmbiguousPluginCallError } from './utility-transport.js';
 import { assertPluginBrowserConfigWriteAllowed } from '../browser-config-permission.js';
+import { assertPluginLifecycleConfigWriteAllowed } from '../plugin-lifecycle-config-guard.js';
 
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.').filter(Boolean);
@@ -134,9 +135,16 @@ export function createUtilityPluginAPI(options: {
       },
       set: (path, value) => {
         checkPermission('config:write');
-        // Fail in the utility process before mutating its synchronous mirror;
-        // the main-process PluginAPI repeats this check as the authority boundary.
+        // Fail in the utility process BEFORE mutating its synchronous mirror; the
+        // main-process PluginAPI repeats these checks as the authority boundary.
+        // Without the pre-mirror check the plugin would see a successful write +
+        // stale read-after-write while the RPC is only rejected later as an ordered-
+        // call failure (R41P2). Mirror BOTH guards the main process enforces:
+        //  - authenticated-Browser config writes (browser-config-permission), and
+        //  - plugin-lifecycle config (`pluginSystem.disabledPlugins`), which a plugin
+        //    must never write directly (it could disable itself mid-update-freeze).
         assertPluginBrowserConfigWriteAllowed(path, manifest.permissions);
+        assertPluginLifecycleConfigWriteAllowed(path);
         const next = cloneRecord(configMirror.config);
         applyNestedWrite(next, path, value);
         configMirror.config = next;

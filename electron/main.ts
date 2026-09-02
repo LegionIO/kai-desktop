@@ -15,10 +15,11 @@ import {
   powerMonitor,
   webContents,
 } from 'electron';
-import { basename, join, sep } from 'path';
+import { basename, join, resolve, sep } from 'path';
 import {
   mkdirSync,
   existsSync,
+  realpathSync,
   readFileSync,
   writeFileSync,
   readdirSync,
@@ -148,8 +149,66 @@ import {
   checkForUpdatesInteractive,
   performQuitAndInstall,
   setUpdateHookRunner,
-  consumePostUpdateMarker,
+  setInstallReadyGate,
+  setInstallsBlockedForUnresolvedDebt,
 } from './ipc/auto-update.js';
+import {
+  readLedgerResult,
+  markPluginsDone,
+  removeAttempt,
+  setAttemptSuccess,
+  bumpAttemptTries,
+  getAttemptTries,
+  quarantineCorruptLedger,
+  MAX_RECONCILE_TRIES,
+} from './ipc/post-update-ledger.js';
+import type { LedgerAttempt } from './ipc/post-update-ledger.js';
+
+/** Every plugin name whose generation this attempt should protect from
+ *  replacement / defer. That is `owed` PLUS, for a FAILED attempt, its
+ *  `participants` (the durable failure-path superset, R28P38/R28P41) — else a
+ *  bundled/marketplace refresh could swap a failed participant's generation before
+ *  reconciliation runs its cleanup. A SUCCEEDED attempt protects only `owed`
+ *  (participants are irrelevant on success). CRUCIAL (R28P51): when `success` is not
+ *  yet persisted, DERIVE it the SAME way the reconciler does — the attempt succeeded
+ *  iff we're now running its version. Using a bare `success !== true` here would
+ *  treat a just-committed, not-yet-derived SUCCESSFUL attempt (success unset) as a
+ *  failure at startup — protecting + trust-bypassing (strict-compat / integrity) a
+ *  hookless participant's OLD generation for the session even though the update
+ *  actually succeeded. Only union participants for a DERIVED failure. */
+function attemptProtectedNames(a: LedgerAttempt): string[] {
+  const succeeded = typeof a.success === 'boolean' ? a.success : a.version === app.getVersion();
+  if (!succeeded && Array.isArray(a.participants)) {
+    return [...new Set([...a.owed, ...a.participants])];
+  }
+  return a.owed;
+}
+
+/**
+ * True when an attempt owes NOTHING and that emptiness is DURABLE — its outcome is
+ * a PERSISTED boolean and, given that outcome, its effective owed set is empty (and
+ * it is not a legacy batch). Such an attempt should be REMOVED; if a transient
+ * ledger-write failure leaves it on disk it must NOT block installs (R31P3/R32P1).
+ *
+ * The persisted-outcome requirement is load-bearing (R32P2): an attempt whose
+ * `success` never persisted is NOT proven-empty even if the CURRENT running version
+ * happens to derive `succeeded=true` (which would hide its participants). Excluding
+ * it would permit another install; if that install changes the version, a later
+ * launch re-derives the SAME attempt as FAILED and runs its participant hooks with
+ * `success:false` although the original install actually succeeded. Only a persisted
+ * outcome (or successful removal from the ledger) proves emptiness — matching the
+ * startup pass, which likewise refuses to drop an unpersisted-outcome attempt.
+ *
+ * A legacy attempt (`legacy-*`, `owed: []` = "all active") is NEVER proven-empty —
+ * its membership is unknown, so it genuinely blocks until the startup batch
+ * reconciles it. Mirrors the two prune-path predicates so the startup final-check
+ * and the on-demand reconciler's recompute agree on which lingering records are debt.
+ */
+function attemptIsProvenEmpty(a: LedgerAttempt): boolean {
+  if (a.id.startsWith('legacy-')) return false;
+  if (typeof a.success !== 'boolean') return false;
+  return attemptProtectedNames(a).length === 0;
+}
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import {
   isCanonicalPrimaryRendererUrl,
@@ -530,6 +589,87 @@ process.on('unhandledRejection', (reason) => {
 // Initialize terminal output buffer persistence (must be before any terminal usage)
 initOutputBuffer(APP_HOME);
 
+// ── Remap Electron userData for an isolated home — BEFORE the singleton lock ──
+// When APP_HOME is overridden (dev/headless isolation via KAI_USER_DATA), remap
+// Electron's own userData dir so BOTH the single-instance lock namespace AND the
+// post-update ledger track the app home. This MUST run before the lock (below) and
+// before any ledger access: without it, two instances pointed at DIFFERENT homes
+// would collide on the one shared DEFAULT userData — sharing a lock (the loser
+// quits without serving its socket) AND, worse, sharing the ledger, so profile B
+// could run and CLEAR profile A's owed cleanup against B's own plugin generation
+// (R28P45). We resolve to an ABSOLUTE path (a relative KAI_USER_DATA would make
+// setPath ambiguous), CREATE the dir (setPath throws if absent), and — crucially —
+// FAIL FAST if any of that fails (R28P47): silently continuing on the DEFAULT
+// userData while loading plugins from the isolated APP_HOME is the exact
+// cross-profile ledger-corruption hazard this remap exists to prevent, so a
+// broken override must ABORT the launch rather than fall back.
+if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
+  // Only isolate when APP_HOME is genuinely a DIFFERENT home than a normal launch
+  // uses. If KAI_USER_DATA points at the SAME home as the default `~/.<slug>`,
+  // remapping this launch's userData to `<home>/electron-user-data` while a normal
+  // launch (no KAI_USER_DATA) keeps Electron's DEFAULT userData would give the two
+  // DIFFERENT singleton-lock namespaces for the SAME APP_HOME — both instances would
+  // pass the single-instance guard and write conversations/config/plugins
+  // concurrently (R47P2). Equivalent homes MUST share the lock namespace, so skip the
+  // remap when the override points at the normal default home.
+  //
+  // Identity is compared by DEVICE+INODE (R49P1), the canonical filesystem identity:
+  // it collapses EVERY alias to the same physical directory — symlinks, and macOS
+  // FIRMLINKS where `/Users/u/.kai` and `/System/Volumes/Data/Users/u/.kai` have
+  // identical dev/ino but DIFFERENT realpath strings (so the earlier realpath-string
+  // compare (R48P1) still split them). We create the default home first so it can be
+  // statted, then compare `{dev, ino}`. If identity can't be established for BOTH
+  // paths (one doesn't exist / stat fails), fall back to a canonical-string compare
+  // (realpath, else lexical) — conservative for a fresh home no alias can point at.
+  const defaultHomePath = join(homedir(), '.' + __BRAND_APP_SLUG);
+  const identityOf = (p: string): string | null => {
+    try {
+      const s = statSync(p);
+      return `${s.dev}:${s.ino}`;
+    } catch {
+      return null;
+    }
+  };
+  const canonicalString = (p: string): string => {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  // Do NOT create the default home just to stat it (R51P1#structured): during an
+  // isolated launch (KAI_USER_DATA elsewhere) that would materialize the real
+  // `~/.<slug>`, breaking the documented non-pollution guarantee and leaving state
+  // after test/headless runs. If the default home doesn't exist, identityOf() returns
+  // null and we fall back to the canonical-string compare below — a non-existent
+  // default home can't be an alias of the override anyway (they're different homes,
+  // so the remap SHOULD proceed).
+  const defaultId = identityOf(defaultHomePath);
+  const overrideId = identityOf(APP_HOME);
+  const sameHome =
+    defaultId !== null && overrideId !== null
+      ? defaultId === overrideId
+      : canonicalString(defaultHomePath) === canonicalString(APP_HOME);
+  if (!sameHome) {
+    const isolatedUserData = resolve(APP_HOME, 'electron-user-data');
+    try {
+      mkdirSync(isolatedUserData, { recursive: true });
+      app.setPath('userData', isolatedUserData);
+      if (app.getPath('userData') !== isolatedUserData) {
+        throw new Error(`userData remap did not take effect (still ${app.getPath('userData')})`);
+      }
+    } catch (err) {
+      // Do NOT fall back to the default profile — quit before touching its ledger/lock.
+      console.error(
+        `[${__BRAND_PRODUCT_NAME}] KAI_USER_DATA is set but userData could not be isolated to "${isolatedUserData}" — aborting to avoid corrupting the default profile:`,
+        err,
+      );
+      app.quit();
+      process.exit(1);
+    }
+  }
+}
+
 // ── Single-instance lock (acquired BEFORE the OTA rollback check) ─────────
 // CLI mode never requests the singleton lock — the backend (GUI or headless)
 // owns it. A `false` here also disables the whole backend bootstrap block below.
@@ -668,23 +808,23 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// When APP_HOME is overridden (dev/headless isolation via KAI_USER_DATA), also
-// remap Electron's own userData dir so the single-instance lock namespace
-// tracks the app home. Without this, two instances pointed at DIFFERENT homes
-// would still collide on one shared lock (the default userData), and the loser
-// would quit without ever serving its socket. With it: distinct homes ⇒
-// distinct locks (isolation works); same home ⇒ shared lock (the intended
-// "one backend per install" contract still holds).
-if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
-  try {
-    app.setPath('userData', join(APP_HOME, 'electron-user-data'));
-  } catch (err) {
-    console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to remap userData for isolated home:`, err);
-  }
-}
-
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
+// True if the early bundled-plugin bootstrap could NOT confirm/install a bundled
+// plugin this launch due to a transient filesystem failure (R46P1#structured). A
+// required plugin may then be absent/old at loadAll, so an app update could bypass its
+// pre-update veto — the post-loadAll install-block honors this alongside
+// hadIncompleteDiscovery(). Cleared on a clean launch (module init).
+let bundledBootstrapIncomplete = false;
+// True if marketplace startup init could not confirm a brand-required plugin because
+// the configured catalog was unreachable (R52P1) — the required plugin (and its
+// pre-update veto) may be absent, so installs must block for the session, mirroring
+// bundledBootstrapIncomplete. Cleared on a clean launch (module init).
+let marketplaceBootstrapIncomplete = false;
+// Resolves when the startup post-update reconciliation finishes. An install
+// triggered during reconciliation awaits this so its pre-update hooks never run
+// concurrently with the post-update hooks the reconciler is running (R35P1).
+let postUpdateReconcileDone: Promise<void> = Promise.resolve();
 let taskTerminalManagerRef: TaskTerminalManager | null = null;
 let taskDispatcherRef: TaskDispatcher | null = null;
 let quitCleanupStarted = false;
@@ -714,9 +854,41 @@ function ensureAppHome(): void {
 
   // Copy brand-required plugins from bundled resources into ~/.{appSlug}/plugins/
   try {
-    bootstrapBundledPlugins(join(APP_HOME, 'plugins'));
+    // Compute which bundled plugins owe un-reconciled post-update cleanup so the
+    // bootstrap does NOT replace their installed generation before the reconciler
+    // (which runs later, inside `pluginsReady`) can run their post-update hook
+    // against matching code. Without this, a brand shipping updated bundled
+    // plugins would overwrite an owed plugin's generation here — BEFORE the ledger
+    // is even read — stranding the setup its pre-update hook performed (R28P1).
+    // A corrupt/unavailable ledger, or a legacy marker (owed:[] = "all active"),
+    // means the owed set is UNKNOWN → protect ALL bundled plugins this launch (fail
+    // safe). ONE status-bearing read (R28P32).
+    let protectedUpdates: { names?: ReadonlySet<string>; all?: boolean } | undefined;
+    try {
+      const { status, attempts } = readLedgerResult();
+      if (status !== 'ok') {
+        protectedUpdates = { all: true };
+      } else {
+        const anyLegacyAllOwed = attempts.some((a) => a.id.startsWith('legacy-') && a.owed.length === 0);
+        const owedNames = new Set<string>();
+        for (const a of attempts) for (const n of attemptProtectedNames(a)) owedNames.add(n);
+        protectedUpdates = { names: owedNames, all: anyLegacyAllOwed };
+      }
+    } catch (err) {
+      // Couldn't read the ledger — protect everything rather than risk stranding
+      // cleanup for a plugin we can't enumerate (fail safe).
+      console.warn('[Main] Could not read post-update ledger for bundled bootstrap — protecting all:', err);
+      protectedUpdates = { all: true };
+    }
+    const bootstrapResult = bootstrapBundledPlugins(join(APP_HOME, 'plugins'), protectedUpdates);
+    if (bootstrapResult.incompleteBootstrap) {
+      bundledBootstrapIncomplete = true;
+    }
   } catch (err) {
     console.warn('[Main] Bundled plugin bootstrap failed (non-fatal):', err);
+    // A THROW out of bootstrap (unexpected) also leaves the bundled set unconfirmed →
+    // block installs conservatively (R46P1#structured).
+    bundledBootstrapIncomplete = true;
   }
 
   // Sentinel: tests subscribe to this to know the user-data directory has
@@ -786,7 +958,22 @@ function buildMenu(): void {
     ? {
         label: 'Install Update…',
         click: () => {
-          void performQuitAndInstall();
+          void performQuitAndInstall().then((result) => {
+            // Surface a decline that has no native dialog of its own (artifact
+            // swap, plugin-set change, or a confirmation dialog that failed to
+            // show) so the menu action doesn't silently do nothing (R12P1). Skip
+            // it when `surfaced` — a deliberate plugin veto already showed its own
+            // dialog; a second generic warning would be a duplicate (R13P1).
+            if (!result.ok && result.error && !result.surfaced) {
+              void dialog.showMessageBox({
+                type: 'warning',
+                title: 'Update not installed',
+                message: 'The update could not be installed.',
+                detail: result.error,
+                buttons: ['OK'],
+              });
+            }
+          });
         },
       }
     : {
@@ -3088,53 +3275,516 @@ if (gotSingleInstanceLock) {
     // fire the event before any handler registered here can observe it.
     const pluginsReady = (async () => {
       try {
+        // BEFORE touching the marketplace: defer auto-updating any plugin the
+        // ledger says is owed post-update cleanup. initMarketplace auto-updates
+        // required plugins (unload+reload), which would run before the ledger is
+        // reconciled below and could strand/misdirect that owed cleanup (R35P1).
+        // When we CANNOT enumerate the owed set — a corrupt/unreadable ledger, or
+        // a LEGACY marker (owed:[] means "all active plugins") — defer ALL
+        // required-plugin updates conservatively rather than none (R35P1).
+        try {
+          // ONE status-bearing read (R28P32): branch AND enumerate from the same
+          // result so a corrupt/unavailable ledger — or a read that changes between
+          // two calls — can't seed an empty deferral while debt exists.
+          const { status, attempts } = readLedgerResult();
+          if (status !== 'ok') {
+            pluginManager.setDeferredUpdateNames([], { all: true });
+          } else {
+            const anyLegacyAllOwed = attempts.some((a) => a.id.startsWith('legacy-') && a.owed.length === 0);
+            const owedNames = new Set<string>();
+            for (const a of attempts) for (const n of attemptProtectedNames(a)) owedNames.add(n);
+            pluginManager.setDeferredUpdateNames(owedNames, { all: anyLegacyAllOwed });
+          }
+        } catch (err) {
+          // Enumeration failed unexpectedly — defer everything (fail safe).
+          console.warn(
+            `[${__BRAND_PRODUCT_NAME}] Could not seed deferred-update set from ledger — deferring all:`,
+            err,
+          );
+          pluginManager.setDeferredUpdateNames([], { all: true });
+        }
+
         // Initialize marketplace and auto-install required plugins before loading.
         // Always call initMarketplace (even with no URLs) so it can flip the
         // "marketplace ready" flag and broadcast — the renderer waits on that to
         // avoid a false "No marketplace configured" during the async fetch.
         const marketplaceUrls = getBrandMarketplaceUrls();
         try {
-          await pluginManager.initMarketplace(marketplaceUrls);
+          const mktResult = await pluginManager.initMarketplace(marketplaceUrls);
+          if (mktResult.marketplaceBootstrapIncomplete) {
+            marketplaceBootstrapIncomplete = true;
+          }
         } catch (err) {
           console.warn(`[${__BRAND_PRODUCT_NAME}] Marketplace init failed (non-fatal):`, err);
+          // Unconfirmed required-plugin set → block installs conservatively (R52P1).
+          marketplaceBootstrapIncomplete = true;
         }
 
         await pluginManager.loadAll();
         console.info(`[${__BRAND_PRODUCT_NAME}] ${pluginManager.getPluginCount()} plugins loaded`);
 
+        // If discovery OMITTED any listed plugin due to a transient read/parse failure
+        // (R40P1), the active set is INCOMPLETE — an app update run now could evaluate
+        // pre-update hooks WITHOUT the omitted plugin's veto/elevation hook, exactly the
+        // gap the loader-failure catch below guards against for a total load failure.
+        // Block installs for the session (a clean launch that discovers the full set
+        // lifts it); this is independent of the ledger, so it also covers the no-legacy-
+        // entry case where reconciliation wouldn't otherwise block.
+        if (pluginManager.hadIncompleteDiscovery() || bundledBootstrapIncomplete || marketplaceBootstrapIncomplete) {
+          console.warn(
+            `[${__BRAND_PRODUCT_NAME}] Plugin discovery/bootstrap was incomplete (a plugin dir/manifest/bundle could not be read) — blocking installs this session so an update can't bypass an omitted plugin's pre-update veto.`,
+          );
+          setInstallsBlockedForUnresolvedDebt(true);
+        }
+
         // Start periodic marketplace catalog refresh for plugin update detection
         pluginManager.startCatalogRefresh();
 
-        // If this launch follows a successful update, fire post-update hooks
-        // (e.g., revoke admin privileges granted by pre-update hook).
-        const updateMarker = consumePostUpdateMarker();
+        // If this launch follows one or more update attempts, run each attempt's
+        // still-owed post-update cleanup/notification (e.g. revoke admin a
+        // pre-update hook granted). The ledger keys owed work PER ATTEMPT and PER
+        // PLUGIN, so a later attempt can never overwrite an earlier one's debt
+        // (R35P1), and we run + clear each plugin independently. READ (don't clear)
+        // the ledger up front: hook runs can take minutes; the owed record is the
+        // source of truth — clearing before completion then crashing/quitting
+        // mid-run would permanently lose the debt (R34P2). Each plugin is cleared
+        // only AFTER its own hook succeeds.
+        // If the ledger is UNREADABLE (corrupt content OR a transient I/O failure)
+        // it may hide real owed cleanup. Do NOT reconcile (we'd run nothing and then
+        // clear the install block as if there were no debt) — BLOCK installs. Only a
+        // genuinely CORRUPT (successfully-read-but-invalid) ledger is quarantined; a
+        // transiently UNAVAILABLE one is left untouched so a later launch can read it
+        // (renaming a valid ledger aside on a blip would lose real debt — R28P31).
+        // Use ONE status-bearing read for the branch + the attempts below (R28P32).
+        const ledgerResult = readLedgerResult();
+        if (ledgerResult.status !== 'ok') {
+          const corrupt = ledgerResult.status === 'corrupt';
+          console.error(
+            `[${__BRAND_PRODUCT_NAME}] Post-update ledger ${corrupt ? 'is corrupt' : 'could not be read'} — blocking installs this session${corrupt ? ' and quarantining for recovery' : ' (will retry next launch)'}.`,
+          );
+          setInstallsBlockedForUnresolvedDebt(true);
+          pluginManager.setDeferredUpdateNames([], { all: true });
+          if (corrupt) {
+            // QUARANTINE only genuine corruption so the NEXT launch starts clean
+            // instead of wedging forever (R28P19). A transient unavailable is NOT
+            // quarantined — the file is likely fine and a later read will succeed.
+            try {
+              quarantineCorruptLedger();
+            } catch (err) {
+              console.error(`[${__BRAND_PRODUCT_NAME}] Corrupt-ledger quarantine threw (will retry next launch):`, err);
+            }
+          }
+          clearUpdateReady();
+          return;
+        }
+        const outstandingAttempts = ledgerResult.attempts;
         // This process IS the current version; any update-ready signal is now
         // satisfied (or stale) — clear it so a fresh leader isn't told to step
         // aside for an update it already IS.
         clearUpdateReady();
-        if (updateMarker) {
-          // Only report success if the app actually relaunched into the marker's
-          // target version. A failed/rolled-back Squirrel install can leave a
-          // stale marker; firing success post-hooks (e.g. revoking admin) for a
-          // version we're not running would be wrong.
-          const updateSucceeded = updateMarker.version === app.getVersion();
-          console.info(
-            `[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version} ` +
-              `(running ${app.getVersion()}, success=${updateSucceeded})`,
-          );
-          pluginManager
-            .runPostUpdateHooks({
-              version: updateMarker.version,
-              success: updateSucceeded,
-            })
-            .catch((err) => {
+        // Reconcile attempts SERIALLY (not Promise.all): two outstanding attempts
+        // can owe the SAME plugin, and running that plugin's post-update hook
+        // concurrently with different version/success args would race its shared
+        // cleanup/migration state (R35P1). Detached so it doesn't block startup,
+        // but internally sequential. The promise is tracked so an install triggered
+        // during reconciliation waits for it (its pre-update hooks must not run
+        // concurrently with these post-update hooks — R35P1).
+        postUpdateReconcileDone = (async () => {
+          // Attempts PROVEN to owe nothing (empty effective owed, success known) that
+          // we tried to `removeAttempt()` but whose ledger write FAILED transiently.
+          // They stay on disk, but they hold no real debt — so they must NOT count
+          // toward the final install block, and they don't consume a give-up retry
+          // (there's no hook to run). A later clean launch retries their removal. If
+          // we let them block installs, a transient write blip would wedge every
+          // update for the session with zero owed cleanup (R31P3).
+          const provenEmptyUnremoved = new Set<string>();
+          for (const attempt of outstandingAttempts) {
+            const isLegacy = attempt.id.startsWith('legacy-');
+            // `participants` is the durable FAILURE-path superset recorded at commit
+            // (R28P38). It matters ONLY when the attempt's outcome is/ will be FAILURE
+            // — folded into the effective owed set AFTER the outcome is derived below.
+            // A modern attempt whose `owed` is empty is normally dropped, BUT if it
+            // carries participants and its outcome is NOT already known-success, we
+            // must NOT drop it here (R28P40): the outcome could derive to FALSE (the
+            // installer failed → we relaunched on the OLD version), and dropping
+            // before that derivation would discard the only participant record. Defer
+            // the drop decision to after derivation for such attempts.
+            const mayOweParticipants =
+              !isLegacy &&
+              attempt.success !== true &&
+              Array.isArray(attempt.participants) &&
+              attempt.participants.length > 0;
+            if (attempt.owed.length === 0 && !isLegacy && !mayOweParticipants) {
+              try {
+                if (!removeAttempt(attempt.id)) provenEmptyUnremoved.add(attempt.id);
+              } catch (err) {
+                provenEmptyUnremoved.add(attempt.id);
+                console.error(`[${__BRAND_PRODUCT_NAME}] Post-update ledger cleanup threw:`, err);
+              }
+              continue;
+            }
+            // GIVE-UP CAP: if this entry has already FAILED a completed
+            // reconciliation pass too many times (plugin gone / incompatible / hook
+            // always fails), DROP it and DON'T re-defer it — otherwise a permanently
+            // unrunnable cleanup would block installs forever with no in-app repair
+            // path (R8P1). We accept the (rare, bounded) stranded cleanup.
+            // CRUCIAL (R28P5): only READ the counter here. It is INCREMENTED only
+            // AFTER a pass that RAN but did not fully succeed (below). Bumping up
+            // front would let repeated CRASHES — before the outcome is persisted or
+            // any hook runs — silently exhaust the cap and discard the attempt
+            // without its cleanup ever executing.
+            try {
+              if (getAttemptTries(attempt.id) >= MAX_RECONCILE_TRIES) {
+                console.warn(
+                  `[${__BRAND_PRODUCT_NAME}] Post-update attempt ${attempt.id} exceeded ${MAX_RECONCILE_TRIES} failed reconcile passes — giving up so installs aren't blocked forever.`,
+                );
+                removeAttempt(attempt.id);
+                continue;
+              }
+            } catch (err) {
+              console.error(`[${__BRAND_PRODUCT_NAME}] Post-update try-cap check threw:`, err);
+            }
+            // Determine the install outcome ONCE and PERSIST it: recomputing
+            // `version === current` on every launch would flip a retained attempt's
+            // result once a LATER update changes the running version (e.g. a 2.6
+            // attempt that DID succeed reads false after 2.7 installs) — so hooks
+            // could see the wrong success value (R35P1). The first determination
+            // wins: use a persisted value if present, else derive it now (we're
+            // running this attempt's version ⇒ it succeeded) and persist it.
+            let updateSucceeded: boolean;
+            if (typeof attempt.success === 'boolean') {
+              updateSucceeded = attempt.success;
+            } else {
+              updateSucceeded = attempt.version === app.getVersion();
+              // If the outcome can't be PERSISTED, do NOT run hooks this launch:
+              // running them now, then failing to record the outcome, would let a
+              // later launch recompute a stale success from the then-current version
+              // (R35P1). Skip and retry next launch — the attempt stays owed intact.
+              let persisted = false;
+              try {
+                persisted = setAttemptSuccess(attempt.id, updateSucceeded);
+              } catch (err) {
+                console.error(`[${__BRAND_PRODUCT_NAME}] Post-update ledger success-persist threw:`, err);
+              }
+              if (!persisted) {
+                console.warn(
+                  `[${__BRAND_PRODUCT_NAME}] Could not persist outcome for attempt ${attempt.id} — deferring its cleanup to next launch.`,
+                );
+                // Its `success` stays undefined on disk → the final-ledger check
+                // below blocks installs; no separate flag needed (R5P2#5).
+                continue;
+              }
+            }
+            // Now that the outcome is known, compute the EFFECTIVE owed set: for a
+            // FAILED attempt fold in `participants` (the durable failure-path
+            // superset), so a hookless-at-commit participant whose cleanup was lost
+            // from `owed` (teardown widening write failed) still gets reconciled
+            // (R28P38/R28P40). On a SUCCESSFUL attempt participants are irrelevant —
+            // only real `owed` post-hooks run. A modern attempt that turns out empty
+            // here (e.g. success with no owed) is dropped below by the belt-and-
+            // suspenders sweep / final check.
+            const owed =
+              !updateSucceeded && Array.isArray(attempt.participants)
+                ? [...new Set([...attempt.owed, ...attempt.participants])]
+                : attempt.owed;
+            // A MODERN attempt whose EFFECTIVE owed is now empty owes nothing — most
+            // commonly a SUCCESSFUL participants-only attempt (owed:[], success=true,
+            // participants ignored). Drop it immediately (R28P42): otherwise no hooks
+            // run, `succeededNames` stays empty, the end-of-attempt sweep never
+            // removes it, and the final-state check would BLOCK installs until yet
+            // another relaunch. A write failure just leaves it for next launch
+            // (harmless — it's genuinely un-owed). Legacy attempts (empty owed = "all
+            // active") are never dropped here.
+            if (owed.length === 0 && !isLegacy) {
+              try {
+                if (!removeAttempt(attempt.id)) provenEmptyUnremoved.add(attempt.id);
+              } catch (err) {
+                provenEmptyUnremoved.add(attempt.id);
+                console.error(`[${__BRAND_PRODUCT_NAME}] Post-update ledger drop (empty effective owed) threw:`, err);
+              }
+              continue;
+            }
+            // Legacy → run all active (onlyNames undefined); modern → only the owed.
+            // For modern attempts, persist EACH plugin's completion incrementally
+            // (onPluginDone) so a crash mid-batch doesn't re-run an already-done
+            // plugin's (possibly non-idempotent) hook next launch (R35P1).
+            const runOpts = isLegacy
+              ? undefined
+              : {
+                  onlyNames: owed,
+                  onPluginDone: (name: string) => {
+                    // Persist per-plugin completion incrementally so a crash
+                    // mid-batch can't re-run an already-done hook (R35P1). A write
+                    // failure here just leaves the plugin owed on disk — it retries
+                    // next launch; the attempt's already-persisted `success` keeps
+                    // that retry correct, so no install-block flag is needed.
+                    markPluginsDone(attempt.id, [name]);
+                  },
+                };
+            console.info(
+              `[${__BRAND_PRODUCT_NAME}] Post-update: ${attempt.fromVersion} → ${attempt.version} ` +
+                `(running ${app.getVersion()}, success=${updateSucceeded}, owed=${isLegacy ? 'all' : owed.length})`,
+            );
+            // Capture, BEFORE the batch runs, whether any plugin is held out of the
+            // active set (awaiting consent or in an unresolved `error`/`loading`
+            // state). `runPostUpdateHooks` snapshots the active-plugin plan up front,
+            // so a plugin excluded NOW never gets its hook run in THIS batch — even if
+            // it is approved/activated mid-batch while a later hook is still awaited
+            // (a post-batch check would then see it active and wrongly conclude the
+            // legacy batch was complete, dropping the marker though that plugin's
+            // cleanup never ran — R36P1). We OR this pre-batch snapshot with the
+            // post-batch state so a plugin that becomes pending DURING the batch is
+            // also caught.
+            const legacyHadExcludedAtStart =
+              isLegacy &&
+              (pluginManager.hasPendingConsent() ||
+                pluginManager.hasUnresolvedActivation() ||
+                pluginManager.hadIncompleteDiscovery());
+            try {
+              const { succeededNames, allSucceeded } = await pluginManager.runPostUpdateHooks(
+                { version: attempt.version, success: updateSucceeded },
+                runOpts,
+              );
+              // Track whether the ledger CHECKPOINT WRITE itself succeeded: hooks can
+              // all succeed yet removeAttempt/markPluginsDone return false on a write
+              // failure, leaving the attempt on disk. If we ignored that, the attempt
+              // would block installs + rerun cleanup EVERY launch without ever
+              // approaching the give-up cap (R28P57). So a failed checkpoint counts
+              // as an incomplete pass → spend a retry below.
+              let checkpointOk = true;
+              if (isLegacy) {
+                // Legacy attempt = "ALL active plugins are owed" (membership not
+                // enumerated). A plugin held OUT of the active set — awaiting fresh
+                // Browser consent (R33P1), in an unresolved activation state
+                // (`error`/`loading`, R34P1), OR OMITTED because discovery couldn't
+                // read/parse its directory this launch (R38P1) — is missing from this
+                // "run all active" batch, yet `allSucceeded` can still be true (nothing
+                // that ran failed). Dropping the marker here would permanently skip
+                // that plugin's cleanup — the on-demand reconciler deliberately skips
+                // legacy attempts (R31P1), so nothing else would ever run it. So only
+                // drop a legacy marker when EVERY hook it ran succeeded AND no plugin
+                // was excluded at batch start (R36P1) AND none is awaiting consent, in
+                // an unresolved activation state, or discovery-omitted at batch end;
+                // otherwise keep it and count the pass as incomplete so a give-up
+                // retry is spent. Keeping it defers updates (legacy `all:true`) and
+                // retries next launch, when the plugin is (hopefully) active and its
+                // hook can run. The give-up cap BOUNDS the never-resolving case so
+                // updates aren't blocked forever — a plugin that never activates or
+                // that the user won't approve is one whose privileged setup is
+                // effectively abandoned, so discarding its cleanup then is acceptable.
+                const legacyIncomplete =
+                  legacyHadExcludedAtStart ||
+                  pluginManager.hasPendingConsent() ||
+                  pluginManager.hasUnresolvedActivation() ||
+                  pluginManager.hadIncompleteDiscovery();
+                if (allSucceeded && !legacyIncomplete) {
+                  checkpointOk = removeAttempt(attempt.id);
+                } else if (allSucceeded) {
+                  checkpointOk = false;
+                }
+              } else {
+                // Modern attempts cleared each plugin via onPluginDone already; this
+                // is a belt-and-suspenders sweep for any the callback missed.
+                if (succeededNames.length > 0) checkpointOk = markPluginsDone(attempt.id, succeededNames);
+              }
+              if (!allSucceeded || !checkpointOk) {
+                console.warn(
+                  `[${__BRAND_PRODUCT_NAME}] Post-update cleanup incomplete for attempt ${attempt.id} ` +
+                    `(allSucceeded=${allSucceeded}, checkpointOk=${checkpointOk}) — keeping it for next-launch retry.`,
+                );
+                // The pass COMPLETED but did not fully succeed (a hook failed OR the
+                // ledger checkpoint write failed) — NOW spend a retry (R28P5/R28P57).
+                // A crash before reaching here never consumes the cap.
+                try {
+                  bumpAttemptTries(attempt.id);
+                } catch (err) {
+                  console.error(`[${__BRAND_PRODUCT_NAME}] Post-update try-bump threw:`, err);
+                }
+              }
+            } catch (err) {
+              // The pass RAN (outcome was already persisted above) but a hook threw
+              // → cleanup incomplete; keep the attempt (do not clear) and spend a
+              // retry, exactly like a completed-but-unsuccessful pass (R28P5). A
+              // crash BEFORE this point (before the outcome persisted / before hooks
+              // ran) never reaches here, so it can't consume the cap — that was the
+              // bug. A perpetually-throwing hook is capped after MAX passes (the
+              // accepted rare strand).
               console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
-            });
-        }
+              try {
+                bumpAttemptTries(attempt.id);
+              } catch (e) {
+                console.error(`[${__BRAND_PRODUCT_NAME}] Post-update try-bump (after throw) threw:`, e);
+              }
+            }
+          }
+          // Derive the final state from the ACTUAL post-reconcile ledger via ONE
+          // status-bearing read (R28P32), NOT the sticky `unresolvedDebt` flag: a
+          // per-plugin checkpoint write that failed transiently but was then cleared
+          // by the end-of-attempt sweep must not leave installs wedged (R5P2#5). If
+          // the final read is UNREADABLE (corrupt content OR transient I/O), keep
+          // installs blocked + defer-all; quarantine ONLY genuine corruption
+          // (R28P31).
+          const finalResult = readLedgerResult();
+          if (finalResult.status !== 'ok') {
+            const corrupt = finalResult.status === 'corrupt';
+            console.error(
+              `[${__BRAND_PRODUCT_NAME}] Post-update ledger ${corrupt ? 'corrupt' : 'unreadable'} after reconciliation — blocking installs this session${corrupt ? ' and quarantining for recovery' : ' (will retry next launch)'}.`,
+            );
+            setInstallsBlockedForUnresolvedDebt(true);
+            pluginManager.setDeferredUpdateNames([], { all: true });
+            if (corrupt) {
+              try {
+                quarantineCorruptLedger();
+              } catch (err) {
+                console.error(
+                  `[${__BRAND_PRODUCT_NAME}] Corrupt-ledger quarantine threw (will retry next launch):`,
+                  err,
+                );
+              }
+            }
+            return;
+          }
+          const finalAttempts: LedgerAttempt[] = finalResult.attempts;
+          // A proven-empty attempt whose removal write failed (R31P3/R32P1) still owes
+          // nothing — exclude it from the block. We exclude by BOTH the transient
+          // `provenEmptyUnremoved` set (attempts this pass tried and failed to prune)
+          // AND a re-derivation via `attemptIsProvenEmpty` (any record that is empty +
+          // non-legacy now), so a proven-empty record neither the prune paths nor the
+          // set captured can't wedge installs either. Any OTHER lingering attempt has
+          // unresolved cleanup and must block. (An attempt that fully reconciled is
+          // already off the ledger.)
+          const blockingAttempts = finalAttempts.filter(
+            (a) => !provenEmptyUnremoved.has(a.id) && !attemptIsProvenEmpty(a),
+          );
+          // Block installs while ANY attempt remains on the ledger after
+          // reconciliation — its cleanup is unresolved (either its outcome couldn't
+          // be persisted, OR it ran but a plugin's cleanup is still owed). A newer
+          // install would rerun setup/elevation hooks over that unresolved state
+          // (R9P1). The give-up cap (bumpAttemptTries) drops a permanently-stuck
+          // attempt so this can't wedge installs forever. (An attempt that fully
+          // reconciled is already removed from the ledger, so it doesn't count.)
+          // Also keep the block if discovery was incomplete (R40P1) — the recompute
+          // must not clear the veto-bypass guard set right after loadAll.
+          setInstallsBlockedForUnresolvedDebt(
+            blockingAttempts.length > 0 ||
+              pluginManager.hadIncompleteDiscovery() ||
+              bundledBootstrapIncomplete ||
+              marketplaceBootstrapIncomplete,
+          );
+          // Keep deferring auto-updates for plugins STILL owed cleanup (their
+          // cleanup failed / is pending) — clearing them unconditionally would let
+          // a later refresh replace a generation whose next-launch retry then runs
+          // the wrong hook (R5P1#2). Only names no longer owed become eligible.
+          const stillOwed = new Set<string>();
+          for (const a of finalAttempts) for (const n of attemptProtectedNames(a)) stillOwed.add(n);
+          const anyLegacyStillOwed = finalAttempts.some((a) => a.id.startsWith('legacy-'));
+          pluginManager.setDeferredUpdateNames(stillOwed, { all: anyLegacyStillOwed });
+        })();
+        // If reconciliation itself REJECTS, treat it like unresolved debt: block
+        // installs (an install could otherwise run pre-update hooks concurrently
+        // with, or ahead of, a half-finished reconcile). Cleared on a clean launch.
+        postUpdateReconcileDone.catch((err) => {
+          console.error(`[${__BRAND_PRODUCT_NAME}] Post-update reconciliation rejected — blocking installs:`, err);
+          setInstallsBlockedForUnresolvedDebt(true);
+          // Keep whatever deferral was in effect: a rejected reconcile may have
+          // left owed plugins un-reconciled, so lifting the deferral could let a
+          // refresh replace a generation that still owes cleanup. Installs stay
+          // blocked (above) until a clean launch; the deferral is re-seeded then.
+        });
+
+        // Wire the on-demand owed-cleanup reconciler (R30P2): when the user approves
+        // consent for an owed plugin AFTER startup reconciliation already skipped it
+        // (it was inactive then), PluginManager calls this to run that plugin's owed
+        // post-update hook NOW and clear the ledger + install block. Mirrors the
+        // per-attempt logic above but scoped to one just-activated plugin. Serialized
+        // behind `postUpdateReconcileDone` so it never races the startup pass.
+        pluginManager.setOwedCleanupReconciler(async (pluginName: string) => {
+          await postUpdateReconcileDone.catch(() => {});
+          const { status, attempts } = readLedgerResult();
+          if (status !== 'ok') return; // unreadable → leave blocked; a clean launch reconciles
+          for (const attempt of attempts) {
+            const isLegacy = attempt.id.startsWith('legacy-');
+            // NEVER touch a legacy attempt here (R31P1). A legacy attempt carries
+            // `owed: []` meaning "ALL active plugins are owed" — a batch whose
+            // membership isn't enumerated. This per-plugin path would run only the
+            // just-approved plugin's hook, then `markPluginsDone(legacyId, [it])`
+            // would prune the (already-empty) owed list and DROP the whole legacy
+            // attempt, permanently discarding every OTHER active plugin's still-owed
+            // debt. Legacy batches are reconcilable only by the startup pass, which
+            // runs all active post-hooks together and removes the attempt solely when
+            // `allSucceeded`. Leave it: the install block/deferral it caused persists
+            // until a clean launch reconciles the full batch.
+            if (isLegacy) continue;
+            const succeeded =
+              typeof attempt.success === 'boolean' ? attempt.success : attempt.version === app.getVersion();
+            const effectiveOwed =
+              !succeeded && Array.isArray(attempt.participants)
+                ? [...new Set([...attempt.owed, ...attempt.participants])]
+                : attempt.owed;
+            if (!effectiveOwed.includes(pluginName)) continue;
+            // Persist the outcome once (so a later launch doesn't recompute it stale).
+            if (typeof attempt.success !== 'boolean') {
+              try {
+                if (!setAttemptSuccess(attempt.id, succeeded)) continue;
+              } catch {
+                continue;
+              }
+            }
+            try {
+              const { succeededNames } = await pluginManager.runPostUpdateHooks(
+                { version: attempt.version, success: succeeded },
+                { onlyNames: [pluginName], onPluginDone: (n: string) => void markPluginsDone(attempt.id, [n]) },
+              );
+              if (succeededNames.length > 0) markPluginsDone(attempt.id, succeededNames);
+            } catch (err) {
+              console.error(
+                `[${__BRAND_PRODUCT_NAME}] On-demand owed-cleanup for "${pluginName}" (attempt ${attempt.id}) threw:`,
+                err,
+              );
+            }
+          }
+          // Recompute the install block + deferral from the post-run ledger.
+          const after = readLedgerResult();
+          if (after.status !== 'ok') return;
+          // Exclude attempts that owe nothing but lingered on a transient prune-write
+          // failure (R32P1): counting them here would re-block installs the startup
+          // final-check already excluded, permanently wedging updates until relaunch
+          // despite zero debt. Same predicate as the startup `provenEmptyUnremoved`
+          // exclusion, re-derived from the current ledger so a record that became
+          // proven-empty during THIS run (e.g. its last owed plugin just completed)
+          // is also excluded.
+          const afterBlocking = after.attempts.filter((a) => !attemptIsProvenEmpty(a));
+          // Preserve the incomplete-discovery block (R40P1) through the on-demand recompute too.
+          setInstallsBlockedForUnresolvedDebt(
+            afterBlocking.length > 0 ||
+              pluginManager.hadIncompleteDiscovery() ||
+              bundledBootstrapIncomplete ||
+              marketplaceBootstrapIncomplete,
+          );
+          const stillOwed = new Set<string>();
+          for (const a of after.attempts) for (const n of attemptProtectedNames(a)) stillOwed.add(n);
+          const anyLegacyStillOwed = after.attempts.some((a) => a.id.startsWith('legacy-'));
+          pluginManager.setDeferredUpdateNames(stillOwed, { all: anyLegacyStillOwed });
+        });
       } catch (err) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Plugin loading failed:`, err);
+        // Plugins did not finish loading — an install now would evaluate an
+        // incomplete plugin set and could skip a veto/elevation hook (R35P1).
+        // Block installs until a clean launch loads plugins successfully.
+        setInstallsBlockedForUnresolvedDebt(true);
       }
     })();
+
+    // Gate installs on plugin loading + post-update reconciliation: an install
+    // that runs before loadAll() finishes would evaluate an incomplete plugin set
+    // (missing a veto/elevation hook), and one that runs while reconciliation is
+    // still firing post-update hooks would race them (R35P1). performQuitAndInstall
+    // awaits this gate before running any pre-update hook AND checks the
+    // install-blocked flag; a load/reconcile failure sets that flag (above) so the
+    // install is refused rather than proceeding against partial state. The gate
+    // resolves regardless (allSettled semantics) so the updater never wedges —
+    // the block flag, not a hung gate, is what enforces the refusal.
+    setInstallReadyGate(pluginsReady.then(() => postUpdateReconcileDone).catch(() => {}));
 
     mainWindow?.once('ready-to-show', () => {
       mainWindow.show();

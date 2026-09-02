@@ -100,6 +100,7 @@ import {
 import { subscribeToTaskChanges } from '../tasks/task-sync.js';
 import { isInAppBrowserPartition } from '../browser/session.js';
 import { assertPluginBrowserConfigWriteAllowed } from './browser-config-permission.js';
+import { assertPluginLifecycleConfigWriteAllowed } from './plugin-lifecycle-config-guard.js';
 
 /** Max buffered body for a plugin HTTP server request (1 MB). */
 const PLUGIN_HTTP_MAX_BODY_BYTES = 1_048_576;
@@ -654,6 +655,10 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         // script execution, private-network access, or saved-password autofill.
         // The ordinary config writer is intentionally not sufficient authority.
         assertPluginBrowserConfigWriteAllowed(path, manifest.permissions);
+        // LIFECYCLE-control config (pluginSystem.disabledPlugins) is RESERVED from
+        // generic config:write for ALL plugins — enable/disable must go through the
+        // freeze-aware lifecycle API, never a config write (R28P54).
+        assertPluginLifecycleConfigWriteAllowed(path);
         const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
         if (!hasAgentHook) {
           // Hook enforcement is gated by the dangerous `agent:hook` permission.

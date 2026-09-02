@@ -11,6 +11,9 @@ interface UpdateStatus {
   bytesPerSecond?: number;
   mode?: 'full' | 'differential';
   fullSize?: number;
+  /** Present on a 'downloaded' status that follows a declined install; surfaced
+   *  inline so a web client (which sees no host dialog) learns why (R29P1). */
+  error?: string;
 }
 
 const fmtMB = (n?: number) => (n == null ? '…' : `${(n / 1024 / 1024).toFixed(1)} MB`);
@@ -40,6 +43,7 @@ export const UpdateCard: FC = () => {
   const [status, setStatus] = useState<UpdateStatus>({ state: 'idle' });
   const [dismissed, setDismissed] = useState(false);
   const [visible, setVisible] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
   const didAnimate = useRef(false);
   // Drag offset applied on top of the fixed bottom-right anchor. The card stays
   // anchored (bottom-24 right-6); dragging just translates it from there so a
@@ -52,6 +56,28 @@ export const UpdateCard: FC = () => {
     const cleanup = app.autoUpdate.onStatus(setStatus);
     return cleanup;
   }, []);
+
+  // A FRESH install attempt begins with a 'preparing' broadcast (including a
+  // same-version retry started from the app menu). Clear any stale error from a
+  // prior attempt so the card doesn't show an old failure that the new attempt
+  // hasn't reproduced (R28P14). The version-keyed reset below only fires on a
+  // version CHANGE, so it misses a same-version retry — hence this separate hook.
+  useEffect(() => {
+    if (status.state === 'preparing') setInstallError(null);
+  }, [status.state]);
+
+  // Surface a decline reason carried on a 'downloaded' status (R29P1): a web
+  // client's detached install invoke only gets a started-ack, so the reason a
+  // block/failure produced arrives here on the status broadcast instead. Also
+  // un-dismiss the card (R33P1): if the user dismissed it and started the install
+  // from the app menu, an async failure arrives ONLY via this status — recording
+  // the error while the card stays hidden would make the failure silent.
+  useEffect(() => {
+    if (status.state === 'downloaded' && status.error) {
+      setInstallError(status.error);
+      setDismissed(false);
+    }
+  }, [status.state, status.error]);
 
   // Trigger fade-in animation when card first becomes relevant
   useEffect(() => {
@@ -74,14 +100,26 @@ export const UpdateCard: FC = () => {
   // reset for and only clear the dismissal when it actually changes.
   const lastResetVersion = useRef<string | null>(null);
   useEffect(() => {
-    if (status.state !== 'available' && status.state !== 'downloading') return;
+    // Include 'downloaded': once an update is already downloaded, the main process
+    // suppresses 'available'/'downloading' broadcasts for a subsequent version and
+    // transitions straight to 'downloaded'. Keying only off those earlier states
+    // would miss the version change and leave a prior version's error visible
+    // (R20P1).
+    if (status.state !== 'available' && status.state !== 'downloading' && status.state !== 'downloaded') return;
     const version = status.version ?? null;
     if (version === lastResetVersion.current) return; // same update we've already accounted for
     // A version we haven't seen before: record it, and clear any prior dismissal
     // (that dismissal was for the previous version).
     lastResetVersion.current = version;
     if (dismissed) setDismissed(false);
-  }, [status.state, status.version, dismissed]);
+    // Clear any install error from a PRIOR version's failed attempt — otherwise
+    // the reopened card would show the old error before the user tries the new
+    // version (R19P1). BUT do NOT clear it when the CURRENT status itself carries
+    // an error (e.g. the first status observed after a renderer reload is a
+    // failure): that would erase the only failure reason we'll get (R33P1). The
+    // error-mirroring effect above sets it in that case.
+    if (!status.error) setInstallError(null);
+  }, [status.state, status.version, status.error, dismissed]);
 
   const showable =
     status.state === 'available' ||
@@ -227,7 +265,29 @@ export const UpdateCard: FC = () => {
         <div className="mt-4 flex gap-3">
           <button
             type="button"
-            onClick={() => app.autoUpdate.install()}
+            onClick={() => {
+              // The primary failure surface for a broken pre-update hook is a
+              // native dialog raised in the main process. But if the IPC handler
+              // itself returns { ok: false } (e.g. no download staged after a
+              // relaunch) or the channel rejects, there is NO native dialog — so
+              // surface it inline here, otherwise the button looks dead.
+              setInstallError(null);
+              void app.autoUpdate
+                .install()
+                .then((res) => {
+                  // `surfaced` means the main process already showed a native
+                  // dialog for this outcome (a deliberate plugin veto) — don't
+                  // also render an inline error, that would be a duplicate.
+                  if (!res.ok && !res.surfaced) {
+                    console.warn('[UpdateCard] install rejected:', res.error);
+                    setInstallError(res.error || 'The update could not be started. Please try again.');
+                  }
+                })
+                .catch((err) => {
+                  console.warn('[UpdateCard] install invoke failed:', err);
+                  setInstallError('The update could not be started. Please try again.');
+                });
+            }}
             className="flex-1 rounded-lg bg-foreground px-4 py-2.5 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
           >
             Install and restart
@@ -240,6 +300,12 @@ export const UpdateCard: FC = () => {
             Not yet
           </button>
         </div>
+      )}
+
+      {status.state === 'downloaded' && installError && (
+        <p className="mt-3 text-sm text-red-500" role="alert">
+          {installError}
+        </p>
       )}
     </div>
   );

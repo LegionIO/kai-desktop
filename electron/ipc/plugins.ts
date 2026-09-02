@@ -285,14 +285,47 @@ export function registerPluginHandlers(
 
   // ── Permission Consent ──
 
-  ipcMain.handle('plugin:approve-consent', async (_event, pluginName: string) => {
-    const success = await pluginManager.approveAndReload(pluginName);
-    return { success };
+  ipcMain.handle('plugin:approve-consent', async (_event, pluginName: string, expectedFileHash?: string) => {
+    // REJECT a hashless APPROVE (R29P3): the generation hash is how main rejects a
+    // STALE cross-request approval (R28P55). A pre-fix client (e.g. a web client from
+    // an older build reconnecting after restart) whose bridge omits the hash would
+    // otherwise skip that check — approving a same-name H2 with different, UNSEEN
+    // dangerous permissions. The current desktop + web bridges always send it, so a
+    // missing hash means a stale client that must reload; fail closed rather than
+    // grant permissions the user may never have seen. (Deny is unaffected — denying
+    // grants nothing and its own stale-guard no-ops on mismatch.)
+    if (typeof expectedFileHash !== 'string' || expectedFileHash.length === 0) {
+      return { success: false, error: 'This approval is stale; please reload and try again.' };
+    }
+    try {
+      const success = await pluginManager.approveAndReload(pluginName, expectedFileHash);
+      return { success };
+    } catch (err) {
+      // approveAndReload only THROWS for a PRE-mutation refusal — an active app-update
+      // freeze (assertNoActiveFreeze), before any consent state is consumed or approval
+      // persisted. Mirror the deny handler (R37P2): return a structured failure instead
+      // of letting the rejection escape. The renderer's handleApprove has no catch, so
+      // an escaped rejection would surface as an unhandled promise rejection AND skip
+      // the pending-consent resync; a { success:false } keeps the prompt for a retry
+      // once the freeze clears (nothing was consumed, so the retry is a genuine no-op-
+      // free retry).
+      return { success: false, error: err instanceof Error ? err.message : 'Could not approve the plugin right now' };
+    }
   });
 
-  ipcMain.handle('plugin:deny-consent', (_event, pluginName: string) => {
-    pluginManager.denyPlugin(pluginName);
-    return { success: true };
+  ipcMain.handle('plugin:deny-consent', async (_event, pluginName: string, expectedFileHash?: string) => {
+    try {
+      await pluginManager.denyPlugin(pluginName, expectedFileHash);
+      return { success: true };
+    } catch (err) {
+      // denyPlugin only THROWS for a PRE-mutation refusal (an active app-update
+      // freeze) — nothing was consumed, so this is genuinely retryable: return
+      // success:false and the modal keeps the prompt for a retry once the freeze
+      // clears (R28P17/R28P50). A POST-consumption rollback failure does NOT throw
+      // (denyPlugin swallows it and resolves) — the modal correctly drops the stale
+      // prompt rather than offering a no-op retry that would strand the generation.
+      return { success: false, error: err instanceof Error ? err.message : 'Could not deny the plugin right now' };
+    }
   });
 
   ipcMain.handle('plugin:pending-consent', () => {

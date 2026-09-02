@@ -208,6 +208,13 @@ export type PluginInstance = {
   error?: string;
   /** True while this instance is running its deactivate()/cleanup teardown. */
   tearingDown?: boolean;
+  /** True if this instance ended in `error` state due to a TRANSIENT filesystem
+   *  failure during load/activation (not a deterministic defect). loadAll's faithful
+   *  startup pass consults this to mark discovery incomplete + block installs even for
+   *  a plugin an EARLIER non-faithful path (e.g. initMarketplace's required-plugin
+   *  auto-install) already loaded as an error stub, so a transient failure there can't
+   *  let an app update bypass the plugin's pre-update veto (R51P1). */
+  transientLoadFailure?: boolean;
   compatWarning?: CompatCheckResult;
   module: PluginModule | null;
   registeredTools: ToolDefinition[];
@@ -318,18 +325,99 @@ export type PostReceiveHook = (args: PostReceiveHookArgs) => Promise<PostReceive
 export type PreUpdateHookArgs = {
   version: string;
   artifactPath: string;
+  /**
+   * Aborted when the hook exceeds its per-hook timeout, or when the update is
+   * cancelled/blocked WHILE the hook is still running. A well-behaved hook should
+   * observe this and stop any privileged / long-running work. Propagates to
+   * utility-process plugins via the wire transport's AbortSignal support for the
+   * duration of the call. Note: once a hook has RETURNED, its signal is no longer
+   * driven (a later cancellation can't reach detached background work a returned
+   * hook left running) — a hook that starts background work should tie that work
+   * to the signal and finish it before returning, or reconcile on next launch.
+   * Optional to observe — existing hooks keep working unchanged.
+   */
+  signal: AbortSignal;
 };
 
 export type PreUpdateHookResult = {
   abort?: boolean;
   abortReason?: string;
+  /**
+   * Optional signal a plugin MAY set to mark its own abort as an *operational
+   * failure* (a broken elevation command, a transient error) rather than a
+   * deliberate policy block. When set, the update can offer "Proceed anyway".
+   *
+   * IMPORTANT: correctness must NOT depend on plugins setting this. The runner
+   * also treats a *thrown* hook as a failure, and a deliberate `{ abort: true }`
+   * from ANY plugin always wins over a failure elsewhere (see
+   * `PreUpdateHooksOutcome`). This flag only lets a plugin opt a returned (not
+   * thrown) abort into the overridable bucket.
+   */
+  failed?: boolean;
 };
 
 export type PreUpdateHook = (args: PreUpdateHookArgs) => Promise<PreUpdateHookResult> | PreUpdateHookResult;
 
+/**
+ * Aggregate outcome of running EVERY active plugin's pre-update hooks. The
+ * runner runs them all (a failure in one must not skip a later plugin's
+ * deliberate veto) and collapses the results with this precedence:
+ *
+ *   blocked  (a deliberate `{ abort: true }` from any plugin) — NOT overridable
+ *     >  overridable  (a thrown hook, or a returned `{ failed: true }` abort) — user may Proceed anyway
+ *       >  proceed  (all hooks passed)
+ *
+ * `reason` carries the first relevant plugin's message for display.
+ * `rollback()` reverts setup performed by the plugins that actually participated
+ * in THIS attempt. It is bound to the exact participating plugin instances
+ * captured during the run (not looked up by name later), so a concurrent plugin
+ * reload/disable during the hook window can't misdirect cleanup to a replacement
+ * instance or skip an unloaded original. Invoke it on any non-proceed path. It
+ * resolves with the names of participants whose cleanup did NOT complete
+ * (`failed`) rather than throwing all-or-nothing, so the caller can mark the
+ * SUCCEEDED participants done and re-owe only the failed ones (R35P1 per-plugin
+ * guarantee — a plugin that cleaned up fine must not have its cleanup rerun).
+ *
+ * `stillFresh()` returns false if the active plugin generation has changed since
+ * this outcome was produced. The caller re-checks it right before installing —
+ * the user may sit on the "Proceed anyway" dialog while a plugin activates, which
+ * would make the run's own generation check stale (R12P1).
+ */
+export type PreUpdateHooksOutcome = {
+  rollback: (opts?: { onPluginDone?: (name: string) => void | Promise<void> }) => Promise<{ failed: string[] }>;
+  stillFresh: () => boolean;
+  /** Names of plugins whose pre-update hooks participated (rollback notifies
+   *  these); the caller notifies the remaining active plugins by excluding them,
+   *  so no plugin's post-update hook fires twice (R33P1). */
+  participantNames: string[];
+  /** Subset of `participantNames` that actually captured ≥1 post-update hook. The
+   *  updater records these (∪ post-only plugins) as an attempt's `owed`, so a
+   *  participant with NO cleanup hook isn't owed forever by a reconciler that
+   *  refuses to clear hookless plugins (R35P1). */
+  postHookParticipantNames: string[];
+  /** Names of participants whose pre-update hook TIMED OUT and may still be
+   *  running (could apply privileged setup after we proceed). The updater unions
+   *  these into an attempt's `owed` at commit so a still-running elevation is
+   *  reconciled even if the plugin never registered a post-hook (R8P1). */
+  timedOutParticipantNames: string[];
+  /** Names of participants whose pre-update hook FAILED (threw or returned
+   *  `failed:true`), possibly after partial privileged setup and WITHOUT
+   *  registering a post-update hook. The updater unions these into an attempt's
+   *  `owed` at commit so their setup is reconciled even though they're hookless —
+   *  a "successful" empty rollback must not erase the debt (R28P18). */
+  failedParticipantNames: string[];
+} & ({ decision: 'proceed' } | { decision: 'overridable'; reason: string } | { decision: 'blocked'; reason: string });
+
 export type PostUpdateHookArgs = {
   version: string;
   success: boolean;
+  /**
+   * Aborted when the hook exceeds its per-hook timeout. A well-behaved cleanup
+   * hook should observe this and stop, so an abandoned rollback can't overlap a
+   * later retry's setup. Propagates to utility-process plugins via the wire
+   * transport's AbortSignal support. Optional to observe.
+   */
+  signal: AbortSignal;
 };
 
 export type PostUpdateHook = (args: PostUpdateHookArgs) => Promise<void> | void;
@@ -649,6 +737,20 @@ export type PluginAPI = {
 
   lifecycle: {
     registerPreUpdateHook: (hook: PreUpdateHook) => void;
+    /**
+     * Register a post-update cleanup/notification hook. For cleanup that must
+     * survive an app RESTART/CRASH (e.g. revoking privileged setup a pre-update
+     * hook performed), register this at plugin ACTIVATION — NOT only inside a
+     * pre-update hook. Rationale (R28P48): the post-update ledger persists the owed
+     * plugin's NAME across relaunch, but a JS callback cannot be serialized; after
+     * `quitAndInstall` or a crash, the reconciler re-activates the plugin and
+     * invokes the hooks it registered AT ACTIVATION. A hook registered ONLY as a
+     * closure inside `registerPreUpdateHook` is best-effort within the SAME session
+     * (same-generation rollback re-reads it), but is GONE after a restart — so its
+     * cleanup would never run and the ledger debt is discarded after the reconcile
+     * give-up cap. Make the activation-registered hook idempotent and able to
+     * re-derive what to clean up from durable plugin state.
+     */
     registerPostUpdateHook: (hook: PostUpdateHook) => void;
   };
 

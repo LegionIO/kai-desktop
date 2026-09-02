@@ -23,8 +23,9 @@ import type {
   PostReceiveHookArgs,
   PostReceiveHookResult,
   PreUpdateHookArgs,
-  PreUpdateHookResult,
+  PreUpdateHooksOutcome,
   PostUpdateHookArgs,
+  PostUpdateHook,
   PluginAPI,
   PluginPermission,
   PluginConsentRequest,
@@ -38,6 +39,7 @@ import type { AppConfig } from '../config/schema.js';
 import { toPluginSafeConfig, resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { safeErrorText } from '../utils/safe-error-text.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { eventBus } from '../automations/event-bus.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
@@ -61,10 +63,13 @@ import {
   AUTHENTICATED_BROWSER_PERMISSION,
   arePermissionSetsEqual,
   approvalPermissionsMatch,
+  deferredPermissionsTrusted,
   effectivePluginPermissions,
   hashPluginDirectory,
   hashPluginFile,
   isLegacyInferredBrowserPermissionSnapshot,
+  isTransientFsError,
+  pathAvailability,
   readPluginManifest,
   snapshotPluginDirectory,
 } from './plugin-integrity.js';
@@ -142,6 +147,15 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
 }
 
 export class PluginManager {
+  /**
+   * Upper bound on a SINGLE pre-update hook. A hook that never settles (a wedged
+   * elevation prompt, a stuck helper) is recorded as an overridable failure and
+   * the run moves on — bounding it here (not with one aggregate timeout in the
+   * caller) preserves any deliberate veto another plugin holds (R4). Matches the
+   * updater's historical 5-minute pre-update budget.
+   */
+  static readonly PRE_UPDATE_HOOK_TIMEOUT_MS = 5 * 60 * 1000;
+
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
   /** One independently-accounted SEA or Electron utility process per live plugin. */
@@ -193,6 +207,228 @@ export class PluginManager {
   private sessionDisabled: Set<string> = new Set();
 
   private brandRequiredPluginNamesSet: Set<string>;
+  /**
+   * Plugin names whose required-plugin AUTO-UPDATE must be deferred: they are
+   * owed post-update cleanup by a prior attempt that hasn't reconciled yet.
+   * Auto-updating (unload+reload) them at startup — which `initMarketplace` does
+   * BEFORE the ledger is reconciled — would run their owed cleanup against a
+   * different generation or make it unavailable (R35P1). The startup sequence
+   * sets this before initMarketplace and clears it once reconciliation completes.
+   */
+  private deferredUpdateNames: Set<string> = new Set();
+  /** When true, defer ALL required-plugin auto-updates (not just named ones).
+   *  Used when the ledger can't tell us WHICH plugins are owed cleanup — a legacy
+   *  marker (owed = "all active") or a corrupt/unreadable ledger — so we must
+   *  conservatively hold every auto-update until reconciliation resolves (R35P1). */
+  private deferAllUpdates = false;
+
+  /** Whether an app-update FREEZE is currently active (`beginUpdateFreeze`). Kept
+   *  SEPARATE from `deferAllUpdates`/`deferredUpdateNames` (which track GENUINE owed
+   *  cleanup): the freeze must BLOCK lifecycle ops, but it must NOT make a plugin
+   *  look like it "owes cleanup" — otherwise the strict-compat / integrity-source
+   *  bypasses (meant only for genuinely-owed OLD generations) would wrongly apply to
+   *  an in-flight install racing the drain, activating an incompatible plugin
+   *  (R28P28). */
+  private updateFreezeActive = false;
+
+  /** Set by the most recent `loadAll` discovery pass: true if a plugin directory that
+   *  `readdir` LISTED was then OMITTED because reading/parsing it threw (a transient
+   *  statSync/manifest-read I/O failure — R38P1), as opposed to a deterministic
+   *  non-plugin skip (not a directory, no manifest.json, invalid/mismatched name). A
+   *  legacy post-update reconcile consults this: an omitted plugin may have owed
+   *  cleanup that the "run all active" batch silently skipped, so the legacy marker
+   *  must be retained (not dropped) until a launch discovers the full set. */
+  private lastDiscoveryIncomplete = false;
+
+  /** Set the plugin names whose auto-update is deferred until the caller clears
+   *  it (post-update ledger reconciliation, R35P1). `all:true` defers EVERY
+   *  required-plugin auto-update regardless of name (unknown owed set). */
+  setDeferredUpdateNames(names: Iterable<string>, opts?: { all?: boolean }): void {
+    this.deferredUpdateNames = new Set(names);
+    this.deferAllUpdates = opts?.all === true;
+  }
+
+  clearDeferredUpdateNames(): void {
+    this.deferredUpdateNames = new Set();
+    this.deferAllUpdates = false;
+  }
+
+  /** Callback the updater/startup wires in to RE-RUN a specific plugin's owed
+   *  post-update reconciliation once it becomes active LATE — e.g. after the user
+   *  approves consent for an owed plugin that startup reconciliation had to SKIP as
+   *  inactive (R30P2). Without it, approval loads the plugin but its owed cleanup
+   *  (e.g. privilege revocation) never runs and the install block persists until
+   *  another restart. Optional; a no-op default keeps PluginManager usable stand-alone. */
+  private reconcileOwedForPlugin: (pluginName: string) => void | Promise<void> = () => {};
+  setOwedCleanupReconciler(fn: (pluginName: string) => void | Promise<void>): void {
+    this.reconcileOwedForPlugin = fn;
+  }
+
+  /** Snapshot of the deferral state captured by `beginUpdateFreeze`, restored by
+   *  `endUpdateFreeze`. `null` when no freeze is active. */
+  private updateFreezeSnapshot: { names: Set<string>; all: boolean } | null = null;
+
+  /** FREEZE all plugin-generation replacement for the duration of an app-update
+   *  attempt (R28P1). Sets `deferAllUpdates` so the periodic required-plugin
+   *  refresh finds nothing eligible AND every explicit lifecycle op
+   *  (disable/uninstall/kill/install) that consults `isUpdateDeferred` is refused —
+   *  BOTH at entry and again inside its install-lock (via `assertNotFrozen`), so an
+   *  op that passed its entry check while QUEUED still bails once it acquires the
+   *  lock under the freeze. It then DRAINS any lifecycle op ALREADY running (holding
+   *  an install lock) so a replacement in progress finishes before the updater
+   *  samples plugins — closing the window where a swap/unload could invalidate a
+   *  participant's captured cleanup between `stillFresh()` and quit. Idempotent: a
+   *  second begin without an intervening end keeps the ORIGINAL snapshot and just
+   *  re-drains.
+   *
+   *  BOUNDED by `timeoutMs` (monotonic): a lifecycle op holding an install lock can
+   *  hang indefinitely, and an unbounded `Promise.allSettled` would leave
+   *  `deferAllUpdates` (and the caller's `installInProgress`) stuck forever (R28P11).
+   *  On timeout this THROWS so the caller aborts the update and lifts the freeze;
+   *  the freeze snapshot is left in place for the caller's `endUpdateFreeze()`. */
+  async beginUpdateFreeze(timeoutMs = 15_000): Promise<void> {
+    // NOTE: the freeze uses its OWN `updateFreezeActive` flag, NOT `deferAllUpdates`
+    // — so it blocks lifecycle ops WITHOUT making plugins look like they owe cleanup
+    // (which would wrongly trigger the strict-compat / integrity bypasses, R28P28).
+    // The snapshot still captures the genuine deferral so endUpdateFreeze restores it.
+    if (!this.updateFreezeSnapshot) {
+      this.updateFreezeSnapshot = { names: new Set(this.deferredUpdateNames), all: this.deferAllUpdates };
+    }
+    this.updateFreezeActive = true;
+    // Drain lifecycle ops already in flight. New/queued ops can't start a
+    // replacement now (deferAllUpdates + the in-lock assertNotFrozen recheck), so
+    // once the current holders settle no generation swap is in progress. Bound the
+    // wait on a MONOTONIC clock so a genuinely hung lock can't wedge the freeze.
+    const deadline = performance.now() + timeoutMs;
+    while (this.installLocks.size > 0) {
+      if (performance.now() >= deadline) {
+        throw new Error('Timed out draining in-flight plugin lifecycle operations before update freeze');
+      }
+      // Race the in-flight locks against a short timer so a hung lock doesn't block
+      // the deadline check; re-loop to re-check size + deadline.
+      const remaining = deadline - performance.now();
+      await Promise.race([
+        Promise.allSettled([...this.installLocks.values()]),
+        new Promise((r) => setTimeout(r, Math.max(1, Math.min(100, remaining)))),
+      ]);
+    }
+    // Refuse the freeze if a plugin update is UNRESOLVED and AWAITING A LIVE CONSENT
+    // PROMPT whose ROLLBACK metadata lives ONLY in memory (R28P16b / R36P2). Such an
+    // install released its install lock (so the drain above didn't see it); letting
+    // the app quit now would lose the in-memory rollback stash — a subsequent denial
+    // couldn't restore the prior generation. The guard must be the INTERSECTION of a
+    // live prompt AND a rollback stash:
+    //   • A pending consent with NO rollback (startup discovery, or a FIRST-TIME
+    //     marketplace install) has no prior generation to preserve — the prompt is
+    //     simply re-derived from disk after relaunch, so blocking the app update for
+    //     it would force the user to resolve an unrelated consent prompt before
+    //     updating Kai, for no safety benefit (R36P2).
+    //   • A rollback stash with NO live prompt is the DISABLED-plugin update case
+    //     (resolved on next enable); blocking every app update on that — with nothing
+    //     for the user to resolve — would wedge updates for the session (R28P27). It
+    //     is a lesser concern (its generation isn't running) and is cleared on
+    //     uninstall.
+    // Only when BOTH hold is there a running, unapproved generation with in-memory-
+    // only rollback that a quit would strand — AND that rollback must actually
+    // PRESERVE a prior generation. A FIRST-TIME marketplace install requiring consent
+    // creates a `pendingConsentRollback` entry with `backupDir` UNDEFINED (there is no
+    // prior generation to restore); blocking the app-update freeze on that would force
+    // the user to resolve an unrelated first-install prompt before updating Kai, for
+    // no safety benefit — a quit loses nothing recoverable (R49P2). So require a real
+    // backup (backupDir, or a prior installed/approval record) before blocking.
+    for (const name of this.pendingConsent.keys()) {
+      const rollback = this.pendingConsentRollback.get(name);
+      if (rollback && (rollback.backupDir || rollback.priorInstalledRecord || rollback.priorApproval)) {
+        throw new Error('A plugin update is awaiting consent; resolve it before updating the app');
+      }
+    }
+  }
+
+  /** Throw if an app-update freeze is active — used INSIDE the install lock by the
+   *  explicit lifecycle ops so a QUEUED op that passed its entry check before the
+   *  freeze still refuses to replace a generation once it acquires the lock
+   *  (R28P1). */
+  private assertNotFrozen(pluginName: string): void {
+    if (this.updateFreezeActive || this.deferAllUpdates || this.deferredUpdateNames.has(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
+  }
+
+  /** Throw ONLY if a transient app-update FREEZE is active — NOT merely because the
+   *  plugin is deferred (owes cleanup). Used by CONSENT resolution
+   *  (approve/deny): a plugin that owes post-update cleanup but reached startup
+   *  consent (approval missing/mismatched) must be able to resolve consent, because
+   *  approving is exactly how it LOADS and runs its owed cleanup hook — and denying
+   *  is how it rolls back. Gating consent on `isUpdateDeferred` (freeze OR deferred)
+   *  would DEADLOCK (R28P46): the plugin can't load → cleanup never runs → the
+   *  deferral never clears → consent stays unresolvable → the debt is discarded
+   *  after the give-up cap. Only the ACTUAL in-progress app-update freeze blocks
+   *  consent (its generation swaps must not race the updater's sampled set). */
+  private assertNoActiveFreeze(pluginName: string): void {
+    if (this.updateFreezeActive) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
+  }
+
+  /** END the app-update freeze, RESTORING the pre-freeze deferral state. Callers
+   *  that need to RETAIN specific plugins as deferred (a rollback that left
+   *  cleanup owed) must call `deferUpdates(...)` AFTER this, so those names are
+   *  re-added on top of the restored snapshot rather than clobbered by it. No-op
+   *  if no freeze is active. */
+  endUpdateFreeze(): void {
+    this.updateFreezeActive = false;
+    if (!this.updateFreezeSnapshot) return;
+    this.deferredUpdateNames = this.updateFreezeSnapshot.names;
+    this.deferAllUpdates = this.updateFreezeSnapshot.all;
+    this.updateFreezeSnapshot = null;
+  }
+
+  /** UpdateHookRunner.freezePluginUpdates — alias of `beginUpdateFreeze` (async:
+   *  it drains in-flight lifecycle ops before resolving). */
+  freezePluginUpdates(): Promise<void> {
+    return this.beginUpdateFreeze();
+  }
+
+  /** UpdateHookRunner.unfreezePluginUpdates — alias of `endUpdateFreeze`. */
+  unfreezePluginUpdates(): void {
+    this.endUpdateFreeze();
+  }
+
+  /** ADD names to the deferred set without disturbing the existing deferral (or
+   *  the `deferAllUpdates` flag). Called by the updater when a rollback/teardown
+   *  RETAINS cleanup debt for specific plugins mid-session, so a periodic refresh
+   *  or explicit lifecycle op can't replace that generation before the user
+   *  relaunches and the next-launch reconciler runs the owed cleanup (R6P2/R7). */
+  addDeferredUpdateNames(names: Iterable<string>): void {
+    for (const n of names) this.deferredUpdateNames.add(n);
+  }
+
+  /** UpdateHookRunner.deferUpdates — alias of addDeferredUpdateNames used by the
+   *  auto-updater to defer plugins whose rollback debt it just retained (R7). */
+  deferUpdates(names: readonly string[]): void {
+    this.addDeferredUpdateNames(names);
+  }
+
+  /** Whether replacing this plugin's generation is currently deferred because it
+   *  (or, under `deferAllUpdates`, any plugin) owes un-reconciled post-update
+   *  cleanup. Both the automatic required-plugin refresh AND explicit user
+   *  installs/updates consult this so neither replaces a generation mid-cleanup
+   *  (R5P2). */
+  isUpdateDeferred(pluginName: string): boolean {
+    // Includes the transient FREEZE: while an app update is in progress, replacing
+    // ANY generation is refused, not just genuinely-owed ones.
+    return this.updateFreezeActive || this.deferAllUpdates || this.deferredUpdateNames.has(pluginName);
+  }
+
+  /** Whether this plugin GENUINELY owes un-reconciled post-update cleanup (per the
+   *  ledger-seeded deferral), as opposed to merely being blocked by the transient
+   *  app-update freeze. This — NOT `isUpdateDeferred` — gates the strict-compat and
+   *  integrity-source BYPASSES for a preserved OLD generation: those must apply ONLY
+   *  to a real owed generation, never to an unrelated install that happens to race
+   *  the freeze drain (R28P28). */
+  private ownsGenuineCleanupDebt(pluginName: string): boolean {
+    return this.deferAllUpdates || this.deferredUpdateNames.has(pluginName);
+  }
 
   /**
    * UI-state broadcast coalescing + dedup. broadcastUIState() is called from
@@ -219,15 +455,39 @@ export class PluginManager {
 
   /* ── Discovery ── */
 
-  private discoverPlugins(): Array<{ manifest: PluginManifest; dir: string }> {
-    if (!existsSync(this.pluginsDir)) return [];
+  private discoverPlugins(opts?: { throwOnReadError?: boolean }): Array<{ manifest: PluginManifest; dir: string }> {
+    // Reset the incompleteness flag for THIS pass; only the loadAll path (which passes
+    // `throwOnReadError`) records per-entry read failures into it (R38P1).
+    if (opts?.throwOnReadError) this.lastDiscoveryIncomplete = false;
+    // Classify the plugins-dir existence: a transient stat error is NOT "absent"
+    // (R39P1). On the faithful-discovery path propagate it (like a readdir failure);
+    // elsewhere keep the lenient empty result. Only genuine ENOENT returns [].
+    const dirState = pathAvailability(this.pluginsDir);
+    if (dirState === 'error') {
+      if (opts?.throwOnReadError) {
+        throw new Error(`Plugins directory could not be read: ${this.pluginsDir}`);
+      }
+      return [];
+    }
+    if (dirState === 'absent') return [];
 
     const results: Array<{ manifest: PluginManifest; dir: string }> = [];
     let entries: string[];
 
     try {
       entries = readdirSync(this.pluginsDir);
-    } catch {
+    } catch (err) {
+      // A TRANSIENT directory-read failure (EMFILE/EIO/EACCES/EBUSY…) is NOT the same
+      // as an empty plugins directory. Silently returning [] here makes the whole
+      // plugin set look empty, which for the startup legacy post-update reconcile is
+      // catastrophic: with no active/pending/errored/loading plugins, the "run all
+      // active" batch reports allSucceeded and the legacy marker is dropped, so owed
+      // cleanup (e.g. privilege revocation) is permanently lost (R37P1). Callers that
+      // need a faithful full listing (loadAll) pass `throwOnReadError` so the failure
+      // propagates and aborts loading (main.ts then blocks installs and preserves the
+      // ledger). Single-plugin lookups keep the lenient [] (a missing dir just means
+      // "not found").
+      if (opts?.throwOnReadError) throw err;
       return [];
     }
 
@@ -236,12 +496,38 @@ export class PluginManager {
       const pluginDir = join(this.pluginsDir, entry);
       try {
         if (!statSync(pluginDir).isDirectory()) continue;
-      } catch {
+      } catch (err) {
+        // `readdir` listed this entry but `statSync` (which follows symlinks) threw.
+        // Distinguish TRANSIENT I/O (retryable → discovery incomplete → block installs
+        // so a possibly-owed plugin isn't lost, R38P1) from DETERMINISTIC debris — a
+        // dangling symlink (ENOENT) or a symlink loop (ELOOP) fails identically every
+        // launch, so flagging it would PERMANENTLY wedge all app updates with no UI
+        // recovery (R41P1). Only a transient error flags incompleteness; deterministic
+        // debris is skipped + surfaced.
+        if (opts?.throwOnReadError && isTransientFsError(err)) this.lastDiscoveryIncomplete = true;
+        console.warn(`[PluginManager] Failed to stat plugin entry "${entry}":`, err);
         continue;
       }
 
       const manifestPath = join(pluginDir, 'plugin.json');
-      if (!existsSync(manifestPath)) continue;
+      // Classify the manifest path with the errno in hand (R41P1): ENOENT (incl. a
+      // dangling symlink target) = "not a plugin directory" → deterministic skip; a
+      // symlink loop (ELOOP) or other DETERMINISTIC error is likewise skipped without
+      // blocking; only a TRANSIENT read failure marks discovery incomplete (the
+      // manifest may really be there). A bare `pathAvailability` would collapse the
+      // errno, so stat directly here.
+      let manifestPresent: boolean;
+      try {
+        statSync(manifestPath);
+        manifestPresent = true;
+      } catch (err) {
+        manifestPresent = false;
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+          if (opts?.throwOnReadError && isTransientFsError(err)) this.lastDiscoveryIncomplete = true;
+          console.warn(`[PluginManager] Failed to stat plugin manifest at ${manifestPath}:`, err);
+        }
+      }
+      if (!manifestPresent) continue;
 
       try {
         const manifest = readPluginManifest(pluginDir, entry);
@@ -264,6 +550,17 @@ export class PluginManager {
         }
         results.push({ manifest, dir: pluginDir });
       } catch (err) {
+        // The manifest EXISTS but couldn't be read/parsed/validated. Distinguish the
+        // two cases (R40P1#structured):
+        //   • TRANSIENT I/O (EIO/EACCES/EMFILE/EBUSY/ENFILE/EAGAIN…) — a retry can
+        //     clear it, and the plugin may owe cleanup → flag discovery incomplete so
+        //     installs block until a clean launch reads it.
+        //   • DETERMINISTIC defect (malformed JSON, size/symlink/name limit) — a retry
+        //     will NEVER succeed, so flagging it would WEDGE all app updates forever
+        //     with no in-app recovery (the plugin isn't in plugin:list). Do NOT flag;
+        //     just skip + surface the warning. A genuinely-broken local plugin must not
+        //     hold the whole app's updates hostage.
+        if (opts?.throwOnReadError && isTransientFsError(err)) this.lastDiscoveryIncomplete = true;
         console.warn(`[PluginManager] Failed to read plugin manifest at ${manifestPath}:`, err);
       }
     }
@@ -396,8 +693,15 @@ export class PluginManager {
     return true;
   }
 
-  /** Called by IPC when user approves a dangerous plugin. */
-  async approveAndReload(pluginName: string): Promise<boolean> {
+  /** Called by IPC when user approves a dangerous plugin. `expectedFileHash` (the
+   *  hash the CLIENT was shown) guards against a STALE cross-request decision
+   *  (R28P55): with multiple clients, request R1 can be resolved and a rollback /
+   *  new install can create R2 for the SAME plugin name with a DIFFERENT hash +
+   *  permissions; a client still holding R1 must not have its decision applied to
+   *  R2 (which could approve permissions it never saw). We validate the live pending
+   *  entry's hash matches inside the lock; on mismatch we no-op so the client
+   *  re-syncs and re-prompts against R2. */
+  async approveAndReload(pluginName: string, expectedFileHash?: string): Promise<boolean> {
     const pending = this.pendingConsent.get(pluginName);
     if (!pending) return false;
 
@@ -405,10 +709,23 @@ export class PluginManager {
     // in-flight disable can't interleave with this approval reload and leave the
     // plugin active after the user disabled it.
     return this.withInstallLock(pluginName, async () => {
+      // Re-check inside the lock: approval LOADS/activates a generation, which must
+      // not happen during an ACTIVE app-update freeze (it could introduce a plugin
+      // whose veto/post-update hook isn't in the committed ledger, R28P12). But a
+      // plugin that merely OWES cleanup (deferred) MUST still be approvable — that's
+      // how it loads and runs its owed cleanup; blocking it here would deadlock
+      // (R28P46). So gate on the active freeze only, not the deferral.
+      this.assertNoActiveFreeze(pluginName);
       // Re-check: a concurrent disable/deny may have cleared the pending consent
       // while we waited for the lock.
       const stillPending = this.pendingConsent.get(pluginName);
       if (!stillPending) return false;
+      // Stale cross-request guard (R28P55): the live request must be the SAME one the
+      // client decided on. If a different generation now holds the prompt, ignore
+      // this stale approval — the client re-syncs and re-prompts.
+      if (expectedFileHash !== undefined && stillPending.fileHash !== expectedFileHash) {
+        return false;
+      }
 
       this.persistPluginApproval(pluginName, stillPending.fileHash, stillPending.manifest.permissions);
       this.pendingConsent.delete(pluginName);
@@ -417,9 +734,17 @@ export class PluginManager {
       const discovered = this.discoverPlugins();
       const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
       if (!pluginInfo) {
-        void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval').catch((err) =>
-          console.error(`[plugins] consent rollback for "${pluginName}" failed:`, err),
-        );
+        // AWAIT the rollback INSIDE the lock (R28P43): it unloads/restores/reloads
+        // the prior generation, so detaching it (void) would release the install
+        // lock while a generation swap is still in flight — an app-update freeze
+        // drain could then finish mid-replacement and fail freshness. Holding the
+        // lock through it keeps the swap atomic w.r.t. the freeze + other lifecycle
+        // ops. A throw is contained so approve still returns false cleanly.
+        try {
+          await this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval');
+        } catch (err) {
+          console.error(`[plugins] consent rollback for "${pluginName}" failed:`, err);
+        }
         return false;
       }
 
@@ -428,25 +753,88 @@ export class PluginManager {
       await this.loadPlugin(pluginInfo.manifest, pluginInfo.dir);
       const instance = this.plugins.get(pluginName);
       await this.resolvePendingConsentRollback(pluginName, instance?.state === 'active', instance?.error);
+      // If this plugin OWES un-reconciled post-update cleanup and just became ACTIVE
+      // via approval, startup reconciliation already SKIPPED it (it was inactive
+      // then). Re-run its owed cleanup NOW so it isn't stranded and the install block
+      // clears without another restart (R30P2). Detached (best-effort) so approval
+      // still returns promptly; the reconciler is idempotent + serial.
+      if (instance?.state === 'active' && this.ownsGenuineCleanupDebt(pluginName)) {
+        try {
+          void Promise.resolve(this.reconcileOwedForPlugin(pluginName)).catch((err) =>
+            console.error(`[plugins] post-approval owed-cleanup reconcile for "${pluginName}" failed:`, err),
+          );
+        } catch (err) {
+          console.error(`[plugins] post-approval owed-cleanup reconcile for "${pluginName}" threw:`, err);
+        }
+      }
       return true;
     });
   }
 
-  /** Called by IPC when user denies a dangerous plugin. */
-  denyPlugin(pluginName: string): void {
-    this.pendingConsent.delete(pluginName);
-    if (this.pendingConsentRollback.has(pluginName)) {
-      void this.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user').catch((err) =>
-        console.error(`[plugins] consent rollback for "${pluginName}" failed:`, err),
-      );
-      return;
-    }
-    const instance = this.plugins.get(pluginName);
-    if (instance) {
-      instance.state = 'error';
-      instance.error = 'Permission denied by user';
-      this.broadcastUIState();
-    }
+  /** Called by IPC when user denies a dangerous plugin. ASYNC + fully serialized:
+   *  ALL consent-state mutation AND the rollback-vs-no-rollback DECISION happen
+   *  INSIDE the install lock, AFTER the freeze recheck (R28P17/R28P20). Deciding the
+   *  branch inside the lock closes a TOCTOU where a same-plugin marketplace update
+   *  queued ahead populates `pendingConsentRollback` only after we'd snapshotted it
+   *  as empty — which would take the no-rollback branch and strand the backup +
+   *  denied generation. Rejects (throws) if frozen so the caller keeps the prompt
+   *  up and retries. */
+  async denyPlugin(pluginName: string, expectedFileHash?: string): Promise<void> {
+    await this.withInstallLock(pluginName, async () => {
+      // Gate on the ACTIVE freeze only, not the deferral: a denial of a plugin that
+      // owes cleanup must still be resolvable so its rollback can run — blocking it
+      // on `isUpdateDeferred` would deadlock the consent prompt (R28P46). Its
+      // generation swap during an actual freeze is still refused.
+      this.assertNoActiveFreeze(pluginName);
+      // STALE-request guard (R28P53): if `pendingConsent` no longer holds this
+      // plugin, a PRIOR queued deny/approve for the SAME prompt already resolved it
+      // (two clients denying the same prompt, or a deny queued behind an approve).
+      // Proceeding would consume a non-existent request and — via the no-rollback
+      // branch below — mark the freshly restored/approved generation as `error`,
+      // corrupting a plugin that's now valid. Ignore the stale request (no-op).
+      const current = this.pendingConsent.get(pluginName);
+      if (!current) {
+        return;
+      }
+      // Stale CROSS-request guard (R28P55): the live request must be the SAME one the
+      // client decided on. A different generation now holding the prompt (rollback /
+      // new install created R2 with a different hash) means this decision was for a
+      // request the user no longer sees — ignore it; the client re-syncs.
+      if (expectedFileHash !== undefined && current.fileHash !== expectedFileHash) {
+        return;
+      }
+      // Re-read the rollback state now that we hold the lock: an update that was
+      // queued ahead of us may have just populated it (R28P20).
+      const hasRollback = this.pendingConsentRollback.has(pluginName);
+      // From HERE the consent state is CONSUMED (pendingConsent deleted). A failure
+      // in the rollback below must NOT surface as a retryable "freeze refusal": the
+      // prompt's underlying request is already gone, so keeping the modal up (and
+      // letting a retry no-op) would strand the rejected generation (R28P50). We
+      // therefore SWALLOW a post-consumption rollback error here (logged; the failed
+      // rollback is itself surfaced via setFailedUpdate inside resolvePendingConsentRollback)
+      // so denyPlugin RESOLVES — the modal correctly drops the stale prompt. Only the
+      // PRE-mutation `assertNoActiveFreeze` throw above propagates as retryable.
+      this.pendingConsent.delete(pluginName);
+      if (hasRollback) {
+        // Roll back the installed generation atomically under this same lock.
+        try {
+          await this.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user');
+        } catch (err) {
+          console.error(
+            `[plugins] consent-denial rollback for "${pluginName}" failed (consent already consumed):`,
+            err,
+          );
+        }
+      } else {
+        // Plain consent denial — no generation to roll back.
+        const instance = this.plugins.get(pluginName);
+        if (instance) {
+          instance.state = 'error';
+          instance.error = 'Permission denied by user';
+          this.broadcastUIState();
+        }
+      }
+    });
   }
 
   private async resolvePendingConsentRollback(pluginName: string, activated: boolean, error?: string): Promise<void> {
@@ -488,28 +876,132 @@ export class PluginManager {
     );
   }
 
+  /** True if any plugin is currently awaiting consent (held inactive until the user
+   *  approves). Such a plugin is NOT in the active set, so a "run all active" legacy
+   *  post-update batch silently omits it — the startup reconciler uses this to avoid
+   *  dropping a legacy attempt whose cleanup for a consent-pending plugin hasn't run
+   *  yet (R33P1). */
+  hasPendingConsent(): boolean {
+    return this.pendingConsent.size > 0;
+  }
+
+  /** True if any discovered plugin is in an UNRESOLVED activation state — `error`
+   *  (activation failed this launch, e.g. after an update) or `loading` (still
+   *  settling). Such a plugin is not in the active set, so a "run all active" legacy
+   *  post-update batch omits it even though it may have performed privileged setup
+   *  before failing and still owes cleanup. The startup reconciler uses this (with
+   *  `hasPendingConsent`) to avoid dropping a legacy marker while such a plugin's
+   *  cleanup could not run (R34P1). `disabled` is EXCLUDED: it's a deliberate user
+   *  opt-out and was never part of the "all active" batch scope. */
+  hasUnresolvedActivation(): boolean {
+    for (const instance of this.plugins.values()) {
+      if (instance.state === 'error' || instance.state === 'loading') return true;
+    }
+    return false;
+  }
+
+  /** True if the most recent `loadAll` discovery OMITTED a listed plugin directory
+   *  because reading/parsing it threw (R38P1) — a transient statSync/manifest-read
+   *  failure, not a deterministic non-plugin skip. An omitted plugin never enters the
+   *  active set, so a "run all active" legacy batch can't run its (possibly-owed)
+   *  cleanup; the startup reconciler uses this to retain the legacy marker until a
+   *  launch discovers the full set (bounded by the give-up cap). */
+  hadIncompleteDiscovery(): boolean {
+    return this.lastDiscoveryIncomplete;
+  }
+
   private isRequiredPluginIntegrityTrusted(manifest: PluginManifest, fileHash: string): boolean {
+    // A plugin that owes un-reconciled post-update cleanup is DEFERRED: bootstrap
+    // deliberately kept its OLD generation on disk so the reconciler can run its
+    // post-update hook against matching code (R28P1). That old generation will NOT
+    // match a NEWER catalog entry / bundled resource, so validating it against the
+    // new source would reject the load — its cleanup hook would never register, the
+    // ledger would block installs, and the debt would eventually be discarded
+    // (R28P6). For a deferred plugin we therefore trust the PREVIOUSLY-PERSISTED
+    // installed record (hash + version + permissions the user already approved) and
+    // SKIP comparison against the newer source. The newer generation is validated
+    // normally once reconciliation clears the deferral and a later launch installs it.
+    // Gate the source-comparison bypass on GENUINE owed cleanup, NOT the transient
+    // freeze (R28P28): an unrelated install racing the freeze drain must not be
+    // trusted against a stale record.
+    const deferred = this.ownsGenuineCleanupDebt(manifest.name);
     if (this.marketplaceService) {
       const installedInfo = this.getConfig().marketplace?.installedPlugins?.[manifest.name];
+      // A DEFERRED bundled required plugin records its approval in `pluginApprovals`,
+      // NOT `marketplace.installedPlugins` — and a release can INTRODUCE marketplace
+      // URLs (making `marketplaceService` truthy) AFTER that bundled plugin already
+      // owed cleanup, so no `installedInfo` exists (R33P2). Rejecting here would leave
+      // the owed generation unloadable, its cleanup hook unregistered, and the debt
+      // abandoned at the give-up cap. So for a deferred generation with no marketplace
+      // install record, fall back to the same bundled/`pluginApprovals` trust the
+      // no-marketplace path uses below.
+      if (deferred && !installedInfo?.fileHash) {
+        return this.isDeferredBundledApprovalTrusted(manifest, fileHash);
+      }
       if (!installedInfo?.fileHash || installedInfo.fileHash !== fileHash) return false;
       if (installedInfo.version !== manifest.version) return false;
-      if (!installedInfo.permissions || !arePermissionSetsEqual(installedInfo.permissions, manifest.permissions))
-        return false;
+      // Exact-match is the norm. For a DEFERRED generation, ALSO accept the single
+      // rollout migration where the persisted snapshot predates the host-inferred
+      // authenticated-Browser permission and the manifest adds exactly that one
+      // (R31P2). Rejecting it would leave the owed plugin unloadable — its cleanup
+      // hook never registers, installs stay blocked, and the debt is discarded at
+      // the give-up cap. The hash+version already match the approved generation, so
+      // this is the same trusted code; and because the added permission IS the
+      // authenticated-Browser one, `ensurePluginApproved` still gates activation
+      // behind a fresh consent prompt — integrity tolerance never bypasses consent.
+      const permsOk = deferred
+        ? deferredPermissionsTrusted(installedInfo.permissions, manifest.permissions, 'exact')
+        : !!installedInfo.permissions && arePermissionSetsEqual(installedInfo.permissions, manifest.permissions);
+      if (!permsOk) return false;
 
-      const entry = this.marketplaceService.getCachedCatalog()?.find((plugin) => plugin.name === manifest.name);
-      if (entry && entry.version !== manifest.version) return false;
-      const expectedFileHash = entry ? this.getMarketplaceExpectedFileHash(entry) : undefined;
-      if (expectedFileHash && expectedFileHash !== fileHash) return false;
+      if (!deferred) {
+        const entry = this.marketplaceService.getCachedCatalog()?.find((plugin) => plugin.name === manifest.name);
+        if (entry && entry.version !== manifest.version) return false;
+        const expectedFileHash = entry ? this.getMarketplaceExpectedFileHash(entry) : undefined;
+        if (expectedFileHash && expectedFileHash !== fileHash) return false;
+      }
 
       return true;
     }
 
+    // Bundled (no marketplace): a deferred plugin's on-disk generation won't match
+    // the newer bundled resource. Trust the persisted `pluginApprovals` record for
+    // the deferred generation (R28P6).
+    if (deferred) {
+      return this.isDeferredBundledApprovalTrusted(manifest, fileHash);
+    }
     const bundledIntegrity = getBundledPluginIntegrity(manifest.name);
     return (
       bundledIntegrity?.fileHash === fileHash &&
       bundledIntegrity.version === manifest.version &&
       arePermissionSetsEqual(bundledIntegrity.permissions, manifest.permissions)
     );
+  }
+
+  /**
+   * Integrity trust for a DEFERRED (owed-cleanup) plugin backed by a `pluginApprovals`
+   * record rather than a marketplace install (bundled required plugins, or a plugin
+   * whose marketplace record predates a later marketplace-URL rollout — R33P2). The
+   * stored hash uniquely identifies the approved generation; we only SKIP comparison
+   * against the newer bundled/catalog resource, not the hash itself.
+   *
+   * Permission-snapshot handling mirrors the marketplace branch, PLUS the legacy
+   * hash-ONLY approval that predates permission snapshots entirely (`permissions`
+   * undefined — R33P3): a hash match proves it's the approved code, so trust it for
+   * INTEGRITY and let consent gate activation. `ensurePluginApproved` re-prompts
+   * whenever the manifest carries `browser:authenticated-session` (the only permission
+   * the host infers), so this never activates un-consented Browser access — it just
+   * lets the preserved generation LOAD far enough to reach the consent gate and
+   * register its cleanup hook. A modern approval WITH a snapshot still goes through
+   * `deferredPermissionsTrusted` (exact match OR the narrow inferred-Browser delta).
+   */
+  private isDeferredBundledApprovalTrusted(manifest: PluginManifest, fileHash: string): boolean {
+    const approval = this.getConfig().pluginApprovals?.[manifest.name];
+    if (!approval || approval.hash !== fileHash) return false;
+    // Legacy hash-only approval (no permission snapshot): hash match is sufficient
+    // for integrity; consent re-prompts for any inferred Browser permission (R33P3).
+    if (!approval.permissions) return true;
+    return deferredPermissionsTrusted(approval.permissions, manifest.permissions, 'approval');
   }
 
   private getMarketplaceExpectedFileHash(entry: MarketplaceCatalogEntry): string | undefined {
@@ -559,15 +1051,30 @@ export class PluginManager {
   }
 
   async loadAll(): Promise<void> {
-    const discovered = this.discoverPlugins();
+    // Throw on a directory-read failure rather than treating it as an empty plugin
+    // set (R37P1): loading zero plugins here would let the startup legacy reconcile
+    // conclude nothing is owed and drop the marker. A throw aborts loading; main.ts's
+    // loader catch then blocks installs and leaves the ledger intact for a retry.
+    const discovered = this.discoverPlugins({ throwOnReadError: true });
     console.info(`[PluginManager] Discovered ${discovered.length} plugins`);
 
     // loadPlugin() itself skips persistently-disabled plugins (registering a
     // 'disabled' stub), so this loop stays simple and that guard is the single
     // source of truth across all load paths.
     for (const { manifest, dir } of discovered) {
-      if (this.plugins.has(manifest.name)) continue;
-      await this.loadPlugin(manifest, dir);
+      const existing = this.plugins.get(manifest.name);
+      if (existing) {
+        // Already loaded by an EARLIER path (e.g. initMarketplace's required-plugin
+        // auto-install, which runs before loadAll). If that path left an `error` stub
+        // from a TRANSIENT failure, this faithful pass must still mark discovery
+        // incomplete so installs block — otherwise loadAll would silently skip it and
+        // an app update could bypass the plugin's pre-update veto (R51P1).
+        if (existing.transientLoadFailure) this.lastDiscoveryIncomplete = true;
+        continue;
+      }
+      // Faithful startup pass: a transient activation failure marks discovery
+      // incomplete → installs block (R43P1).
+      await this.loadPlugin(manifest, dir, { faithful: true });
     }
 
     this.broadcastUIState();
@@ -642,7 +1149,13 @@ export class PluginManager {
     }
   }
 
-  private async loadPlugin(manifest: PluginManifest, dir: string): Promise<void> {
+  private async loadPlugin(manifest: PluginManifest, dir: string, opts?: { faithful?: boolean }): Promise<void> {
+    // `faithful` = this load is part of the startup loadAll faithful pass, where a
+    // TRANSIENT activation failure means the active set is incomplete and installs
+    // must block (R43P1). A single mid-session reload (restore/enable) does NOT set
+    // that session-wide flag — it would wrongly wedge installs with no loadAll to
+    // clear it. Default false.
+    const faithful = opts?.faithful === true;
     const pluginCorrelationId = newDiagnosticCorrelationId(`plugin-${manifest.name}`);
     traceDiagnostic({
       scope: 'plugin',
@@ -730,7 +1243,17 @@ export class PluginManager {
       const compat = checkPluginCompatibility(manifest);
       if (!compat.compatible) {
         const mode = this.getConfig().pluginSystem?.compatibilityMode ?? 'warn';
-        if (mode === 'strict') {
+        // A DEFERRED plugin owes un-reconciled post-update cleanup: bootstrap kept
+        // its OLD generation on disk precisely so its post-update hook can run
+        // against matching code. That old generation's `engines.kai` range may
+        // EXCLUDE the newly-bumped host — but rejecting it under strict mode would
+        // mean its cleanup hook never registers, stranding privileged setup (e.g.
+        // temporary elevation) and eventually discarding the debt (R28P26). So a
+        // deferred plugin loads DESPITE strict-mode incompatibility (treated like
+        // warn mode: banner + load). It can't be replaced while deferred, and once
+        // reconciliation clears the debt a later launch installs the compatible new
+        // generation and re-applies strict mode normally.
+        if (mode === 'strict' && !this.ownsGenuineCleanupDebt(manifest.name)) {
           instance.state = 'error';
           instance.error = `Incompatible: ${compat.errors.join('; ')}`;
           console.warn(`[PluginManager] Plugin "${manifest.name}" blocked (strict mode): ${compat.errors.join('; ')}`);
@@ -746,17 +1269,30 @@ export class PluginManager {
           });
           return;
         }
-        // warn mode: store warning, continue loading
+        // warn mode (or a deferred plugin under strict): store warning, continue loading
         instance.compatWarning = compat;
         console.warn(`[PluginManager] Plugin "${manifest.name}" compatibility warning: ${compat.errors.join('; ')}`);
       }
 
-      // Load backend entry point from backend.js
+      // Load backend entry point from backend.js. Classify existence errno-aware
+      // (R43P1): a genuine ENOENT means the plugin really has no backend → deterministic
+      // "missing backend" error. A TRANSIENT read failure must NOT be collapsed to
+      // "missing" (that would skip the backend + its pre-update veto and mis-mark the
+      // plugin); flag discovery incomplete so installs block for the session, and mark
+      // the instance error for a next-launch retry.
       const backendPath = join(dir, 'backend.js');
-      if (!existsSync(backendPath)) {
-        console.warn(`[PluginManager] Plugin "${manifest.name}" missing backend.js - skipping`);
+      const backendState = pathAvailability(backendPath);
+      if (backendState !== 'present') {
+        const transient = backendState === 'error';
+        console.warn(
+          `[PluginManager] Plugin "${manifest.name}" backend.js ${transient ? 'unreadable (transient)' : 'not found'} - skipping`,
+        );
         instance.state = 'error';
-        instance.error = `Plugin backend not found: ${backendPath}`;
+        instance.error = transient
+          ? `Plugin backend could not be read (will retry): ${backendPath}`
+          : `Plugin backend not found: ${backendPath}`;
+        if (transient) instance.transientLoadFailure = true; // R51P1: loadAll honors it even if a prior path made this stub
+        if (transient && faithful) this.lastDiscoveryIncomplete = true;
         this.broadcastUIState();
         this.notifyToolsChanged();
         traceDiagnostic({
@@ -765,7 +1301,7 @@ export class PluginManager {
           level: 'warn',
           correlationId: pluginCorrelationId,
           pluginName: manifest.name,
-          fields: { reason: 'missing-backend' },
+          fields: { reason: transient ? 'backend-unreadable' : 'missing-backend' },
         });
         return;
       }
@@ -990,6 +1526,21 @@ export class PluginManager {
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.error(`[PluginManager] Failed to load plugin "${manifest.name}":`, err);
+      // A TRANSIENT activation failure (snapshotPluginDirectory / backend hashing hits
+      // EIO/EACCES/…) leaves the plugin in `error` state but is retryable next launch.
+      // The plugin is now absent from the active set, so an app update run now could
+      // bypass its pre-update veto (R43P1) — the same risk as incomplete DISCOVERY.
+      // Record it as discovery incompleteness so the install-block check (R40P1) trips
+      // for the session. A DETERMINISTIC activation error (bad code, incompatible API)
+      // is NOT flagged — it fails identically every launch and must not permanently
+      // wedge updates (the plugin's `error` row surfaces it instead).
+      const transientLoad = isTransientFsError(err);
+      // Mark the FACT of a transient failure on the instance regardless of `faithful`,
+      // so loadAll's faithful pass can honor it even when an EARLIER non-faithful path
+      // (e.g. initMarketplace's required-plugin auto-install) produced this error stub
+      // and loadAll would otherwise skip it as "already loaded" (R51P1).
+      if (transientLoad) instance.transientLoadFailure = true;
+      if (transientLoad && faithful) this.lastDiscoveryIncomplete = true;
       if (browserRevocationFailure) throw browserRevocationFailure;
     }
   }
@@ -1274,11 +1825,24 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" is required and cannot be disabled`);
     }
 
+    // Refuse while the plugin owes un-reconciled post-update cleanup: disabling
+    // unloads its process, so the startup reconciler could no longer run its owed
+    // cleanup in-process (R6P1). Clears once reconciliation completes.
+    if (this.isUpdateDeferred(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
+
     // Serialize with marketplace install/update/uninstall for the same plugin so
     // two unload/load sequences can't interleave and leave duplicate side effects
     // or a transiently-missing instance.
-    await this.withInstallLock(pluginName, () =>
-      this.withRendererReplacementForUpdate(pluginName, async () => {
+    await this.withInstallLock(pluginName, () => {
+      // Re-check the freeze INSIDE the lock but BEFORE the renderer replacement: an
+      // app-update may have started while this op was queued (past its entry
+      // check). Checking here avoids a needless full renderer reload for a request
+      // that will bail anyway (R28P9); the reload happens inside
+      // withRendererReplacementForUpdate below.
+      this.assertNotFrozen(pluginName);
+      return this.withRendererReplacementForUpdate(pluginName, async () => {
         const existing = this.plugins.get(pluginName);
         if (!existing) {
           throw new Error(`Unknown plugin "${pluginName}"`);
@@ -1328,8 +1892,8 @@ export class PluginManager {
         this.notifyToolsChanged();
         this.notifyCliToolsChanged();
         console.info(`[PluginManager] Plugin "${pluginName}" disabled (persist=${opts.persist})`);
-      }),
-    );
+      });
+    });
   }
 
   /** Re-enable a previously disabled plugin and load it now. */
@@ -1350,8 +1914,24 @@ export class PluginManager {
       return;
     }
 
+    // Refuse only while an ACTIVE app-update FREEZE is in effect (R43P2) — enabling
+    // loads/activates the generation, which during the post-quitAndInstall window
+    // could introduce a plugin whose veto/post-update hook is absent from the
+    // committed ledger. But gate on the freeze ONLY, not the deferral: a plugin that
+    // was DISABLED while it still owed post-update cleanup returns as a disabled stub
+    // that startup can't run — enabling is the ONLY in-app path to load it and run
+    // that owed hook, so blocking on `isUpdateDeferred` (freeze OR deferred) would
+    // DEADLOCK exactly like the consent path did before R28P46: cleanup never runs,
+    // the deferral never clears, and the ledger discards the debt at the give-up cap
+    // (possibly leaving privileged setup active). Checked here (entry) and again
+    // inside the lock (queued op).
+    this.assertNoActiveFreeze(pluginName);
+
     // Serialize with marketplace lifecycle ops for the same plugin (see disablePlugin).
     await this.withInstallLock(pluginName, async () => {
+      // Re-check the freeze inside the lock: an app-update may have started while
+      // this enable was queued (R28P12).
+      this.assertNoActiveFreeze(pluginName);
       // Multiple enable requests can all observe the disabled stub while they
       // wait behind another lifecycle operation. Re-check after acquiring the
       // lock so a queued duplicate cannot unload the generation just activated
@@ -1395,6 +1975,22 @@ export class PluginManager {
       if (this.pendingConsentRollback.has(pluginName) && !this.pendingConsent.has(pluginName)) {
         const reloaded = this.plugins.get(pluginName);
         await this.resolvePendingConsentRollback(pluginName, reloaded?.state === 'active', reloaded?.error);
+      }
+
+      // If this plugin OWED un-reconciled post-update cleanup and just became ACTIVE
+      // via enable, startup reconciliation SKIPPED it (it was a disabled stub then).
+      // Run its owed cleanup NOW so it isn't stranded and the install block clears
+      // without another restart — same path as post-approval (R30P2/R43P2). Detached +
+      // idempotent + serial.
+      const enabledInstance = this.plugins.get(pluginName);
+      if (enabledInstance?.state === 'active' && this.ownsGenuineCleanupDebt(pluginName)) {
+        try {
+          void Promise.resolve(this.reconcileOwedForPlugin(pluginName)).catch((err) =>
+            console.error(`[plugins] post-enable owed-cleanup reconcile for "${pluginName}" failed:`, err),
+          );
+        } catch (err) {
+          console.error(`[plugins] post-enable owed-cleanup reconcile for "${pluginName}" threw:`, err);
+        }
       }
 
       if (rendererStale) {
@@ -1455,7 +2051,18 @@ export class PluginManager {
   }
 
   async pausePlugin(pluginName: string): Promise<void> {
+    // Refuse to pause while an app-update freeze is active or the plugin owes
+    // cleanup (R28P37): pausing rejects the plugin's pending AND future callbacks
+    // while leaving the instance 'active', so an in-flight pre/post-update hook's
+    // cleanup could fail WITHOUT the generation-freshness check noticing (it only
+    // watches unload/reload), leaving setup stranded and installs blocked for the
+    // launch even after Resume. Entry check + in-lock recheck, mirroring the other
+    // lifecycle ops. Resume stays available (it can only RE-enable a paused plugin).
+    if (this.isUpdateDeferred(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
     await this.withInstallLock(pluginName, async () => {
+      this.assertNotFrozen(pluginName);
       const instance = this.plugins.get(pluginName);
       const host = this.pluginProcesses.get(pluginName);
       if (!instance || instance.state !== 'active' || !host) {
@@ -1477,7 +2084,16 @@ export class PluginManager {
   }
 
   async killPlugin(pluginName: string): Promise<void> {
+    // Killing the process removes the in-process cleanup code the startup
+    // reconciler needs, so refuse while the plugin owes un-reconciled post-update
+    // cleanup (R6P1). Clears once reconciliation completes.
+    if (this.isUpdateDeferred(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
     await this.withInstallLock(pluginName, async () => {
+      // Re-check the freeze INSIDE the lock (R28P1): a queued kill must not tear
+      // down a participant's process after an app-update began.
+      this.assertNotFrozen(pluginName);
       const host = this.pluginProcesses.get(pluginName);
       if (!host) throw new Error(`Plugin "${pluginName}" has no running process`);
       await host.kill();
@@ -1797,32 +2413,622 @@ export class PluginManager {
 
   /* ── Lifecycle Hooks ── */
 
-  async runPreUpdateHooks(args: PreUpdateHookArgs): Promise<PreUpdateHookResult> {
-    for (const instance of this.plugins.values()) {
-      if (instance.state !== 'active') continue;
-      for (const hook of instance.preUpdateHooks) {
-        try {
-          const result = await hook(args);
-          if (result?.abort) return result;
-        } catch (err) {
-          console.error(`[PluginManager] Pre-update hook error in "${instance.manifest.name}":`, err);
-          return { abort: true, abortReason: `Hook "${instance.manifest.name}" threw: ${err}` };
+  /**
+   * Run EVERY active plugin's pre-update hooks and collapse the results.
+   *
+   * Correctness properties (see the R3/R4 reviews):
+   *  - A failure in one plugin's hook must NOT skip a later plugin's hooks — a
+   *    later plugin may hold a deliberate veto or required setup. So we run all
+   *    of them and aggregate, rather than returning at the first non-clean one.
+   *  - A deliberate `{ abort: true }` from ANY plugin is a hard block that wins
+   *    over any failure — "Proceed anyway" must never bypass a real veto.
+   *  - A *thrown* hook, or a returned `{ failed: true }` abort, is an overridable
+   *    failure. Correctness does not depend on a plugin setting `failed`: a throw
+   *    is classified as a failure regardless.
+   *  - A HANG is bounded PER HOOK (R4): a single hook that never settles is
+   *    recorded as an (overridable) failure and the loop moves on, so a hung hook
+   *    can't discard another hook's veto. An aggregate timeout in the caller
+   *    would have thrown away an already-recorded block and wrongly offered
+   *    "Proceed anyway".
+   */
+  async runPreUpdateHooks(args: Omit<PreUpdateHookArgs, 'signal'>): Promise<PreUpdateHooksOutcome> {
+    let block: { reason: string } | null = null; // first deliberate {abort:true}
+    let failure: { reason: string } | null = null; // first overridable failure
+
+    // Snapshot the PLAN up front: the active plugins and a COPY of each one's
+    // pre-update hook array. Iterating the live `instance.preUpdateHooks` while
+    // awaiting is unsafe — a hook that calls `registerPreUpdateHook` appends to
+    // that same array, so a self-registering hook would grow the loop forever and
+    // (with no outer timer) latch `installInProgress` permanently (R8P2). A
+    // snapshot bounds the loop to the hooks present when the attempt began.
+    const plan = [...this.plugins.values()]
+      .filter((instance) => instance.state === 'active')
+      .map((instance) => ({
+        instance,
+        preHooks: [...instance.preUpdateHooks],
+        // BASELINE post-hooks captured NOW, before any pre-hook awaits. A
+        // concurrent unload can clear `instance.postUpdateHooks` in the gap
+        // between a pre-hook resolving and our after-the-fact snapshot; without a
+        // baseline the participant capture would see [] → rollback falsely
+        // "succeeds" → no cleanup-debt marker → privileged setup left active
+        // (R30P2). We union this baseline with whatever exists after the pre-hooks
+        // (to also include hooks registered DURING setup, R8P2).
+        baselinePostHooks: [...instance.postUpdateHooks],
+      }));
+
+    // Per participating plugin: a SNAPSHOT of its post-update hooks (copied) plus
+    // its name — NOT the mutable PluginInstance. Rolling back by name would
+    // re-enumerate `this.plugins`, and holding the instance is no better: the
+    // unload/disable/crash paths MUTATE the same instance (`postUpdateHooks = []`)
+    // during the up-to-5m window, so a captured reference would yield empty hooks
+    // (R7P2/R8P1). We snapshot AFTER a plugin's pre-hooks run so post-hooks it
+    // registers during setup are included in its rollback (R8P2). Deduped by
+    // instance identity.
+    const participants: Array<{ name: string; postHooks: PostUpdateHook[]; instance: PluginInstance }> = [];
+    const seen = new Set<PluginInstance>();
+    // Identity of the active plugin generation the plan was built from. If this
+    // set changes during the (up to 5m) hook window — a plugin enabled/disabled,
+    // or replaced by a marketplace update — the plan is stale: a NEW generation's
+    // veto/elevation hook was never evaluated. `stillCurrent` skips replaced
+    // entries but can't run a replacement that isn't in the plan, so we fail
+    // closed rather than install past an un-run hook (R11P1).
+    const planInstances = new Set(plan.map((p) => p.instance));
+    // Snapshot each plan instance's pre-update-hook COUNT. A plugin can call
+    // registerPreUpdateHook DURING our await window (a hook registered by another
+    // of its hooks, or by async plugin code), appending to the LIVE
+    // `instance.preUpdateHooks` array — which our per-plugin `preHooks` SNAPSHOT
+    // does NOT include. That late hook could hold a deliberate veto we'd never
+    // evaluate. `stillFresh` compares these counts and fails closed if any grew, so
+    // the point-of-no-return check refuses to install past an un-run pre-hook
+    // (R28P24). The user retries; the next attempt's plan includes the new hook.
+    const planPreHookCounts = new Map(plan.map((p) => [p.instance, p.instance.preUpdateHooks.length] as const));
+
+    // A plan entry is safe to invoke only while its captured instance is STILL
+    // the current, active, non-tearing-down registration for its name. Checked
+    // before EVERY hook (not once per plugin): a plugin can unload/reload while
+    // its own first hook awaits, and its later snapshotted hooks must then be
+    // skipped rather than run against a stale/torn-down generation (R10P2).
+    const stillCurrent = (instance: PluginInstance): boolean =>
+      this.plugins.get(instance.manifest.name) === instance && instance.state === 'active' && !instance.tearingDown;
+
+    // Controllers for hooks that COMPLETED cleanly (their signal wasn't already
+    // aborted on timeout/throw). The API promises `signal` fires when the update
+    // is otherwise cancelled, so on any non-proceed outcome we abort these too —
+    // an earlier successful hook may have started signal-observing work that must
+    // stop when a later hook blocks or the user cancels (R12P1).
+    const liveControllers: AbortController[] = [];
+    // Names of plugins whose pre-update hook TIMED OUT: the hook is still running
+    // (abort is advisory — a trusted hook may ignore it) and could perform
+    // privileged setup AFTER the timeout. rollback() reports these as `failed` so
+    // the caller keeps their cleanup owed even on a "clean" cancel, rather than
+    // clearing debt for setup that may still be applied (R6P1).
+    const timedOutPlugins = new Set<string>();
+    // Plugins whose pre-update hook FAILED (threw or returned `failed:true`) after
+    // possibly performing partial privileged setup. Even if such a plugin never
+    // registered a post-update hook, its cleanup debt MUST be retained: it may have
+    // elevated/staged something before failing (R28P18). Rollback forces these into
+    // its `failed` set so the ledger keeps owing them (a hookless success would
+    // otherwise erase the debt). Timed-out plugins are tracked separately above.
+    const failedParticipants = new Set<string>();
+    // Set when a plugin's remaining hooks were SKIPPED after one of its hooks
+    // failed. We can't know whether a skipped hook held a deliberate veto, so we
+    // must fail closed rather than let the failure be overridable (R12P1 —
+    // resolves the R11 break-vs-veto tension conservatively).
+    let skippedAfterFailure = false;
+
+    scan: for (const { instance, preHooks, baselinePostHooks } of plan) {
+      if (!stillCurrent(instance)) continue;
+      let participated = false;
+      // Cumulatively capture post-hooks this plugin has registered, snapshotting
+      // the live array RIGHT AFTER each pre-hook resolves. Reading only the final
+      // live array (as the end-of-plugin snapshot does) can LOSE a post-hook that
+      // an early pre-hook registered if a later pre-hook's await lets a concurrent
+      // unload clear `instance.postUpdateHooks` before we snapshot (R35P1). By
+      // merging synchronously after each hook — with no await between the hook
+      // returning and this capture — a registration is recorded before any unload
+      // can run. Seeded with the plan-time baseline (R30P2).
+      const capturedPostHooks: PostUpdateHook[] = [...baselinePostHooks];
+      const mergePostHooks = (from: readonly PostUpdateHook[]) => {
+        for (const h of from) if (!capturedPostHooks.includes(h)) capturedPostHooks.push(h);
+      };
+      for (let hookIndex = 0; hookIndex < preHooks.length; hookIndex++) {
+        const hook = preHooks[hookIndex];
+        if (!stillCurrent(instance)) break; // reloaded/torn down mid-plugin → stop invoking its stale hooks
+        participated = true;
+        // Hold the LIVE post-hook array object BEFORE invoking the hook. Plugins
+        // register via `instance.postUpdateHooks.push(hook)` (mutates this object),
+        // while unload/disable/crash REASSIGNS `instance.postUpdateHooks = []` (a
+        // new object). Reading from this held reference after the hook resolves
+        // therefore still sees a cleanup the hook registered even if a concurrent
+        // unload swapped the instance's array out mid-hook (R35P1) — the very race
+        // that reading `instance.postUpdateHooks` post-await would lose.
+        const liveArrayBeforeHook = instance.postUpdateHooks;
+        // Per-hook AbortController: aborted on timeout so a well-behaved hook can
+        // stop privileged/long-running work instead of being silently abandoned.
+        // Propagates to utility-process plugins via the wire transport's native
+        // AbortSignal marshalling.
+        const controller = new AbortController();
+        const hookArgs: PreUpdateHookArgs = { ...args, signal: controller.signal };
+        const outcome = await PluginManager.runHookWithTimeout(() => hook(hookArgs));
+        const hadMoreHooks = hookIndex < preHooks.length - 1;
+        // Capture any post-hook this hook registered BEFORE branching on the
+        // outcome: a supported hook can register its cleanup then throw or hang
+        // (timeout). Doing this only on the clean-pass branch would lose that
+        // cleanup from the rollback snapshot, so rollback would falsely "succeed"
+        // and leave privileged setup active (R35P1). Merge from BOTH the array we
+        // held before the hook (survives a concurrent-unload reassignment) and the
+        // instance's current array (in case it wasn't reassigned) — a hook's
+        // registration is captured whether or not an unload swapped the array.
+        mergePostHooks(liveArrayBeforeHook);
+        mergePostHooks(instance.postUpdateHooks);
+
+        if (outcome.kind === 'timeout') {
+          const minutes = Math.round(PluginManager.PRE_UPDATE_HOOK_TIMEOUT_MS / 60000);
+          console.error(
+            `[PluginManager] Pre-update hook in "${instance.manifest.name}" timed out after ${minutes}m — aborting it and treating as failure.`,
+          );
+          // Signal the hook to stop, then move on. A hook that ignores the signal
+          // is a plugin bug (plugins are trusted), but aborting bounds the damage
+          // and prevents overlapping work on retry.
+          controller.abort(new DOMException('Pre-update hook timed out', 'TimeoutError'));
+          // A hook may register its cleanup from an abort listener (fires
+          // synchronously on .abort()) rather than before returning. Re-merge
+          // AFTER the abort so that late registration is still captured for
+          // rollback (R35P1) — otherwise a timed-out hook's cleanup is lost.
+          mergePostHooks(liveArrayBeforeHook);
+          mergePostHooks(instance.postUpdateHooks);
+          // The hook is still running (abort is advisory) — it may still perform
+          // privileged setup. Mark it so rollback reports it as `failed` and its
+          // cleanup debt is retained even on a clean cancel (R6P1).
+          timedOutPlugins.add(instance.manifest.name);
+          failure ??= {
+            reason: `Hook "${instance.manifest.name}" timed out after ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+          };
+          if (hadMoreHooks) skippedAfterFailure = true; // a skipped later hook could hold a veto
+          break; // stop THIS plugin's remaining hooks (they may depend on the failed one); other plugins still run
+        }
+        if (outcome.kind === 'threw') {
+          // safeErrorText never throws (a plugin can throw an object whose
+          // toString throws) — a bare `${err}` here could escape.
+          console.error(`[PluginManager] Pre-update hook error in "${instance.manifest.name}":`, outcome.error);
+          // Abort the signal (symmetric with the timeout branch): a hook can
+          // reject while leaving async work in flight, and for utility plugins the
+          // abort must fire before the remote controller is released on settle.
+          controller.abort(new DOMException('Pre-update hook failed', 'AbortError'));
+          // Re-merge after abort for the same reason as the timeout branch: an
+          // abort-listener cleanup registration must still be captured (R35P1).
+          mergePostHooks(liveArrayBeforeHook);
+          mergePostHooks(instance.postUpdateHooks);
+          failure ??= { reason: `Hook "${instance.manifest.name}" failed: ${safeErrorText(outcome.error)}` };
+          failedParticipants.add(instance.manifest.name); // retain debt even if hookless (R28P18)
+          if (hadMoreHooks) skippedAfterFailure = true; // a skipped later hook could hold a veto
+          break; // stop THIS plugin's remaining hooks; other plugins still run for veto aggregation
+        }
+
+        // Hook completed: keep its controller so we can abort it if the overall
+        // attempt is later cancelled/blocked.
+        liveControllers.push(controller);
+
+        const result = outcome.value;
+        if (!result?.abort && !result?.failed) continue; // clean pass
+        const reason = result.abortReason ?? `Plugin "${instance.manifest.name}" blocked the update`;
+        if (result.failed) {
+          // Operational failure the plugin opted into as overridable. NOTE: a
+          // plugin that catches its own operational error and returns a bare
+          // `{ abort: true }` (no `failed`) is classified as a deliberate block
+          // below — it MUST set `failed: true` to be overridable. (See the
+          // PreUpdateHookResult docs; the Privileges elevation hook needs this.)
+          //
+          // Treat this exactly like a thrown/timed-out failure (R12P2): stop this
+          // plugin's remaining hooks, and if any were skipped, a later one could
+          // hold a veto → fail closed. Otherwise a returned `{ failed: true }`
+          // would let later same-plugin hooks run and stay overridable.
+          failure ??= { reason };
+          failedParticipants.add(instance.manifest.name); // retain debt even if hookless (R28P18)
+          if (hadMoreHooks) skippedAfterFailure = true;
+          break;
+        } else {
+          // Deliberate policy block — highest precedence and terminal: nothing a
+          // later hook returns can change the outcome, and running more hooks
+          // would only run needless side-effecting setup (that we'd then have to
+          // roll back) and could add another per-hook timeout of delay. Stop now.
+          block = { reason };
+          // Capture this plugin's post-hooks before stopping — its (partial)
+          // setup still needs rollback.
+          if (participated && !seen.has(instance)) {
+            seen.add(instance);
+            participants.push({ name: instance.manifest.name, postHooks: [...capturedPostHooks], instance });
+          }
+          break scan;
+        }
+      }
+      // Record this plugin's participation using the CUMULATIVE post-hook capture
+      // (baseline ∪ everything registered synchronously after each pre-hook), so a
+      // hook registered early then hidden by a later-await unload is still rolled
+      // back (R35P1). A final merge picks up anything the last completed hook added.
+      if (participated && !seen.has(instance)) {
+        seen.add(instance);
+        mergePostHooks(instance.postUpdateHooks);
+        participants.push({ name: instance.manifest.name, postHooks: [...capturedPostHooks], instance });
+      }
+    }
+
+    // Build the rollback thunk over the SNAPSHOT of participating plugins'
+    // post-update hooks, so neither a re-enumeration nor a concurrent reload (which
+    // would clear the live instance's hooks) can misdirect or empty it. It also
+    // aborts the signals of hooks that are STILL RUNNING (or in-process) — the
+    // non-proceed paths run rollback (R12P1). A returned out-of-process hook's
+    // signal is already released by the transport, so its abort is a no-op there
+    // (that returned-hook case is the documented best-effort limit).
+    const captured = participants.slice();
+    // Abort still-live hook signals, on the CANCEL/BLOCK paths only. This lets a
+    // running (or in-process) hook observe `abort` and revoke its setup. On the
+    // COMMIT path we do NOT touch these signals: `quitAndInstall` terminates every
+    // plugin process (freeing child controllers via exit), and aborting on a
+    // successful install would wrongly trigger a hook's revoke-on-cancel (R15P1).
+    const abortLiveHooks = () => {
+      for (const c of liveControllers) {
+        if (!c.signal.aborted) c.abort(new DOMException('Update attempt cancelled', 'AbortError'));
+      }
+    };
+    const rollback = async (opts?: {
+      onPluginDone?: (name: string) => void | Promise<void>;
+    }): Promise<{ failed: string[] }> => {
+      abortLiveHooks();
+      const failed: string[] = [];
+      for (const p of captured) {
+        // Attempt EVERY participant's cleanup even if an earlier one failed, and
+        // report which plugins' cleanup did NOT complete. The caller marks the
+        // SUCCEEDED participants done in the ledger and re-owes only the failed
+        // ones — so a successfully-cleaned plugin's (possibly non-idempotent)
+        // hook is never rerun on the next launch (R35P1, per-plugin guarantee).
+        // Previously this threw all-or-nothing, which re-owed even the plugins
+        // that cleaned up fine (R29P2 kept the coarse marker; the ledger refines
+        // it to per-plugin). `onPluginDone` fires after EACH success so the caller
+        // can persist completion incrementally — a crash mid-batch then can't
+        // re-run an already-cleaned plugin.
+        // A TIMED-OUT plugin: we STILL attempt its captured cleanup here (it may
+        // have registered a post-hook / applied setup before timing out, so the
+        // cleanup must at least run — skipping it entirely would leave elevation
+        // active, R28P7). But its pre-update hook may STILL be running and apply
+        // further privileged setup after this rollback, so we RETAIN it as failed
+        // regardless of the cleanup's outcome, and NEVER call onPluginDone for it —
+        // checkpointing it done would let the committed-install teardown clear its
+        // ledger debt before we re-add it to `failed` (R6P2). So: run the cleanup,
+        // ignore its result for the done/failed decision when timed out.
+        // A TIMED-OUT plugin OR one whose pre-hook FAILED (threw / returned
+        // failed:true) is RETAINED as failed regardless of the cleanup's outcome
+        // (R28P7/R28P18): its pre-hook may have applied partial privileged setup —
+        // possibly WITHOUT registering a post-hook — so its debt must survive even a
+        // trivially-"successful" empty cleanup. We still ATTEMPT the cleanup, and
+        // NEVER call onPluginDone for it (checkpointing done would let a teardown
+        // clear its debt before we re-add it to `failed`, R6P2).
+        // Re-merge the participant's CURRENT live post-hooks with its snapshot
+        // (R28P30): a plugin can register a post-update hook AFTER its own pre-hook
+        // returned — e.g. asynchronously while a LATER plugin's pre-hook/dialog is
+        // still awaiting — which the participant snapshot taken at that time missed.
+        // Only merge when the live instance is STILL the SAME, ACTIVE generation we
+        // captured. Identity alone is NOT enough (R28P33): a crash/teardown can keep
+        // the same instance object but flip it to state 'error'/tearingDown and CLEAR
+        // its postUpdateHooks — so re-reading would see an empty list, run "nothing"
+        // successfully, and clear the debt for cleanup that never ran. If the
+        // instance is no longer active/non-tearing-down, we CANNOT trust its live
+        // hooks: fall back to the SNAPSHOT and RETAIN the participant as failed so
+        // its debt survives (a late registration we didn't snapshot may be lost, but
+        // retaining is safe — the next launch reconciles).
+        const live = this.plugins.get(p.name);
+        const sameLiveGeneration = live === p.instance && live.state === 'active' && !live.tearingDown;
+        const effectivePostHooks = [...p.postHooks];
+        if (sameLiveGeneration) {
+          for (const h of p.instance.postUpdateHooks) {
+            if (!effectivePostHooks.includes(h)) effectivePostHooks.push(h);
+          }
+        }
+        // A participant whose captured instance is no longer the live active
+        // generation is retained as failed: we can't be sure we ran its complete,
+        // possibly-late-registered cleanup (R28P33).
+        const staleGeneration = live !== p.instance || live.state !== 'active' || live.tearingDown;
+        const retainAnyway = timedOutPlugins.has(p.name) || failedParticipants.has(p.name) || staleGeneration;
+        const cleanupOk = await this.runPostHooks(p.name, effectivePostHooks, {
+          version: args.version,
+          success: false,
+        });
+        const ok = !retainAnyway && cleanupOk;
+        if (ok) {
+          if (opts?.onPluginDone) {
+            try {
+              await opts.onPluginDone(p.name);
+            } catch (e) {
+              console.error(`[PluginManager] rollback onPluginDone("${p.name}") threw:`, e);
+            }
+          }
+        } else {
+          failed.push(p.name);
+        }
+      }
+      // Also report any timed-out OR failed plugin that never became a participant
+      // (deduped against the loop above), so it is owed even if it isn't in
+      // `captured` (a pre-hook that failed before registering anything, R28P18).
+      for (const name of timedOutPlugins) if (!failed.includes(name)) failed.push(name);
+      for (const name of failedParticipants) if (!failed.includes(name)) failed.push(name);
+      return { failed };
+    };
+    // Names of plugins whose pre-update hooks participated. The committed-failure
+    // teardown notifies participants via `rollback()` (snapshot-based) and then
+    // notifies the REMAINING active plugins (post-only) by excluding these — so no
+    // plugin's post-update hook is invoked twice (R33P1).
+    const participantNames = captured.map((p) => p.name);
+    // Subset of participants that actually CAPTURED at least one post-update hook.
+    // The updater records these (∪ post-only) as `owed` — a participant with NO
+    // post hook has no cleanup and must NOT be owed, or reconciliation (which
+    // refuses to clear a hookless plugin) would keep the attempt forever (R35P1).
+    // Sourced from the capture (not the live array) so a hook registered during a
+    // pre-hook then hidden by a concurrent unload is still counted.
+    const postHookParticipantNames = captured.filter((p) => p.postHooks.length > 0).map((p) => p.name);
+
+    // True while the active plugin generation still matches the plan. The caller
+    // rechecks this right before installing, because the override dialog can be
+    // open long enough for a plugin to activate after our own check (R12P1).
+    // A plugin in the `loading` state counts as a generation change too (R17P1):
+    // it's mid-activation and about to register a pre-update hook we never
+    // evaluated, so proceeding would skip its potential veto/setup. Any loading
+    // plugin (whether or not it was in the plan) makes the outcome non-fresh.
+    const activeSetMatchesPlan = (): boolean => {
+      const anyLoading = [...this.plugins.values()].some((i) => i.state === 'loading' && !i.tearingDown);
+      if (anyLoading) return false;
+      const active = [...this.plugins.values()].filter((i) => i.state === 'active' && !i.tearingDown);
+      if (active.length !== planInstances.size || !active.every((i) => planInstances.has(i))) return false;
+      // Also fail closed if any plan instance registered a NEW pre-update hook
+      // during the update window (its live count exceeds the snapshot) — that hook
+      // was never evaluated and could veto (R28P24).
+      for (const [inst, count] of planPreHookCounts) {
+        if (inst.preUpdateHooks.length !== count) return false;
+      }
+      return true;
+    };
+    const stillFresh = activeSetMatchesPlan;
+    // Fields common to every outcome — avoids drift across the return sites.
+    const common = {
+      rollback,
+      stillFresh,
+      participantNames,
+      postHookParticipantNames,
+      timedOutParticipantNames: [...timedOutPlugins],
+      // Plugins whose pre-hook FAILED (threw/failed:true): owed at commit even if
+      // hookless, because they may have applied partial setup (R28P18).
+      failedParticipantNames: [...failedParticipants],
+    };
+
+    // Precedence: a deliberate block wins (already terminal above). Next, fail
+    // closed if the active plugin generation changed since we snapshotted the
+    // plan — a newly-active instance may hold an un-evaluated veto/setup hook, so
+    // installing could skip it. This MUST outrank `overridable`: otherwise a hook
+    // failure plus a plugin swap would let the user "Proceed anyway" past the
+    // un-evaluated generation (R11P2). Not overridable; the user simply retries
+    // and the next attempt builds a fresh plan.
+    if (block) return { decision: 'blocked', reason: block.reason, ...common };
+
+    if (!activeSetMatchesPlan()) {
+      console.warn('[PluginManager] Active plugin set changed during pre-update hooks — failing closed.');
+      return {
+        decision: 'blocked',
+        reason: 'The set of installed plugins changed during the update check. Please try installing again.',
+        ...common,
+      };
+    }
+
+    // A plugin's later hooks were skipped after one of its hooks failed. A skipped
+    // hook could have held a deliberate veto, so the failure must NOT be
+    // overridable — fail closed (R12P1). (When nothing was skipped, a failure is
+    // the plugin's own overridable operational error.)
+    if (skippedAfterFailure && failure) {
+      return {
+        decision: 'blocked',
+        reason: `${failure.reason} Some update checks could not complete, so the update was paused for safety.`,
+        ...common,
+      };
+    }
+
+    if (failure) return { decision: 'overridable', reason: failure.reason, ...common };
+    return { decision: 'proceed', ...common };
+  }
+
+  /**
+   * Names of every currently-active plugin that has at least one post-update
+   * hook — i.e. everyone owed a post-update notification after an install. The
+   * updater records this set (unioned with pre-update participants) as an
+   * attempt's `owed` at commit time, so BOTH participants AND post-only plugins
+   * (those that registered only `registerPostUpdateHook`) are reconciled after a
+   * successful update (R35P1 — otherwise post-only plugins would silently never
+   * be notified, regressing the prior all-active behaviour).
+   */
+  getPostUpdatePluginNames(): string[] {
+    return [...this.plugins.values()]
+      .filter((instance) => instance.state === 'active' && instance.postUpdateHooks.length > 0)
+      .map((instance) => instance.manifest.name);
+  }
+
+  /**
+   * Names of active plugins that have a pre-update hook — i.e. every plugin that
+   * COULD perform privileged setup during the update. The updater records these
+   * as a PROVISIONAL owed set BEFORE running any pre-update hook, so a crash
+   * between "hook granted admin" and the commit still leaves a ledger entry to run
+   * the revoke next launch (R5P2/R6P1). Deliberately keyed on the PRE-update hook,
+   * not on already having a post-update hook: a hook commonly registers its
+   * cleanup DURING its pre-update run, so requiring a post-hook at snapshot time
+   * would miss exactly the plugin that just elevated. Refined to the true owed set
+   * at commit; reconciled to the failed set on cancel.
+   */
+  getSetupCapablePluginNames(): string[] {
+    return [...this.plugins.values()]
+      .filter((instance) => instance.state === 'active' && instance.preUpdateHooks.length > 0)
+      .map((instance) => instance.manifest.name);
+  }
+
+  /**
+   * Run post-update hooks for all currently-active plugins. Used AFTER a real
+   * relaunch (success may be true or false) where re-enumeration is correct — by
+   * then the surviving plugin set is exactly who should see the result. For
+   * rollback of an in-flight cancelled attempt use the pre-hook result's
+   * `rollback` thunk instead (it targets the exact participating generation via a
+   * hook snapshot taken before any reload could clear them).
+   */
+  async runPostUpdateHooks(
+    args: Omit<PostUpdateHookArgs, 'signal'>,
+    opts?: {
+      excludeNames?: readonly string[];
+      onlyNames?: readonly string[];
+      /** Invoked after EACH plugin whose hook succeeds, before the next runs, so a
+       *  caller can persist per-plugin completion incrementally — if the process
+       *  crashes mid-batch, the plugins already done aren't re-run next launch
+       *  (R35P1). Awaited; a throw is swallowed (logged) so one plugin's bookkeeping
+       *  failure can't abort the rest of the batch. */
+      onPluginDone?: (name: string) => void | Promise<void>;
+    },
+  ): Promise<{ allSucceeded: boolean; succeededNames: string[]; attemptedNames: string[] }> {
+    // Snapshot the plan up front (active plugins + a COPY of each post-hook
+    // array), same rationale as runPreUpdateHooks: iterating the live map/arrays
+    // across awaits lets a self-registering post-hook grow the loop indefinitely
+    // and a mid-run reload introduce a new generation (R9P2). Returns whether ALL
+    // hooks succeeded, the exact set of plugins whose cleanup COMPLETED, and the
+    // set that was ATTEMPTED — so a caller (the failed-install teardown / startup
+    // reconciler) can clear per-plugin owed state AND record newly-discovered
+    // owed plugins (post-only ones whose notify failed) in the ledger, retrying
+    // only the ones that did NOT finish (R35P1). `excludeNames` skips plugins
+    // already notified elsewhere (the committed-failure teardown notifies
+    // participants via the rollback thunk, then calls this with participants
+    // excluded so no plugin is notified twice — R33P1). `onlyNames` restricts the
+    // run to a specific set — the startup reconciler passes exactly the plugins a
+    // ledger attempt still owes, so no unrelated active plugin is notified for an
+    // attempt it never participated in (R35P1). `onPluginDone` fires per-plugin so
+    // the reconciler can persist completion incrementally (crash-safety).
+    const exclude = opts?.excludeNames ? new Set(opts.excludeNames) : null;
+    const only = opts?.onlyNames ? new Set(opts.onlyNames) : null;
+    const plan = [...this.plugins.values()]
+      .filter(
+        (instance) =>
+          instance.state === 'active' &&
+          // A plugin with NO post-update hook has no cleanup to run; it must NOT be
+          // counted as "done" for an owed attempt (doing so would clear the debt
+          // without any cleanup actually running, permanently stranding privileged
+          // pre-update setup if the plugin simply hasn't re-registered its hook yet
+          // this launch). Excluding it here keeps it owed for a future launch when
+          // its hook is present (R35P1).
+          instance.postUpdateHooks.length > 0 &&
+          !(exclude && exclude.has(instance.manifest.name)) &&
+          !(only && !only.has(instance.manifest.name)),
+      )
+      .map((instance) => ({ name: instance.manifest.name, postHooks: [...instance.postUpdateHooks] }));
+    let allSucceeded = true;
+    const succeededNames: string[] = [];
+    const attemptedNames = plan.map((p) => p.name);
+    for (const { name, postHooks } of plan) {
+      if (await this.runPostHooks(name, postHooks, args)) {
+        succeededNames.push(name);
+        if (opts?.onPluginDone) {
+          try {
+            await opts.onPluginDone(name);
+          } catch (e) {
+            console.error(`[PluginManager] onPluginDone("${name}") threw:`, e);
+          }
+        }
+      } else {
+        allSucceeded = false;
+      }
+    }
+    // Any plugin the caller explicitly OWED (`onlyNames`) that we could NOT attempt
+    // — missing, inactive, or hookless this launch — must count as NOT succeeded
+    // (R28P8). It stays owed on the ledger; if `allSucceeded` stayed true the
+    // startup reconciler would neither clear it (no cleanup ran) NOR bump the retry
+    // cap, leaving the attempt owed forever and BLOCKING all future app-update
+    // installs indefinitely. Reporting incomplete lets the caller spend a retry so
+    // the give-up cap is eventually reached.
+    if (only) {
+      const attemptedSet = new Set(attemptedNames);
+      for (const owedName of only) {
+        if (!attemptedSet.has(owedName)) {
+          allSucceeded = false;
+          break;
         }
       }
     }
-    return {};
+    return { allSucceeded, succeededNames, attemptedNames };
   }
 
-  async runPostUpdateHooks(args: PostUpdateHookArgs): Promise<void> {
-    for (const instance of this.plugins.values()) {
-      if (instance.state !== 'active') continue;
-      for (const hook of instance.postUpdateHooks) {
-        try {
-          await hook(args);
-        } catch (err) {
-          console.error(`[PluginManager] Post-update hook error in "${instance.manifest.name}":`, err);
+  /**
+   * Invoke a set of post-update hooks, each time-bounded + abortable. Attempts
+   * ALL hooks (a failing one doesn't skip the rest), then reports whether they
+   * all succeeded. Callers that gate recovery state on cleanup completion (the
+   * updater keeps its recovery marker unless cleanup fully succeeded, R29P2) need
+   * this signal — swallowing failures silently would make failed privilege
+   * cleanup look done and never be retried. A "process gone" skip counts as NOT
+   * succeeded (cleanup genuinely didn't run).
+   */
+  private async runPostHooks(
+    pluginName: string,
+    hooks: readonly PostUpdateHook[],
+    args: Omit<PostUpdateHookArgs, 'signal'>,
+  ): Promise<boolean> {
+    let allSucceeded = true;
+    for (const hook of hooks) {
+      // Bound each post-update (rollback / cleanup) hook the same way as
+      // pre-update hooks, and give it an AbortSignal so a timed-out cleanup can
+      // stop rather than overlap a later retry's setup. A timed-out or throwing
+      // hook is logged and does NOT abort the remaining hooks, but is reported.
+      const controller = new AbortController();
+      const hookArgs: PostUpdateHookArgs = { ...args, signal: controller.signal };
+      const outcome = await PluginManager.runHookWithTimeout(() => hook(hookArgs));
+      if (outcome.kind === 'timeout') {
+        controller.abort(new DOMException('Post-update hook timed out', 'TimeoutError'));
+        console.error(
+          `[PluginManager] Post-update hook in "${pluginName}" timed out — aborting it and skipping (best-effort).`,
+        );
+        allSucceeded = false;
+      } else if (outcome.kind === 'threw') {
+        // A dead/torn-down utility process rejects callback invocations (e.g.
+        // "Plugin process is not running/paused"). If the plugin was unloaded
+        // between its pre-update setup and this rollback, its cleanup code no
+        // longer exists to run — an inherent limit of in-process rollback. Emit a
+        // clear, distinct warning rather than an opaque error so this case is
+        // diagnosable; the plugin's own next-launch post-update reconciliation is
+        // the backstop.
+        const msg = safeErrorText(outcome.error);
+        if (/plugin process is (?:not running|paused|disposed)/i.test(msg)) {
+          console.warn(
+            `[PluginManager] Post-update hook for "${pluginName}" skipped — its plugin process is gone (unloaded/reloaded mid-update); cleanup could not run in-process.`,
+          );
+        } else {
+          console.error(`[PluginManager] Post-update hook error in "${pluginName}":`, outcome.error);
         }
+        allSucceeded = false;
       }
+    }
+    return allSucceeded;
+  }
+
+  /**
+   * Race a single hook invocation against the per-hook timeout. Never throws:
+   * returns a discriminated outcome so callers apply their own policy. On
+   * timeout the passed AbortController (if any) is the caller's to abort — this
+   * helper only bounds the wait, it does not own cancellation.
+   */
+  private static async runHookWithTimeout<T>(
+    invoke: () => T | Promise<T>,
+  ): Promise<{ kind: 'value'; value: T } | { kind: 'timeout' } | { kind: 'threw'; error: unknown }> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const TIMED_OUT = Symbol('hook-timeout');
+    try {
+      const raced = await Promise.race([
+        Promise.resolve(invoke()),
+        new Promise<typeof TIMED_OUT>((resolve) => {
+          timer = setTimeout(() => resolve(TIMED_OUT), PluginManager.PRE_UPDATE_HOOK_TIMEOUT_MS);
+        }),
+      ]);
+      return raced === TIMED_OUT ? { kind: 'timeout' } : { kind: 'value', value: raced as T };
+    } catch (error) {
+      return { kind: 'threw', error };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -2114,13 +3320,21 @@ export class PluginManager {
 
   /* ── Marketplace ── */
 
-  async initMarketplace(marketplaceUrls: string[]): Promise<void> {
+  /** Result of marketplace startup init. `marketplaceBootstrapIncomplete` is true when
+   *  a configured catalog was UNREACHABLE (fetch failed, no usable cache) AND a
+   *  brand-REQUIRED plugin is consequently not installed/active — so its pre-update
+   *  veto would be absent. The caller must then block app installs for the session
+   *  (mirrors bundledBootstrapIncomplete), else an update could bypass that required
+   *  plugin's hook (R52P1). A reachable catalog, or a required plugin that IS present,
+   *  is not incomplete. */
+  async initMarketplace(marketplaceUrls: string[]): Promise<{ marketplaceBootstrapIncomplete: boolean }> {
+    let marketplaceBootstrapIncomplete = false;
     try {
       if (marketplaceUrls.length === 0) {
         // Nothing to fetch — there is no configured marketplace. init is
         // still "done" so the renderer stops waiting and shows the (correct)
         // unconfigured empty state rather than a perpetual spinner.
-        return;
+        return { marketplaceBootstrapIncomplete: false };
       }
 
       this.marketplaceService = new MarketplaceService(
@@ -2131,6 +3345,7 @@ export class PluginManager {
         this.brandRequiredPluginNamesSet,
       );
 
+      let fetchFailed = false;
       try {
         // Full refresh (fetch + required-plugin auto-install) under the
         // single-flight guard so a concurrent renderer/periodic refresh joins
@@ -2139,7 +3354,33 @@ export class PluginManager {
         console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
       } catch (err) {
         console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
+        fetchFailed = true;
       }
+
+      // If the catalog was UNREACHABLE and a brand-required plugin is therefore not
+      // present/active on disk, the required-plugin auto-install couldn't run — its
+      // pre-update veto would be missing at an app update. Flag incomplete so the
+      // caller blocks installs (R52P1). If the required plugin IS present (installed
+      // earlier / from cache), a failed fetch is harmless. Checked against the
+      // just-refreshed on-disk set via discovery.
+      if (fetchFailed && this.brandRequiredPluginNames.length > 0) {
+        const present = new Set(this.discoverPlugins().map((d) => d.manifest.name));
+        for (const required of this.brandRequiredPluginNames) {
+          if (!present.has(required)) {
+            marketplaceBootstrapIncomplete = true;
+            console.warn(
+              `[Marketplace] Required plugin "${required}" is not installed and the catalog was unreachable — blocking installs so an update can't bypass its pre-update veto.`,
+            );
+            break;
+          }
+        }
+      }
+      return { marketplaceBootstrapIncomplete };
+    } catch (err) {
+      // An UNEXPECTED throw out of init leaves the required-plugin set unconfirmed →
+      // block installs conservatively (R52P1).
+      console.error('[Marketplace] initMarketplace threw unexpectedly — blocking installs conservatively:', err);
+      return { marketplaceBootstrapIncomplete: true };
     } finally {
       // Always signal renderers that startup init has settled — even on an
       // unexpected throw — so a marketplace view opened mid-init can reload
@@ -2180,12 +3421,36 @@ export class PluginManager {
       if (!service) return [];
       const catalog = await service.fetchCatalog(urls);
       if (this.brandRequiredPluginNames.length > 0) {
-        const updated = await service.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
-          serialize: (name, fn) => this.withInstallLock(name, () => this.withRendererReplacementForUpdate(name, fn)),
-          afterInstall: async (name, result) => {
-            await this.swapToInstalledPlugin(name, result.version, result);
-          },
-        });
+        // Skip auto-updating any required plugin that is DEFERRED because it owes
+        // post-update cleanup not yet reconciled — replacing its generation now
+        // could strand or misdirect that cleanup (R35P1). It auto-updates on a
+        // later refresh once reconciliation clears the deferral. When the owed set
+        // is UNKNOWN (legacy marker = "all active", or a corrupt ledger),
+        // `deferAllUpdates` holds EVERY required-plugin update until reconcile.
+        const eligible = this.deferAllUpdates
+          ? new Set<string>()
+          : new Set([...this.brandRequiredPluginNamesSet].filter((n) => !this.deferredUpdateNames.has(n)));
+        const updated =
+          eligible.size > 0
+            ? await service.autoInstallRequired(eligible, catalog, {
+                serialize: <T>(name: string, fn: () => Promise<T>): Promise<T> =>
+                  this.withInstallLock(name, async (): Promise<T> => {
+                    // RE-CHECK the deferral INSIDE the lock but BEFORE any renderer
+                    // replacement (R9P1): `eligible` was computed before the lock; a
+                    // rollback's `deferUpdates` could have deferred this plugin while
+                    // we were queued. Skip cleanly if so — the install closure's
+                    // result is only pushed to `installed`, which we then omit.
+                    if (this.isUpdateDeferred(name)) {
+                      console.info(`[PluginManager] Skipping auto-update of "${name}" — deferred mid-refresh (R9P1).`);
+                      return undefined as T;
+                    }
+                    return this.withRendererReplacementForUpdate(name, fn);
+                  }),
+                afterInstall: async (name, result) => {
+                  await this.swapToInstalledPlugin(name, result.version, result);
+                },
+              })
+            : [];
         if (updated.length > 0) this.broadcastUpdateCount();
       }
       return catalog;
@@ -2550,6 +3815,15 @@ export class PluginManager {
       throw new Error('Marketplace is not initialized');
     }
 
+    // Refuse to replace a plugin whose owed post-update cleanup hasn't reconciled
+    // yet (R5P2): an explicit user "Update" would otherwise unload+reload the very
+    // generation the startup reconciler is about to run cleanup against — killing
+    // the captured utility-process hook and later running the old debt against the
+    // replacement. The deferral clears once reconciliation completes.
+    if (this.isUpdateDeferred(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
+
     const catalog = this.marketplaceService.getCachedCatalog();
     const entry = catalog?.find((p) => p.name === pluginName);
     if (!entry) {
@@ -2563,18 +3837,34 @@ export class PluginManager {
       throw new UnverifiedPluginError(pluginName);
     }
 
-    await this.withInstallLock(pluginName, () =>
-      this.withRendererReplacementForUpdate(pluginName, async () => {
+    await this.withInstallLock(pluginName, () => {
+      // RE-CHECK the deferral INSIDE the lock but BEFORE the renderer replacement
+      // (R9P1/R28P9): the pre-lock check above is a snapshot; a concurrent
+      // app-update (freeze) or rollback could have deferred this plugin while we
+      // were queued. Bail here to avoid a needless full renderer reload for a
+      // request that would replace a generation whose owed cleanup is still needed.
+      if (this.isUpdateDeferred(pluginName)) {
+        throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+      }
+      return this.withRendererReplacementForUpdate(pluginName, async () => {
         const result = await this.marketplaceService!.installPlugin(entry, opts);
         await this.swapToInstalledPlugin(pluginName, entry.version, result);
-      }),
-    );
+      });
+    });
 
     // Update count changed since we just installed/updated a plugin
     this.broadcastUpdateCount();
   }
 
   async uninstallFromMarketplace(pluginName: string): Promise<void> {
+    // Refuse to tear down a plugin that owes un-reconciled post-update cleanup —
+    // checked FIRST (before marketplace/name checks): uninstalling unloads its
+    // process, so the startup reconciler could no longer run its owed cleanup
+    // in-process (R6P1). Clears once reconciliation completes.
+    if (this.isUpdateDeferred(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is finishing a previous update. Please try again in a moment.`);
+    }
+
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
     }
@@ -2594,6 +3884,11 @@ export class PluginManager {
     }
 
     await this.withInstallLock(pluginName, () => {
+      // Re-check the freeze INSIDE the lock but BEFORE the renderer replacement
+      // (R28P9): an app-update may have begun while this uninstall was queued —
+      // bail here to avoid a needless renderer reload for a request that must not
+      // strand the owed cleanup the updater expects to run against this generation.
+      this.assertNotFrozen(pluginName);
       return this.withRendererReplacementForUpdate(pluginName, async () => {
         await this.unloadPlugin(pluginName);
         this.marketplaceService!.uninstallPlugin(pluginName);
@@ -2603,6 +3898,14 @@ export class PluginManager {
         this.clearDisabledState(pluginName);
         this.clearPendingRestart(pluginName);
         this.setFailedUpdate(pluginName, null);
+        // Clear any deferred disabled-update rollback stash + its consent state:
+        // the plugin is gone, so there's nothing to roll back to, and a lingering
+        // stash would otherwise leak (and — before R28P27 — could wedge app updates)
+        // (R28P27). Discard the on-disk backup too.
+        const stash = this.pendingConsentRollback.get(pluginName);
+        if (stash?.backupDir) this.marketplaceService?.discardBackup(stash.backupDir);
+        this.pendingConsentRollback.delete(pluginName);
+        this.pendingConsent.delete(pluginName);
         this.broadcastUIState();
         this.notifyToolsChanged();
       });

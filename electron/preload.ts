@@ -637,10 +637,10 @@ const appAPI = {
       ipcRenderer.on('plugin:modal-callback', handler);
       return () => ipcRenderer.removeListener('plugin:modal-callback', handler);
     },
-    approveConsent: (pluginName: string) =>
-      ipcRenderer.invoke('plugin:approve-consent', pluginName) as Promise<{ success: boolean }>,
-    denyConsent: (pluginName: string) =>
-      ipcRenderer.invoke('plugin:deny-consent', pluginName) as Promise<{ success: boolean }>,
+    approveConsent: (pluginName: string, expectedFileHash?: string) =>
+      ipcRenderer.invoke('plugin:approve-consent', pluginName, expectedFileHash) as Promise<{ success: boolean }>,
+    denyConsent: (pluginName: string, expectedFileHash?: string) =>
+      ipcRenderer.invoke('plugin:deny-consent', pluginName, expectedFileHash) as Promise<{ success: boolean }>,
     getPendingConsent: () =>
       ipcRenderer.invoke('plugin:pending-consent') as Promise<
         Array<{

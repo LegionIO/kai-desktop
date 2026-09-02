@@ -489,6 +489,20 @@ describe('config IPC: registered channels', () => {
     expect(onDisk.launchAtLogin).toBe(true);
   });
 
+  it('REJECTS a config:set write to pluginSystem.disabledPlugins (lifecycle is not raw config, R30P1)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(ipc as Parameters<typeof registerConfigHandlers>[0], appHome);
+      },
+    });
+    // Enabling/disabling plugins must go through the freeze-aware plugin lifecycle
+    // IPC, never this generic config path — a plugin frontend sharing the renderer
+    // could otherwise disable itself mid-freeze and strand its owed cleanup.
+    await expect(harness.invoke('config:set', FAKE_EVENT, 'pluginSystem.disabledPlugins', ['self'])).rejects.toThrow(
+      /lifecycle/i,
+    );
+  });
+
   it('rejects an internal write while an external config edit remains unreadable', async () => {
     let requestReload!: () => void;
     const harness = await createIpcHarness({

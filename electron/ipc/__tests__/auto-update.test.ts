@@ -1,18 +1,13 @@
 /**
- * Tests for the post-update marker lifecycle in auto-update.ts. The marker is
- * written before quitAndInstall() and consumed after relaunch to fire
- * post-update hooks (e.g. revoking admin granted by a pre-update hook). The
- * safety-critical property: a stale/failed-install marker must NOT cause
- * success post-hooks to fire for a version we're not running — that gate lives
- * in the main.ts consumer (marker.version === app.getVersion()), and these tests
- * document + lock the marker's own read/delete/self-heal behavior.
+ * Tests for auto-update.ts download-mode + config-path resolution helpers. The
+ * post-update cleanup state now lives in the attempt-scoped ledger
+ * (post-update-ledger.ts) and is covered by post-update-ledger.test.ts.
  *
- * POST_UPDATE_MARKER = join(app.getPath('userData'), '.update-completed') is a
- * module-level const, so electron (getPath/getVersion), electron-updater, and
- * window-send are mocked and KAI_USER_DATA is repointed before import.
+ * electron (getPath/getVersion), electron-updater, and window-send are mocked and
+ * KAI_USER_DATA is repointed before import.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'fs';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -29,109 +24,10 @@ vi.mock('electron-updater', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() }));
 
-const {
-  consumePostUpdateMarker,
-  withTimeout,
-  PRE_UPDATE_HOOK_TIMEOUT_MS,
-  resolveDownloadMode,
-  shouldForceSingleRange,
-  parseUpdateConfigFields,
-  resolveUpdateConfigPath,
-} = await import('../auto-update.js');
+const { resolveDownloadMode, shouldForceSingleRange, parseUpdateConfigFields, resolveUpdateConfigPath } =
+  await import('../auto-update.js');
 
-const MARKER = join(USERDATA, '.update-completed');
-const writeMarker = (obj: unknown) => writeFileSync(MARKER, JSON.stringify(obj));
-
-beforeEach(() => {
-  rmSync(MARKER, { force: true });
-});
 afterEach(() => vi.clearAllMocks());
-
-describe('consumePostUpdateMarker', () => {
-  it('returns null when no marker exists', () => {
-    expect(consumePostUpdateMarker()).toBeNull();
-  });
-
-  it('reads a valid marker and deletes it (consumed exactly once)', () => {
-    writeMarker({ version: '2.5.0', fromVersion: '2.4.0', timestamp: Date.now() });
-    const first = consumePostUpdateMarker();
-    expect(first).toMatchObject({ version: '2.5.0', fromVersion: '2.4.0' });
-    // The marker file is removed on read → a second consume returns null.
-    expect(existsSync(MARKER)).toBe(false);
-    expect(consumePostUpdateMarker()).toBeNull();
-  });
-
-  it('self-heals: deletes the marker and returns null on corrupt JSON', () => {
-    writeFileSync(MARKER, '{ not valid json ');
-    expect(consumePostUpdateMarker()).toBeNull();
-    expect(existsSync(MARKER)).toBe(false); // corrupt marker cleaned up
-  });
-
-  it('returns a malformed-but-valid-JSON marker as-is (shape safety is the consumer’s job)', () => {
-    // The main.ts consumer gates success on marker.version === app.getVersion(),
-    // so a marker with a wrong/absent version fails safe (success=false) even
-    // though consume() itself does not validate the shape.
-    writeMarker({});
-    const r = consumePostUpdateMarker() as { version?: string } | null;
-    expect(r).toEqual({});
-    // Simulate the consumer's fail-safe gate: version !== current → not a success.
-    expect(r?.version === CURRENT_VERSION).toBe(false);
-  });
-
-  it('a stale marker for a DIFFERENT version does not equal the running version (fail-safe)', () => {
-    writeMarker({ version: '9.9.9', fromVersion: '2.4.0' });
-    const r = consumePostUpdateMarker();
-    expect(r?.version).toBe('9.9.9');
-    // The consumer would compute success = ('9.9.9' === '2.5.0') === false.
-    expect(r?.version === CURRENT_VERSION).toBe(false);
-  });
-
-  it('a marker matching the running version is treated as a successful update', () => {
-    writeMarker({ version: CURRENT_VERSION, fromVersion: '2.4.0' });
-    const r = consumePostUpdateMarker();
-    expect(r?.version === CURRENT_VERSION).toBe(true);
-  });
-});
-
-describe('withTimeout (pre-update-hook bound)', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it('resolves { timedOut:false, value } when the promise settles before the deadline', async () => {
-    const p = withTimeout(Promise.resolve('ok'), 1000);
-    await vi.advanceTimersByTimeAsync(0);
-    await expect(p).resolves.toEqual({ timedOut: false, value: 'ok' });
-  });
-
-  it('resolves { timedOut:true } when the promise never settles before the deadline', async () => {
-    const never = new Promise<string>(() => {}); // never resolves
-    const p = withTimeout(never, 5000);
-    await vi.advanceTimersByTimeAsync(5000);
-    await expect(p).resolves.toEqual({ timedOut: true });
-  });
-
-  it('does not time out a promise that settles just under the deadline', async () => {
-    let resolveFn!: (v: string) => void;
-    const slow = new Promise<string>((r) => (resolveFn = r));
-    const p = withTimeout(slow, 5000);
-    await vi.advanceTimersByTimeAsync(4999);
-    resolveFn('done');
-    await expect(p).resolves.toEqual({ timedOut: false, value: 'done' });
-  });
-
-  it('propagates a rejection from the raced promise (not swallowed by the timeout)', async () => {
-    // Reject inside an executor so the rejection isn't a floating unhandled
-    // promise before withTimeout attaches its handler.
-    const failing = new Promise<string>((_resolve, reject) => reject(new Error('hook failed')));
-    const p = withTimeout(failing, 1000);
-    await expect(p).rejects.toThrow('hook failed');
-    await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it('PRE_UPDATE_HOOK_TIMEOUT_MS is a sane positive bound (5 min)', () => {
-    expect(PRE_UPDATE_HOOK_TIMEOUT_MS).toBe(5 * 60 * 1000);
-  });
-});
 
 describe('resolveDownloadMode — bytes are authoritative over the logger label', () => {
   const FULL = 559_300_000; // ~559 MB, the reported full size

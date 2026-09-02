@@ -1,4 +1,5 @@
 import type { IpcMain } from 'electron';
+import { assertPluginLifecycleConfigWriteAllowed } from '../plugins/plugin-lifecycle-config-guard.js';
 import { readFileSync, existsSync, watch, mkdirSync, chmodSync, statSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname, basename } from 'path';
@@ -1696,6 +1697,17 @@ export function registerConfigHandlers(
     if ((path === 'browser' || path.startsWith('browser.')) && !mayWriteBrowserConfig(event)) {
       throw new Error('Browser settings can only be changed from the primary Kai window.');
     }
+    // Enabling/disabling plugins is a LIFECYCLE op that MUST go through the
+    // freeze-aware `plugin:disable`/`plugin:enable` IPC — never a raw config write
+    // (R28P54/R30P1). Plugin FRONTEND code shares the primary renderer and could
+    // otherwise reach this `config:set` ingress directly to add itself to
+    // `pluginSystem.disabledPlugins` during an app-update freeze (bypassing the
+    // backend PluginAPI guard) — reloading next launch only as a disabled stub whose
+    // owed post-update cleanup hook never registers. The app's own settings UI uses
+    // `app.plugins.disable(...)`, never this path, so blocking it here for ALL
+    // renderer/web callers breaks nothing legitimate (the main-process internal
+    // setter is unaffected).
+    assertPluginLifecycleConfigWriteAllowed(path);
     setConfigImpl(path, value);
     return currentConfig;
   });

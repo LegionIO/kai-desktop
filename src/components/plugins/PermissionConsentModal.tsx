@@ -133,6 +133,13 @@ function normalizeConsentRequest(data: unknown): ConsentRequest | null {
 export const PermissionConsentModal: FC = () => {
   const [requests, setRequests] = useState<ConsentRequest[]>([]);
   const [processing, setProcessing] = useState<string | null>(null);
+  // Error surfaced when approve/deny returns { success:false, error } (e.g. an
+  // app-update freeze rejects consent resolution) — R42P2. Keyed by GENERATION
+  // (pluginName + fileHash), NOT plugin name alone (R44P3): if a stale H1 decision
+  // fails and resync replaces the prompt with a same-name H2, H2 must not display
+  // H1's error — a different generation the user never acted on.
+  const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
+  const errorKey = (pluginName: string, fileHash: string) => `${pluginName}:${fileHash}`;
 
   useEffect(() => {
     // Load any pending consent requests on mount
@@ -153,7 +160,14 @@ export const PermissionConsentModal: FC = () => {
         const req = normalizeConsentRequest(data);
         if (!req) return;
         setRequests((prev) => {
-          if (prev.some((r) => r.pluginName === req.pluginName)) return prev;
+          const existing = prev.find((r) => r.pluginName === req.pluginName);
+          // Same name AND same hash → already showing this exact request; no-op.
+          if (existing && existing.fileHash === req.fileHash) return prev;
+          // Same name but a DIFFERENT hash → a new generation (H2) replaced H1
+          // (rollback/reinstall). REPLACE the stale prompt so the user sees H2's
+          // actual permissions, not H1's (R29P1). Otherwise a by-name dedup would
+          // keep showing H1 while main holds H2.
+          if (existing) return prev.map((r) => (r.pluginName === req.pluginName ? req : r));
           return [...prev, req];
         });
       });
@@ -161,27 +175,106 @@ export const PermissionConsentModal: FC = () => {
     }
   }, []);
 
-  const handleApprove = useCallback(async (pluginName: string) => {
-    setProcessing(pluginName);
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (window as any).app.plugins.approveConsent(pluginName);
-      setRequests((prev) => prev.filter((r) => r.pluginName !== pluginName));
-    } finally {
-      setProcessing(null);
-    }
+  // After a consent decision (approve OR deny) that main reports as taken-effect,
+  // RE-SYNC the prompt list from main's authoritative pending set rather than
+  // optimistically filtering by name (R28P52/R28P56/R29P1): a rollback/reload can
+  // re-create a same-name request, and a stale cross-request decision can be
+  // REJECTED leaving the live request pending — in both cases a by-name drop would
+  // hide a request main still holds, invisibly blocking future update freezes. On
+  // re-sync FAILURE, KEEP the current prompt (safer than hiding a live request).
+  const resyncPendingConsent = useCallback(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pending = (await (window as any).app.plugins.getPendingConsent()) as unknown[];
+    const normalized = (Array.isArray(pending) ? pending : [])
+      .map(normalizeConsentRequest)
+      .filter((r): r is ConsentRequest => r !== null);
+    setRequests(normalized);
   }, []);
 
-  const handleDeny = useCallback(async (pluginName: string) => {
-    setProcessing(pluginName);
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (window as any).app.plugins.denyConsent(pluginName);
-      setRequests((prev) => prev.filter((r) => r.pluginName !== pluginName));
-    } finally {
-      setProcessing(null);
-    }
-  }, []);
+  const handleApprove = useCallback(
+    async (pluginName: string, fileHash: string) => {
+      setProcessing(pluginName);
+      const key = errorKey(pluginName, fileHash);
+      // Clear any prior error for THIS generation before retrying.
+      setActionErrors((prev) => {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      try {
+        // Pass the fileHash the user was shown so main can reject a STALE cross-request
+        // decision (a different generation now holding the prompt) (R28P55).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = (await (window as any).app.plugins.approveConsent(pluginName, fileHash)) as
+          | { success?: boolean; error?: string }
+          | undefined;
+        // Surface a structured rejection (e.g. an app-update freeze) so the user
+        // understands why the button did nothing, rather than it appearing
+        // ineffective (R42P2). The request stays pending and is retryable. Keyed by
+        // generation so a same-name replacement (H2) doesn't inherit this error (R44P3).
+        if (result && result.success === false) {
+          setActionErrors((prev) => ({
+            ...prev,
+            [key]: result.error || 'Could not approve the plugin right now. Please try again in a moment.',
+          }));
+        }
+        // ALWAYS re-sync from main afterwards — on success OR on a { success:false }
+        // stale-rejection (R29P2): if we skipped resync on false, a rejected approval
+        // (client held H1, main now holds H2) would leave the stale H1 modal up, and
+        // every retry re-sends the same stale hash and fails — permanently stuck.
+        // Resyncing surfaces the LIVE request (H2) the user can actually act on. Keep
+        // the current prompt only if the resync itself fails (R28P56).
+        try {
+          await resyncPendingConsent();
+        } catch {
+          /* resync failed → keep current prompt */
+        }
+      } finally {
+        setProcessing(null);
+      }
+    },
+    [resyncPendingConsent],
+  );
+
+  const handleDeny = useCallback(
+    async (pluginName: string, fileHash: string) => {
+      setProcessing(pluginName);
+      const key = errorKey(pluginName, fileHash);
+      setActionErrors((prev) => {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = (await (window as any).app.plugins.denyConsent(pluginName, fileHash)) as
+          | { success?: boolean; error?: string }
+          | undefined;
+        // Surface a structured rejection (e.g. an app-update freeze) — the request
+        // stays pending and is retryable (R42P2). Generation-keyed (R44P3).
+        if (result && result.success === false) {
+          setActionErrors((prev) => ({
+            ...prev,
+            [key]: result.error || 'Could not deny the plugin right now. Please try again in a moment.',
+          }));
+        }
+        // ALWAYS re-sync from main afterwards (R28P52/R29P2). On success a rollback
+        // may have re-created a same-name request; on a { success:false } freeze
+        // refusal the same request is still pending — resync re-shows the authoritative
+        // set either way. Keep the current prompt only if resync itself fails (R28P56).
+        try {
+          await resyncPendingConsent();
+        } catch {
+          /* resync failed → keep current prompt */
+        }
+      } finally {
+        setProcessing(null);
+      }
+    },
+    [resyncPendingConsent],
+  );
 
   if (requests.length === 0) return null;
 
@@ -331,8 +424,13 @@ export const PermissionConsentModal: FC = () => {
 
             {/* Footer */}
             <div className="flex items-center justify-end gap-2.5 border-t px-5 py-3">
+              {actionErrors[errorKey(req.pluginName, req.fileHash)] && (
+                <p className="mr-auto text-[11px] text-red-600" role="alert">
+                  {actionErrors[errorKey(req.pluginName, req.fileHash)]}
+                </p>
+              )}
               <button
-                onClick={() => handleDeny(req.pluginName)}
+                onClick={() => handleDeny(req.pluginName, req.fileHash)}
                 disabled={processing === req.pluginName}
                 className="flex items-center gap-1.5 rounded-lg border px-4 py-2 text-xs font-medium text-foreground hover:bg-muted/50 transition-colors disabled:opacity-50"
               >
@@ -340,7 +438,7 @@ export const PermissionConsentModal: FC = () => {
                 Deny
               </button>
               <button
-                onClick={() => handleApprove(req.pluginName)}
+                onClick={() => handleApprove(req.pluginName, req.fileHash)}
                 disabled={processing === req.pluginName}
                 className="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
               >

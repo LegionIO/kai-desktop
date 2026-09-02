@@ -29,6 +29,8 @@ describe('plugin process control IPC', () => {
     pausePlugin: vi.fn(async () => {}),
     resumePlugin: vi.fn(async () => {}),
     killPlugin: vi.fn(async () => {}),
+    approveAndReload: vi.fn(async () => true),
+    denyPlugin: vi.fn(async () => {}),
     getMarketplaceStatus: vi.fn(() => ({ configured: true, ready: false, reachable: false, catalogSize: 0 })),
     getMarketplaceSnapshot: vi.fn(() => ({
       catalog: [],
@@ -188,5 +190,40 @@ describe('plugin process control IPC', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // ── Consent handlers (R37P2): approve must mirror deny's structured-failure ──
+
+  it('plugin:approve-consent rejects a hashless approve without calling the manager (R29P3)', async () => {
+    await expect(handlers.get('plugin:approve-consent')?.({}, 'p')).resolves.toEqual({
+      success: false,
+      error: expect.stringMatching(/stale/i),
+    });
+    await expect(handlers.get('plugin:approve-consent')?.({}, 'p', '')).resolves.toMatchObject({ success: false });
+    expect(manager.approveAndReload).not.toHaveBeenCalled();
+  });
+
+  it('plugin:approve-consent forwards to approveAndReload and returns its result', async () => {
+    vi.mocked(manager.approveAndReload).mockResolvedValueOnce(true);
+    await expect(handlers.get('plugin:approve-consent')?.({}, 'p', 'h')).resolves.toEqual({ success: true });
+    expect(manager.approveAndReload).toHaveBeenCalledWith('p', 'h');
+  });
+
+  it('plugin:approve-consent returns a structured failure (no unhandled rejection) when approval races the freeze (R37P2)', async () => {
+    vi.mocked(manager.approveAndReload).mockRejectedValueOnce(
+      new Error('Plugin "p" is finishing a previous update. Please try again in a moment.'),
+    );
+    // Must RESOLVE with { success:false } (mirroring deny), NOT reject — the renderer
+    // has no catch, so a rejection would be an unhandled promise rejection and skip
+    // the pending-consent resync.
+    await expect(handlers.get('plugin:approve-consent')?.({}, 'p', 'h')).resolves.toMatchObject({
+      success: false,
+      error: expect.stringMatching(/finishing a previous update/i),
+    });
+  });
+
+  it('plugin:deny-consent returns a structured failure when denial races the freeze (R28P17)', async () => {
+    vi.mocked(manager.denyPlugin).mockRejectedValueOnce(new Error('freeze active'));
+    await expect(handlers.get('plugin:deny-consent')?.({}, 'p', 'h')).resolves.toMatchObject({ success: false });
   });
 });

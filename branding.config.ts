@@ -125,7 +125,7 @@ export const branding = {
 
   // ── Plugin API ─────────────────────────────────────────────────────────
   /** Semver version of the plugin API surface. Bump minor for additive changes, major for breaking. */
-  pluginApiVersion: '1.0.0',
+  pluginApiVersion: '1.1.0',
 
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */

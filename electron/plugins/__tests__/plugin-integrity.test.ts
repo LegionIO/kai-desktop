@@ -19,7 +19,10 @@ import {
   getPluginIntegrity,
   arePermissionSetsEqual,
   approvalPermissionsMatch,
+  deferredPermissionsTrusted,
   isLegacyInferredBrowserPermissionSnapshot,
+  pathAvailability,
+  isTransientFsError,
   MAX_PLUGIN_DIRECTORY_DEPTH,
   MAX_PLUGIN_FILE_BYTES,
   MAX_PLUGIN_RENDERER_ASSET_BYTES,
@@ -230,6 +233,47 @@ describe('isLegacyInferredBrowserPermissionSnapshot', () => {
   });
 });
 
+describe('deferredPermissionsTrusted', () => {
+  const BROWSER = 'browser:authenticated-session';
+
+  it('accepts an exact match under the "exact" base', () => {
+    expect(deferredPermissionsTrusted(['fs', 'net'], ['net', 'fs'], 'exact')).toBe(true);
+  });
+
+  it('accepts an exact match under the "approval" base', () => {
+    expect(deferredPermissionsTrusted(['fs', 'net'], ['net', 'fs'], 'approval')).toBe(true);
+  });
+
+  it('accepts the narrow legacy inferred-Browser delta for a deferred plugin (both bases)', () => {
+    // Persisted snapshot predates the host-inferred Browser permission; the manifest
+    // now adds exactly that one. Exact/approval bases both reject it, so the legacy
+    // fallback is what keeps the owed plugin loadable (R31P2).
+    expect(deferredPermissionsTrusted(['ui:panel'], ['ui:panel', BROWSER], 'exact')).toBe(true);
+    expect(deferredPermissionsTrusted(['ui:panel'], ['ui:panel', BROWSER], 'approval')).toBe(true);
+  });
+
+  it('rejects any delta beyond the single inferred-Browser permission', () => {
+    // Adds Browser AND another permission → not the narrow rollout delta.
+    expect(deferredPermissionsTrusted(['ui:panel'], ['ui:panel', BROWSER, 'net'], 'exact')).toBe(false);
+    // Adds a non-Browser permission → never tolerated.
+    expect(deferredPermissionsTrusted(['ui:panel'], ['ui:panel', 'net'], 'exact')).toBe(false);
+    expect(deferredPermissionsTrusted(['ui:panel'], ['ui:panel', 'net'], 'approval')).toBe(false);
+  });
+
+  it('rejects when the "exact" base has no persisted permissions', () => {
+    // Marketplace records must carry a permission snapshot; undefined is untrusted.
+    expect(deferredPermissionsTrusted(undefined, ['ui:panel'], 'exact')).toBe(false);
+  });
+
+  it('honors the legacy approval-compat rule when the manifest has no Browser permission', () => {
+    // "approval" base: a legacy (undefined) approval matches a non-Browser manifest,
+    // but not one that acquires Browser access — which then flows to the legacy check
+    // (also false here, since undefined previous is not a legacy snapshot).
+    expect(deferredPermissionsTrusted(undefined, ['config:read'], 'approval')).toBe(true);
+    expect(deferredPermissionsTrusted(undefined, [BROWSER], 'approval')).toBe(false);
+  });
+});
+
 describe('readPluginManifest execScope parsing', () => {
   it('does not follow a symbolic-link manifest', () => {
     const target = join(dir, 'manifest-target.json');
@@ -289,5 +333,50 @@ describe('getPluginIntegrity', () => {
 
     expect(readPluginManifest(dir).permissions).toEqual(['ui:panel']);
     expect(getPluginIntegrity(dir).permissions).toEqual(['ui:panel', 'browser:authenticated-session']);
+  });
+});
+
+describe('pathAvailability (R39P1/R40P1 — absent vs unreadable classification)', () => {
+  it("returns 'present' for a path that exists", () => {
+    write('exists.txt', 'x');
+    expect(pathAvailability(join(dir, 'exists.txt'))).toBe('present');
+    expect(pathAvailability(dir)).toBe('present');
+  });
+
+  it("returns 'absent' for a genuinely missing path (ENOENT)", () => {
+    expect(pathAvailability(join(dir, 'nope', 'missing'))).toBe('absent');
+  });
+
+  it("returns 'error' for a non-ENOENT stat failure (e.g. ENOTDIR: a path component is a file)", () => {
+    write('afile', 'x');
+    // Traversing THROUGH a file yields ENOTDIR, not ENOENT — must classify as 'error'
+    // (unconfirmable), never 'absent', so callers fail closed instead of proceeding.
+    expect(pathAvailability(join(dir, 'afile', 'child'))).toBe('error');
+  });
+});
+
+describe('isTransientFsError (R40P1 — transient vs deterministic classification)', () => {
+  it('classifies retryable I/O errnos as transient', () => {
+    for (const code of ['EIO', 'EACCES', 'EPERM', 'EMFILE', 'ENFILE', 'EBUSY', 'EAGAIN', 'ETIMEDOUT']) {
+      expect(isTransientFsError(Object.assign(new Error(code), { code }))).toBe(true);
+    }
+  });
+
+  it('classifies deterministic content defects as NOT transient (must not wedge updates)', () => {
+    // A JSON parse error / validation error has no transient errno → deterministic.
+    expect(isTransientFsError(new SyntaxError('Unexpected token in JSON'))).toBe(false);
+    expect(isTransientFsError(new Error('Plugin file exceeds the byte limit'))).toBe(false);
+    expect(isTransientFsError(Object.assign(new Error('nope'), { code: 'ENOENT' }))).toBe(false);
+    expect(isTransientFsError(undefined)).toBe(false);
+    expect(isTransientFsError('a string')).toBe(false);
+  });
+
+  it('unwraps a transient errno carried on the error cause (integrity wraps low-level fs errors)', () => {
+    const wrapped = new Error('Plugin file could not be opened', {
+      cause: Object.assign(new Error('EIO'), { code: 'EIO' }),
+    });
+    expect(isTransientFsError(wrapped)).toBe(true);
+    const wrappedDeterministic = new Error('bad', { cause: new SyntaxError('parse') });
+    expect(isTransientFsError(wrappedDeterministic)).toBe(false);
   });
 });

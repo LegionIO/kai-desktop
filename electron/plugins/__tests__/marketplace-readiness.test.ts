@@ -230,6 +230,37 @@ describe('frontend update revocation', () => {
     expect(manager.getInferenceProvider()).toBeNull();
   });
 
+  it('does NOT reload the renderer when a lifecycle op is refused by an active update freeze (R28P9)', async () => {
+    const revokeRenderer = vi.fn();
+    const manager = makeManager([], [], revokeRenderer);
+    const manifest = {
+      name: 'frozen-target',
+      displayName: 'Frozen Target',
+      version: '1.0.0',
+      permissions: [],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (p: typeof manifest, d: string, s: 'active') => { state: string };
+      plugins: Map<string, { state: string }>;
+      rendererLoadedThisSession: Set<string>;
+    };
+    internal.plugins.set(
+      manifest.name,
+      internal.createPluginInstance(manifest, '/tmp/plugins-test/frozen-target', 'active'),
+    );
+    internal.rendererLoadedThisSession.add(manifest.name); // has a renderer that WOULD be reloaded
+
+    await manager.beginUpdateFreeze();
+    await expect(manager.disablePlugin(manifest.name, { persist: false })).rejects.toThrow(
+      /finishing a previous update/i,
+    );
+    // The freeze check runs BEFORE withRendererReplacementForUpdate, so no needless
+    // full renderer reload happened for the refused op (R28P9).
+    expect(revokeRenderer).not.toHaveBeenCalled();
+    manager.endUpdateFreeze();
+  });
+
   it('continues renderer replacement when assistant revocation bookkeeping throws', async () => {
     const revokeRenderer = vi.fn();
     const manager = makeManager([], [], revokeRenderer);
@@ -772,6 +803,40 @@ describe('getMarketplaceStatus', () => {
       catalogSize: 0,
     });
     expect(broadcastToAllWindows).toHaveBeenCalledWith('plugin:marketplace-ready', expect.any(Object));
+  });
+
+  it('reports marketplaceBootstrapIncomplete when the catalog is unreachable and a REQUIRED plugin is absent (R52P1)', async () => {
+    cachedCatalog = [];
+    fetchImpl = async () => {
+      throw new Error('network down');
+    };
+    // A brand-required plugin that is NOT installed on disk (fresh profile). With the
+    // catalog unreachable, its auto-install can't run → its pre-update veto would be
+    // missing at an app update, so init must report incomplete to block installs.
+    const mgr = makeManager(['https://plugins.example.com/catalog.json'], ['required-ui']);
+
+    const result = await mgr.initMarketplace(['https://plugins.example.com/catalog.json']);
+
+    expect(result.marketplaceBootstrapIncomplete).toBe(true);
+  });
+
+  it('does NOT report incomplete when the catalog is unreachable but NO plugin is required (R52P1)', async () => {
+    cachedCatalog = [];
+    fetchImpl = async () => {
+      throw new Error('network down');
+    };
+    const mgr = makeManager(['https://plugins.example.com/catalog.json']); // no required plugins
+
+    const result = await mgr.initMarketplace(['https://plugins.example.com/catalog.json']);
+
+    // No required plugin → an unreachable catalog strands nothing → not incomplete.
+    expect(result.marketplaceBootstrapIncomplete).toBe(false);
+  });
+
+  it('does NOT report incomplete with zero configured marketplace URLs (R52P1)', async () => {
+    const mgr = makeManager([], ['required-ui']);
+    const result = await mgr.initMarketplace([]);
+    expect(result.marketplaceBootstrapIncomplete).toBe(false);
   });
 
   it('flips ready=true and broadcasts even with zero configured URLs', async () => {
