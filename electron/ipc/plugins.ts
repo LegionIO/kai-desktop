@@ -264,7 +264,7 @@ export function registerPluginHandlers(
   });
 
   ipcMain.handle('plugin:available-update-count', () => {
-    return pluginManager.getAvailableUpdateCount();
+    return pluginManager.getAvailableUpdateCountForRenderer();
   });
 
   ipcMain.handle('plugin:pending-restart', () => {

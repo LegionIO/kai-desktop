@@ -866,7 +866,11 @@ export class PluginManager {
     // or backend-only plugin had no old frontend in this renderer generation.
     // The restored build can therefore load normally without a restart banner.
     this.clearPendingRestart(pluginName);
-    this.broadcastUpdateCount();
+    // Force: rejecting the update restored the prior version, so an update is
+    // available again. The recomputed count may match main's last-broadcast
+    // value while disagreeing with what the renderer currently shows — force
+    // past the dedupe so the badge reflects the restored state.
+    this.broadcastUpdateCount({ force: true });
   }
 
   /** Get list of plugins pending consent. */
@@ -3451,7 +3455,7 @@ export class PluginManager {
                 },
               })
             : [];
-        if (updated.length > 0) this.broadcastUpdateCount();
+        if (updated.length > 0) this.broadcastUpdateCount({ force: true });
       }
       return catalog;
     });
@@ -3585,9 +3589,29 @@ export class PluginManager {
     }, REFRESH_INTERVAL_MS);
   }
 
-  private broadcastUpdateCount(): void {
+  /**
+   * Read the current available-update count for a direct renderer pull, and
+   * record it as the last value the renderer has seen. The renderer seeds its
+   * badge from this getter on mount, so keeping `lastUpdateCount` in sync here
+   * prevents a later `broadcastUpdateCount()` dedupe from suppressing a legit
+   * "count changed" push when the pull and broadcast channels disagree.
+   */
+  getAvailableUpdateCountForRenderer(): number {
     const count = this.getAvailableUpdateCount();
-    if (count !== this.lastUpdateCount) {
+    this.lastUpdateCount = count;
+    return count;
+  }
+
+  /**
+   * Broadcast the current update count to all windows. Dedupes against the last
+   * value the renderer received (via pull or a prior broadcast). Pass
+   * `force: true` after an install/update where the count may have changed but
+   * could recompute to the same numeric value the renderer last pulled — the
+   * dedupe would otherwise silently drop the clear and leave a stale badge.
+   */
+  private broadcastUpdateCount(options?: { force?: boolean }): void {
+    const count = this.getAvailableUpdateCount();
+    if (options?.force || count !== this.lastUpdateCount) {
       this.lastUpdateCount = count;
       broadcastToAllWindows('plugin:updates-available', { count });
     }
@@ -3852,8 +3876,11 @@ export class PluginManager {
       });
     });
 
-    // Update count changed since we just installed/updated a plugin
-    this.broadcastUpdateCount();
+    // Update count changed since we just installed/updated a plugin. Force the
+    // emit: after a successful swap the recomputed count often returns to a
+    // value the renderer already pulled (e.g. 1 → 0), and the dedupe guard
+    // would otherwise suppress the badge clear.
+    this.broadcastUpdateCount({ force: true });
   }
 
   async uninstallFromMarketplace(pluginName: string): Promise<void> {
