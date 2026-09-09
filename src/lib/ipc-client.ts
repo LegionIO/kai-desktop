@@ -428,6 +428,8 @@ type AppAPI = {
     getPendingRestart: () => Promise<string[]>;
     restartApp: () => Promise<{ success: boolean }>;
     onPendingRestartChanged: (callback: (data: { plugins: string[] }) => void) => () => void;
+    getDegradedPlugins?: () => Promise<string[]>;
+    onDegradedChanged?: (callback: (data: { plugins: string[] }) => void) => () => void;
     onMarketplaceReady?: (
       callback: (data: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number }) => void,
     ) => () => void;

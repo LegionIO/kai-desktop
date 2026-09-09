@@ -589,6 +589,12 @@ const appAPI = {
       ipcRenderer.on('plugin:pending-restart-changed', handler);
       return () => ipcRenderer.removeListener('plugin:pending-restart-changed', handler);
     },
+    getDegradedPlugins: () => ipcRenderer.invoke('plugin:degraded') as Promise<string[]>,
+    onDegradedChanged: (callback: (data: { plugins: string[] }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { plugins: string[] }) => callback(data);
+      ipcRenderer.on('plugin:degraded-changed', handler);
+      return () => ipcRenderer.removeListener('plugin:degraded-changed', handler);
+    },
     onMarketplaceReady: (
       callback: (data: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number }) => void,
     ) => {

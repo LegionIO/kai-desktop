@@ -96,6 +96,11 @@ export function uiStateChanged(lastJson: string, nextJson: string): boolean {
  *  traversal, no leading dot. Mirrors the skills-loader name rule. */
 const PLUGIN_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
+/** Max automatic crash-recovery reload attempts per plugin before we stop
+ *  auto-reloading it and leave it degraded (prevents a repeat-crashing frontend
+ *  plugin from trapping the app in an endless crash→reload loop). */
+const MAX_CRASH_RECOVERY_ATTEMPTS = 3;
+
 export function isValidPluginName(name: unknown): name is string {
   return typeof name === 'string' && name !== '.' && name !== '..' && PLUGIN_NAME_RE.test(name);
 }
@@ -230,6 +235,44 @@ export class PluginManager {
    *  an in-flight install racing the drain, activating an incompatible plugin
    *  (R28P28). */
   private updateFreezeActive = false;
+
+  /** Single-flight guard for reconcileAfterRendererReload — a burst of renderer
+   *  reloads (crash auto-reload + stall-watchdog + a manual Cmd-R) must not spawn
+   *  overlapping plugin re-loads. */
+  private rendererReloadReconcileInFlight = false;
+
+  /** Set when a reconcile arrives while one is already in flight. The active pass
+   *  snapshotted its degraded set BEFORE that crash, so it would miss the newly
+   *  degraded plugin; this flag makes the active pass run one more time on
+   *  completion instead of dropping the follow-up (R8/P2). */
+  private rendererReloadReconcileRerun = false;
+
+  /** Set true when the bootstrap loadAll() completes. Until then, discovered
+   *  plugins are still populating this.plugins, so getDegradedPlugins() must NOT
+   *  report the not-yet-loaded ones as crashed (they'd falsely light the recovery
+   *  banner on a cold start). */
+  private bootstrapComplete = false;
+
+  /** Plugins whose backing process EXITED UNEXPECTEDLY (crash / fatal V8 error /
+   *  process.exit) — set by handleUnexpectedPluginExit, cleared on a successful
+   *  (re)activation or an intentional unload/disable. This is the crash-recovery
+   *  signal, kept distinct from the many NON-crash `state === 'error'` conditions
+   *  (pending consent, strict incompat, missing backend, activation failure) that
+   *  a restart cannot resolve and must not be surfaced as "stopped after recovery". */
+  private crashedPlugins: Set<string> = new Set();
+
+  /** Plugin names the OPERATOR is deliberately killing (Diagnostics → Kill), so
+   *  the resulting unexpected-exit handler does NOT crash-mark them and auto-reload
+   *  reverse the kill. host.kill() intentionally routes through the unexpected-exit
+   *  path (to keep a diagnostic row), so expectedExit alone can't tell them apart. */
+  private operatorKilling: Set<string> = new Set();
+
+  /** Per-plugin automatic crash-recovery reload attempts. A plugin that activates
+   *  then keeps crashing would otherwise trap the app in an endless
+   *  crash → renderer-reload → reconcile → crash loop. After MAX_CRASH_RECOVERY_ATTEMPTS
+   *  we stop auto-reloading it and leave it degraded (banner persists; the user
+   *  restarts or disables it). Reset on genuine recovery or intentional unload. */
+  private crashRecoveryAttempts: Map<string, number> = new Map();
 
   /** Set by the most recent `loadAll` discovery pass: true if a plugin directory that
    *  `readdir` LISTED was then OMITTED because reading/parsing it threw (a transient
@@ -441,6 +484,8 @@ export class PluginManager {
    */
   private uiStateBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
   private lastBroadcastUIStateJson = '';
+  /** Last degraded-set JSON broadcast, for change-detection in broadcastDegraded. */
+  private lastBroadcastDegradedJson = '';
 
   constructor(
     private pluginsDir: string,
@@ -454,6 +499,33 @@ export class PluginManager {
   }
 
   /* ── Discovery ── */
+
+  /**
+   * Discovery probe for the crash-recovery reconcile path. Runs a strict
+   * (throwOnReadError) discovery to distinguish a TRANSIENT filesystem failure
+   * (→ `inconclusive: true`, keep the crash mark) from a genuine uninstall
+   * (→ found:false, inconclusive:false, clear it). Crucially it SAVES/RESTORES the
+   * startup `lastDiscoveryIncomplete` latch so this rescan can't clobber the
+   * install-blocking safety result recorded by startup loadAll() (R13/P1).
+   */
+  private probeDiscoveryForReconcile(name: string): {
+    found?: { manifest: PluginManifest; dir: string };
+    inconclusive: boolean;
+  } {
+    const savedLatch = this.lastDiscoveryIncomplete;
+    try {
+      const found = this.discoverPlugins({ throwOnReadError: true }).find((d) => d.manifest.name === name);
+      // A per-entry transient failure doesn't throw — it only sets the latch during
+      // this pass; read it BEFORE restoring to decide inconclusiveness.
+      const incompleteThisPass = this.lastDiscoveryIncomplete;
+      return { found, inconclusive: incompleteThisPass };
+    } catch {
+      return { found: undefined, inconclusive: true };
+    } finally {
+      // Restore the startup latch — this reconcile rescan must never overwrite it.
+      this.lastDiscoveryIncomplete = savedLatch;
+    }
+  }
 
   private discoverPlugins(opts?: { throwOnReadError?: boolean }): Array<{ manifest: PluginManifest; dir: string }> {
     // Reset the incompleteness flag for THIS pass; only the loadAll path (which passes
@@ -1055,33 +1127,46 @@ export class PluginManager {
   }
 
   async loadAll(): Promise<void> {
-    // Throw on a directory-read failure rather than treating it as an empty plugin
-    // set (R37P1): loading zero plugins here would let the startup legacy reconcile
-    // conclude nothing is owed and drop the marker. A throw aborts loading; main.ts's
-    // loader catch then blocks installs and leaves the ledger intact for a retry.
-    const discovered = this.discoverPlugins({ throwOnReadError: true });
-    console.info(`[PluginManager] Discovered ${discovered.length} plugins`);
+    // Mark the bootstrap attempt settled even if discovery/activation throws:
+    // main.ts catches a loadAll failure and keeps running, so leaving this false
+    // would permanently disable crash detection (getDegradedPlugins → []) for the
+    // plugins that DID load this session (R7/P2). The finally also fires the
+    // post-bootstrap broadcasts so a partial load still surfaces its degraded set.
+    try {
+      // Throw on a directory-read failure rather than treating it as an empty plugin
+      // set (R37P1): loading zero plugins here would let the startup legacy reconcile
+      // conclude nothing is owed and drop the marker. A throw aborts loading; main.ts's
+      // loader catch then blocks installs and leaves the ledger intact for a retry.
+      const discovered = this.discoverPlugins({ throwOnReadError: true });
+      console.info(`[PluginManager] Discovered ${discovered.length} plugins`);
 
-    // loadPlugin() itself skips persistently-disabled plugins (registering a
-    // 'disabled' stub), so this loop stays simple and that guard is the single
-    // source of truth across all load paths.
-    for (const { manifest, dir } of discovered) {
-      const existing = this.plugins.get(manifest.name);
-      if (existing) {
-        // Already loaded by an EARLIER path (e.g. initMarketplace's required-plugin
-        // auto-install, which runs before loadAll). If that path left an `error` stub
-        // from a TRANSIENT failure, this faithful pass must still mark discovery
-        // incomplete so installs block — otherwise loadAll would silently skip it and
-        // an app update could bypass the plugin's pre-update veto (R51P1).
-        if (existing.transientLoadFailure) this.lastDiscoveryIncomplete = true;
-        continue;
+      // loadPlugin() itself skips persistently-disabled plugins (registering a
+      // 'disabled' stub), so this loop stays simple and that guard is the single
+      // source of truth across all load paths.
+      for (const { manifest, dir } of discovered) {
+        const existing = this.plugins.get(manifest.name);
+        if (existing) {
+          // Already loaded by an EARLIER path (e.g. initMarketplace's required-plugin
+          // auto-install, which runs before loadAll). If that path left an `error` stub
+          // from a TRANSIENT failure, this faithful pass must still mark discovery
+          // incomplete so installs block — otherwise loadAll would silently skip it and
+          // an app update could bypass the plugin's pre-update veto (R51P1).
+          if (existing.transientLoadFailure) this.lastDiscoveryIncomplete = true;
+          continue;
+        }
+        // Faithful startup pass: a transient activation failure marks discovery
+        // incomplete → installs block (R43P1).
+        await this.loadPlugin(manifest, dir, { faithful: true });
       }
-      // Faithful startup pass: a transient activation failure marks discovery
-      // incomplete → installs block (R43P1).
-      await this.loadPlugin(manifest, dir, { faithful: true });
+    } finally {
+      this.bootstrapComplete = true;
+      this.broadcastUIState();
+      // A plugin that started then crashed WHILE loadAll was still activating later
+      // plugins broadcast [] (bootstrap not yet complete). Now that the gate is open,
+      // publish the true degraded set so a backend-only startup crash isn't silent
+      // until the next reload (R2/P3).
+      this.broadcastDegraded();
     }
-
-    this.broadcastUIState();
   }
 
   private createPluginInstance(manifest: PluginManifest, dir: string, state: PluginInstance['state']): PluginInstance {
@@ -1452,6 +1537,14 @@ export class PluginManager {
 
       instance.state = 'active';
       instance.error = undefined;
+      // A successful (re)activation clears any prior crash mark — the plugin is
+      // healthy again, so it must drop out of the degraded/recovery set (and any
+      // mounted banner updates immediately). The crash-recovery retry budget is
+      // deliberately NOT reset here: a plugin that activates then immediately
+      // re-crashes must still exhaust its budget (resetting on each brief
+      // activation would defeat the cap, R5/P1). The budget resets only on an
+      // explicit operator action (disable/uninstall/kill) — see resetCrashRecovery.
+      this.clearCrashMark(manifest.name);
       traceDiagnostic({
         scope: 'plugin',
         event: 'plugin.load-complete',
@@ -1605,6 +1698,14 @@ export class PluginManager {
     }
     instance.state = 'error';
     instance.error = details.error ?? `Plugin process exited unexpectedly (code ${details.code})`;
+    // Crash-recovery signal: this exit was UNEXPECTED (distinct from a consent /
+    // incompat / activation `error` row). getDegradedPlugins() reports only these.
+    // BUT an operator-initiated Kill (Diagnostics) routes through here too (host.kill
+    // sets expectedExit=false to keep a diagnostic row); it must NOT be crash-marked,
+    // or auto-reload would immediately reverse the intentional kill (R5/P2).
+    if (!this.operatorKilling.has(pluginName)) {
+      this.crashedPlugins.add(pluginName);
+    }
     instance.registeredTools = [];
     instance.preSendHooks = [];
     instance.postReceiveHooks = [];
@@ -1668,6 +1769,9 @@ export class PluginManager {
     this.broadcastUIState();
     this.notifyToolsChanged();
     this.notifyCliToolsChanged();
+    // Surface the crash to the recovery banner immediately, even when the renderer
+    // is still alive (no reload) — the plugin is gone until a restart/reconcile.
+    this.broadcastDegraded();
   }
 
   /* ── Unloading ── */
@@ -1729,6 +1833,11 @@ export class PluginManager {
   private async unloadPlugin(pluginName: string): Promise<void> {
     const instance = this.plugins.get(pluginName);
     if (!instance) return;
+
+    // An intentional unload/disable/reload clears any stale crash mark — the
+    // reload path re-adds it only if the fresh process crashes again. Broadcast
+    // the cleared degraded set so a mounted banner drops it immediately (R4/P2).
+    this.clearCrashMark(pluginName);
 
     // Revoke before deactivate(): a backend process may take its full timeout
     // to acknowledge teardown while an already-running turn still holds tool
@@ -1872,6 +1981,11 @@ export class PluginManager {
         const hadRenderer = this.rendererLoadedThisSession.has(pluginName);
 
         await this.unloadPlugin(pluginName);
+        // Disable committed — drop the auto-recovery retry budget so a later
+        // re-enable starts fresh. (unloadPlugin already cleared the crash marker;
+        // doing this only AFTER commit means a rejected disable above leaves the
+        // crash state intact so the banner + retry survive — R6/P2.)
+        this.crashRecoveryAttempts.delete(pluginName);
 
         // Keep a stub so the plugin remains visible (and re-enablable) in the UI.
         this.plugins.set(pluginName, this.createPluginInstance(manifest, dir, 'disabled'));
@@ -2035,6 +2149,15 @@ export class PluginManager {
     return this.plugins.size;
   }
 
+  /** True once the bootstrap loadAll() has completed. main uses this to decide
+   *  whether a renderer's FIRST did-finish-load is the initial bootstrap load
+   *  (skip reconcile) or a post-bootstrap load — including the first GUI window
+   *  promoted after a headless start, whose bootstrap already ran with no
+   *  renderer (R3/P2). */
+  isBootstrapComplete(): boolean {
+    return this.bootstrapComplete;
+  }
+
   listPlugins(): PluginListEntry[] {
     return [...this.plugins.values()].map((instance) => ({
       name: instance.manifest.name,
@@ -2048,6 +2171,285 @@ export class PluginManager {
       permissions: [...instance.manifest.permissions],
       capabilities: [...(instance.manifest.capabilities ?? [])],
     }));
+  }
+
+  /**
+   * Plugins that stopped running UNEXPECTEDLY and should be restarted — the
+   * crash-recovery degraded set. After the window-health monitor force-reloads a
+   * wedged renderer, the plugin utility processes may already be dead, leaving the
+   * fresh renderer with no plugins and no signal.
+   *
+   * A plugin is degraded only when it SHOULD be active (discovered on disk, not
+   * intentionally disabled) AND its backing process is gone: either its host
+   * crashed (tracked in `crashedPlugins` — distinct from the many NON-crash
+   * `state === 'error'` conditions a restart can't fix), or an otherwise-live
+   * instance lost its process host. Reconciled against on-disk discovery so a
+   * dropped-instance crash is caught too.
+   *
+   * Returns [] until bootstrap loadAll() completes — during cold start the map is
+   * still populating, so not-yet-loaded plugins must not be misreported as crashed.
+   */
+  getDegradedPlugins(): string[] {
+    if (!this.bootstrapComplete) return [];
+    const disabled = this.getPersistentlyDisabled();
+    const isIntentionallyDisabled = (name: string) =>
+      (disabled.has(name) || this.sessionDisabled.has(name)) && !this.brandRequiredPluginNamesSet.has(name);
+
+    let discovered: Array<{ manifest: PluginManifest; dir: string }>;
+    try {
+      discovered = this.discoverPlugins();
+    } catch {
+      // A transient directory-read failure (EIO/EMFILE) — discovery is unavailable.
+      // Do NOT clear authoritative crash marks: still report any crash-marked,
+      // not-disabled plugin so the banner survives until discovery recovers (R10/P2).
+      return [...this.crashedPlugins].filter((name) => !isIntentionallyDisabled(name));
+    }
+    const degraded: string[] = [];
+    const seen = new Set<string>();
+    for (const { manifest } of discovered) {
+      const name = manifest.name;
+      seen.add(name);
+      if (isIntentionallyDisabled(name)) continue;
+      const instance = this.plugins.get(name);
+      const hostAlive = this.pluginProcesses.has(name);
+      // A CRASH mark is authoritative — always report it, even mid-transition.
+      if (this.crashedPlugins.has(name)) {
+        degraded.push(name);
+        continue;
+      }
+      // Skip plugins undergoing a normal lifecycle transition (install/enable/
+      // update/unload): loadPlugin briefly holds a 'loading' instance before its
+      // host registers, and unload transiently removes the instance entirely.
+      // Classifying those as crashed would raise a false, possibly-persistent
+      // banner (a successful non-crash activation doesn't broadcast degraded), so
+      // defer to the crash mark above and skip transient states here (R9/P2).
+      if (this.installLocks.has(name) || instance?.state === 'loading') continue;
+      // An instance whose host vanished, or (post-bootstrap) an enabled plugin that
+      // never produced an instance at all. A non-crash `error` row WITH no crash
+      // mark (consent/incompat/activation failure) is NOT degraded — a restart
+      // can't resolve it and it isn't "stopped after recovery".
+      if (instance && instance.state !== 'error' && !hostAlive) {
+        degraded.push(name);
+      } else if (!instance) {
+        degraded.push(name);
+      }
+    }
+    // A PARTIAL/lenient discovery (transient I/O) may omit a directory that is
+    // still authoritatively crash-marked; keep reporting it so the banner + retry
+    // don't vanish until discovery fully recovers (R10/P2).
+    for (const name of this.crashedPlugins) {
+      if (!seen.has(name) && !isIntentionallyDisabled(name)) degraded.push(name);
+    }
+    return degraded;
+  }
+
+  /** Broadcast the current degraded set to ALL surfaces (desktop windows + web
+   *  clients) via broadcastToAllWindows, mirroring pending-restart-changed. Change-
+   *  detected: only emits when the set actually differs from the last broadcast, so
+   *  lifecycle paths can call it freely (including when degradation is INFERRED from
+   *  a missing instance/host with no crash mark — R16/P2) without spamming. */
+  broadcastDegraded(): void {
+    const current = this.getDegradedPlugins();
+    const json = JSON.stringify([...current].sort());
+    if (json === this.lastBroadcastDegradedJson) return;
+    this.lastBroadcastDegradedJson = json;
+    broadcastToAllWindows('plugin:degraded-changed', { plugins: current });
+  }
+
+  /** Clear a plugin's crash marker and publish the (possibly-changed) degraded set.
+   *  Always calls broadcastDegraded (which self-dedups) rather than gating on the
+   *  delete result: a plugin can be degraded purely by INFERENCE (missing instance/
+   *  host, no crash mark), and clearing that inferred state via disable/uninstall/
+   *  restore must still update a mounted banner (R4/P2, R16/P2). */
+  private clearCrashMark(pluginName: string): void {
+    this.crashedPlugins.delete(pluginName);
+    this.broadcastDegraded();
+  }
+
+  /** Fully reset a plugin's crash-recovery state (mark + retry budget). Called on
+   *  EXPLICIT operator actions — disable, uninstall, kill — where the user has
+   *  deliberately taken control, so a later manual re-enable/reinstall should get
+   *  a fresh auto-recovery budget rather than inheriting a burned-out count (R5/P1). */
+  private resetCrashRecovery(pluginName: string): void {
+    this.crashRecoveryAttempts.delete(pluginName);
+    this.clearCrashMark(pluginName);
+  }
+
+  /**
+   * Called from main after a renderer reload/recovery. Re-broadcasts UI state so a
+   * fresh renderer that merely lost its snapshot is repopulated, and best-effort
+   * re-loads any plugin whose host died so they come back without an app restart.
+   * Single-flight (a burst of reloads must not overlap loads). Respects the
+   * app-update freeze — a plugin mid-update is reported as still-degraded, never
+   * force-reloaded. Returns the tri-state result for logging + the banner.
+   */
+  async reconcileAfterRendererReload(): Promise<{
+    recovered: string[];
+    failed: string[];
+    stillDegraded: string[];
+  }> {
+    // Always resync the fresh renderer, even if nothing needs restarting. Force
+    // the replay (bypass dedup): the renderer may have fetched a transient
+    // empty/loading snapshot that happens to match the last broadcast, which the
+    // normal dedup would then swallow (R4/P1).
+    this.forceUIStateReplay();
+
+    if (this.rendererReloadReconcileInFlight) {
+      // A reconcile is already running; it snapshotted its degraded set before any
+      // crash that triggered THIS call, so ask it to run one more pass rather than
+      // dropping the follow-up (R8/P2).
+      this.rendererReloadReconcileRerun = true;
+      return { recovered: [], failed: [], stillDegraded: this.getDegradedPlugins() };
+    }
+    this.rendererReloadReconcileInFlight = true;
+    // Per-plugin FINAL outcome; a later pass overwrites an earlier one so the most
+    // recent state wins (a plugin recovered in pass 1 that re-crashes and fails in a
+    // coalesced pass must report failed, not recovered — R16/P2).
+    const outcomes = new Map<string, 'recovered' | 'failed' | 'stillDegraded'>();
+    // Bound the rerun loop so a pathological stream of overlapping crashes can't
+    // spin it forever; the per-plugin retry cap already limits real reload work.
+    let passesRemaining = MAX_CRASH_RECOVERY_ATTEMPTS + 1;
+    try {
+      // Re-run while overlapping callers requested a follow-up pass, so a plugin
+      // that crashed mid-reconcile still gets recovered without another reload.
+      // Accumulate results across passes; a later pass's outcome for the same
+      // plugin supersedes an earlier one (dedup on return).
+      do {
+        this.rendererReloadReconcileRerun = false;
+        const degraded = this.getDegradedPlugins();
+        if (degraded.length === 0) continue;
+
+        for (const name of degraded) {
+          // Don't fight an in-progress app update: reload after it settles.
+          if (this.updateFreezeActive || this.isUpdateDeferred(name)) {
+            outcomes.set(name, 'stillDegraded');
+            continue;
+          }
+          // Cap automatic retries: a plugin that activates then keeps crashing would
+          // otherwise loop crash → renderer-reload → reconcile → crash forever. After
+          // the cap, leave it degraded (banner persists) and stop auto-reloading it;
+          // the user restarts or disables it. Counter resets on genuine recovery or an
+          // intentional disable/uninstall/kill (R5/P1). Cheap pre-lock gate; the
+          // authoritative increment happens INSIDE the lock only for a real reload
+          // attempt, so a skipped/raced pass never burns the budget (R7/P2).
+          if ((this.crashRecoveryAttempts.get(name) ?? 0) >= MAX_CRASH_RECOVERY_ATTEMPTS) {
+            outcomes.set(name, 'stillDegraded');
+            continue;
+          }
+          try {
+            // 'reloaded' | 'skipped' — decided INSIDE the lock so a concurrent
+            // uninstall/disable that removed the host (making the plugin look
+            // transiently degraded) can't make us reload a stale manifest into a
+            // ghost error instance after its directory is gone (R3/P2).
+            const outcome = await this.withInstallLock(name, async (): Promise<'reloaded' | 'skipped'> => {
+              this.assertNotFrozen(name);
+              // A concurrent disable/uninstall may have committed while we waited for
+              // the lock, leaving a disabled stub with no host that would otherwise
+              // look degraded. Recheck intentional-disable INSIDE the lock so we don't
+              // burn a retry attempt (or reload) on a plugin the user just disabled;
+              // clear its recovery state so a later re-enable starts fresh (R13/P2).
+              const nowDisabled =
+                (this.getPersistentlyDisabled().has(name) || this.sessionDisabled.has(name)) &&
+                !this.brandRequiredPluginNamesSet.has(name);
+              if (nowDisabled) {
+                this.resetCrashRecovery(name);
+                return 'skipped';
+              }
+              // Re-discover + re-check degradation now that we hold the lock. A strict
+              // probe distinguishes TRANSIENT failure (keep the crash mark) from a
+              // genuine uninstall (clear it), WITHOUT clobbering the startup discovery
+              // latch (R12/P2, R13/P1).
+              const probe = this.probeDiscoveryForReconcile(name);
+              const foundNow = probe.found;
+              if (!foundNow) {
+                // TRUE removal only when the probe was conclusive (discovery succeeded
+                // and was complete). An inconclusive probe (transient/partial) keeps the
+                // crash mark so the banner/retry survive until discovery recovers.
+                if (!probe.inconclusive) this.resetCrashRecovery(name);
+                return 'skipped';
+              }
+              // Re-check the degradation condition WITHOUT the install-lock transition
+              // guard — getDegradedPlugins() would now skip this plugin precisely
+              // because WE hold its lock (R9/P2), so consult the raw condition instead:
+              // still crash-marked, or an instance/host that's actually gone.
+              const inst = this.plugins.get(name);
+              const stillDegraded =
+                this.crashedPlugins.has(name) || !inst || (inst.state !== 'error' && !this.pluginProcesses.has(name));
+              if (!stillDegraded) return 'skipped';
+              // A real reload attempt is now committed — count it against the retry
+              // budget (only here, so a skipped/raced pass never burns it, R7/P2).
+              this.crashRecoveryAttempts.set(name, (this.crashRecoveryAttempts.get(name) ?? 0) + 1);
+              // Clear any stale instance/host (error row or dead process) before reload.
+              if (this.plugins.has(name) || this.pluginProcesses.has(name)) {
+                await this.unloadPlugin(name);
+              }
+              await this.loadPlugin(foundNow.manifest, foundNow.dir);
+              return 'reloaded';
+            });
+            if (outcome === 'skipped') {
+              // No longer our problem (gone or already healthy) — don't re-mark.
+              continue;
+            }
+            // Recovery counts only if a LIVE host is now established. A reload that
+            // lands on a disabled stub or an (unmarked) error row did NOT recover —
+            // and because unloadPlugin() cleared the crash marker and loadPlugin()
+            // usually swallows activation errors into a plain `state === 'error'`
+            // row, we must RE-MARK it as crashed so it stays in the degraded set and
+            // is retried on the next reload rather than silently disappearing (R2/P1).
+            const after = this.plugins.get(name);
+            const liveHost = this.pluginProcesses.has(name);
+            if (after && after.state !== 'error' && after.state !== 'disabled' && liveHost) {
+              // A frontend plugin whose renderer replacement FAILED during the crash
+              // is still held in rendererRevocations — leaving it suppressed in
+              // getUIState / asset resolution / inference-provider selection even
+              // though it's now healthy. This reconcile runs AFTER a completed
+              // renderer load, so it's safe to release the stale revocation and let
+              // the recovered plugin surface (R4/P1).
+              if (this.rendererRevocations.has(name)) {
+                this.acknowledgeRendererUnload(name);
+              }
+              // Republish tool + CLI-tool registries. loadPlugin's registration-time
+              // notify fired while the instance was still 'loading' (so getPluginCliTools
+              // filtered it out); now that it's active, notify again or the recovered
+              // plugin's contributed CLI tools stay missing until another reload (R11/P2).
+              this.notifyToolsChanged();
+              this.notifyCliToolsChanged();
+              outcomes.set(name, 'recovered');
+            } else {
+              if (after?.state !== 'disabled') this.crashedPlugins.add(name);
+              outcomes.set(name, 'stillDegraded');
+            }
+          } catch (error) {
+            // The reload threw (activation error, freeze race). Keep the plugin marked
+            // crashed so the banner persists and a later reload retries it.
+            this.crashedPlugins.add(name);
+            outcomes.set(name, 'failed');
+            console.error(`[PluginManager] Crash-recovery reload of "${name}" failed:`, error);
+          }
+        }
+      } while (this.rendererReloadReconcileRerun && --passesRemaining > 0);
+
+      // Force replay (bypass dedup): the fresh renderer may have fetched UI state
+      // during a transient empty/loading window; a byte-identical post-reconcile
+      // snapshot would otherwise be deduped and never reach it (R4/P1).
+      this.forceUIStateReplay();
+      // Build the result from each plugin's FINAL (latest-pass) outcome so a plugin
+      // that recovered then re-crashed reports its current state, not the stale one.
+      const recovered: string[] = [];
+      const failed: string[] = [];
+      const stillDegraded: string[] = [];
+      for (const [name, outcome] of outcomes) {
+        if (outcome === 'recovered') recovered.push(name);
+        else if (outcome === 'failed') failed.push(name);
+        else stillDegraded.push(name);
+      }
+      return { recovered, failed, stillDegraded };
+    } finally {
+      this.rendererReloadReconcileInFlight = false;
+      // A leftover rerun request (e.g. passesRemaining hit its cap) must not leak
+      // into the next reconcile; the next did-finish-load will re-evaluate fresh.
+      this.rendererReloadReconcileRerun = false;
+    }
   }
 
   getPluginInstance(pluginName: string): PluginInstance | null {
@@ -2100,7 +2502,18 @@ export class PluginManager {
       this.assertNotFrozen(pluginName);
       const host = this.pluginProcesses.get(pluginName);
       if (!host) throw new Error(`Plugin "${pluginName}" has no running process`);
-      await host.kill();
+      // Mark this as an operator kill so the resulting unexpected-exit handler
+      // doesn't crash-mark it and auto-reload reverse the kill (R5/P2). Cleared in
+      // a finally so a failed kill doesn't permanently suppress future crash marks.
+      this.operatorKilling.add(pluginName);
+      try {
+        await host.kill();
+      } finally {
+        this.operatorKilling.delete(pluginName);
+      }
+      // Explicit operator kill — reset any auto-recovery retry budget so a later
+      // manual re-enable starts fresh (R5/P1). The kill itself is not crash-marked.
+      this.resetCrashRecovery(pluginName);
     });
   }
 
@@ -3139,6 +3552,17 @@ export class PluginManager {
     };
   }
 
+  /** Force an immediate UI-state broadcast that BYPASSES the dedup + debounce.
+   *  A freshly reloaded renderer may have fetched plugin:get-ui-state during a
+   *  transient empty/loading window; if the post-reconcile snapshot happens to be
+   *  byte-identical to what was last broadcast to the OLD renderer, the normal
+   *  dedup would send nothing and leave the new renderer stuck on the transient
+   *  snapshot (R4/P1). Resetting lastBroadcastUIStateJson guarantees the replay. */
+  private forceUIStateReplay(): void {
+    this.lastBroadcastUIStateJson = '';
+    this.flushUIStateBroadcast();
+  }
+
   private broadcastUIState(): void {
     // Coalesce bursts (e.g. several plugins publishing state in the same tick, or
     // a plugin updating state rapidly) into a single emit on the next tick.
@@ -3758,6 +4182,12 @@ export class PluginManager {
     const hadPriorRenderer = this.rendererLoadedThisSession.has(pluginName);
 
     await this.unloadPlugin(pluginName);
+    // A new plugin GENERATION is being installed — the retry budget is keyed by
+    // name and would otherwise carry an exhausted count from the OLD version,
+    // immediately excluding a fixed version's first crash from recovery. Reset it
+    // on the install/update commit (but NOT on automatic reloads, which reuse the
+    // same version and must keep counting) (R8/P2).
+    this.crashRecoveryAttempts.delete(pluginName);
 
     const loadFromDisk = async () => {
       const found = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
@@ -3919,6 +4349,13 @@ export class PluginManager {
       return this.withRendererReplacementForUpdate(pluginName, async () => {
         await this.unloadPlugin(pluginName);
         this.marketplaceService!.uninstallPlugin(pluginName);
+        // Uninstall committed — fully reset recovery state. Use resetCrashRecovery
+        // (not a bare attempts-delete) because unloadPlugin() early-returns when the
+        // plugin has NO in-memory instance — a case getDegradedPlugins() supports —
+        // so its clearCrashMark wouldn't run and a backend-only uninstall would leave
+        // a stale crash mark + banner up until another reload (R14/P2). Post-commit
+        // only, so a rejected uninstall above keeps crash state intact (R6/P2).
+        this.resetCrashRecovery(pluginName);
         // Clear every piece of lifecycle state before releasing the same lock
         // used by install/update/disable. A replacement install must not start
         // and then have this uninstall's delayed cleanup mutate its generation.

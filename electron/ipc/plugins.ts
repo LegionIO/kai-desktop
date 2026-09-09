@@ -271,6 +271,10 @@ export function registerPluginHandlers(
     return pluginManager.getPendingRestart();
   });
 
+  ipcMain.handle('plugin:degraded', () => {
+    return pluginManager.getDegradedPlugins();
+  });
+
   ipcMain.handle('plugin:failed-updates', () => {
     return pluginManager.getFailedUpdates();
   });

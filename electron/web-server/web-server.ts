@@ -525,6 +525,7 @@ export function getBridgeScript(): string {
       marketplaceRefresh: function() { return invoke('plugin:marketplace-refresh'); },
       getAvailableUpdateCount: function() { return invoke('plugin:available-update-count'); },
       getPendingRestart: function() { return invoke('plugin:pending-restart'); },
+      getDegradedPlugins: function() { return invoke('plugin:degraded'); },
       restartApp: function() { return invoke('plugin:restart-app'); },
       getFailedUpdates: function() { return invoke('plugin:failed-updates'); },
       approveConsent: function(pn, expectedFileHash) { return invoke('plugin:approve-consent', pn, expectedFileHash); },
@@ -537,6 +538,7 @@ export function getBridgeScript(): string {
       onModalCallback: function(cb) { return on('plugin:modal-callback', cb); },
       onUpdatesAvailable: function(cb) { return on('plugin:updates-available', cb); },
       onPendingRestartChanged: function(cb) { return on('plugin:pending-restart-changed', cb); },
+      onDegradedChanged: function(cb) { return on('plugin:degraded-changed', cb); },
       onMarketplaceReady: function(cb) { return on('plugin:marketplace-ready', cb); },
       onFailedUpdatesChanged: function(cb) { return on('plugin:failed-updates-changed', cb); },
       onConsentRequired: function(cb) { return on('plugin:consent-required', cb); }

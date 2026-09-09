@@ -36,6 +36,7 @@ describe('plugin process control IPC', () => {
       catalog: [],
       status: { configured: true, ready: false, reachable: false, catalogSize: 0 },
     })),
+    getDegradedPlugins: vi.fn(() => ['msgraph', 'rally']),
   } as unknown as PluginManager;
   const webContentsListeners = new Map<string, Set<(...args: unknown[]) => void>>();
   const loadURL = vi.fn(async () => undefined);
@@ -138,6 +139,11 @@ describe('plugin process control IPC', () => {
       status: { configured: true, ready: false, reachable: false, catalogSize: 0 },
     });
     expect(manager.getMarketplaceSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards plugin:degraded to PluginManager.getDegradedPlugins', () => {
+    expect(handlers.get('plugin:degraded')?.({})).toEqual(['msgraph', 'rally']);
+    expect(manager.getDegradedPlugins).toHaveBeenCalledTimes(1);
   });
 
   it('delegates disable and uninstall so PluginManager can hold its lifecycle lock across renderer replacement', async () => {

@@ -31,6 +31,7 @@ import { ThreadSettingsModal } from '@/components/conversations/ThreadSettingsMo
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginModalHost } from '@/components/plugins/PluginModalHost';
+import { PluginCrashRecoveryBanner } from '@/components/plugins/PluginCrashRecoveryBanner';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { PermissionConsentModal } from '@/components/plugins/PermissionConsentModal';
 import { PluginErrorBoundary } from '@/components/plugins/PluginErrorBoundary';
@@ -3286,6 +3287,7 @@ function AppShell() {
                 {/* Main content area */}
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                   <UpdateCard />
+                  <PluginCrashRecoveryBanner />
                   {/* Interactive title bar */}
                   <div
                     onDoubleClick={() => window.app?.titlebar.doubleClick()}

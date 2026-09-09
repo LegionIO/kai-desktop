@@ -810,6 +810,14 @@ protocol.registerSchemesAsPrivileged([
 
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
+// Cleared once the bootstrap renderer load completes. The very first renderer
+// load in the app's lifetime coincides with plugin loadAll(); every SUBSEQUENT
+// renderer load — an in-place reload OR a freshly recreated window (health
+// recovery, re-open after all-closed, idle-shutdown reopen) — is a reload where
+// plugins may already be dead, so it should trigger crash-recovery reconcile.
+// App-global (NOT per-window): a recreated window's FIRST load is still a reload
+// of an app that already booted, which is exactly the overnight failure case.
+let bootstrapRendererLoadComplete = false;
 // True if the early bundled-plugin bootstrap could NOT confirm/install a bundled
 // plugin this launch due to a transient filesystem failure (R46P1#structured). A
 // required plugin may then be absent/old at loadAll, so an app update could bypass its
@@ -1294,6 +1302,43 @@ function createWindow(): BrowserWindow {
     mainWindow.webContents.on('page-favicon-updated', restoreMacDockIconAfterRendererIconUpdates);
     mainWindow.webContents.on('did-finish-load', restoreMacDockIconAfterRendererIconUpdates);
   }
+
+  // Plugin crash-recovery reconcile. The window-health monitor force-reloads a
+  // wedged renderer via webContents.reload() with no callback, and health recovery
+  // may recreate the window entirely; either way the plugin utility processes may
+  // already be dead, leaving the fresh renderer with no plugins and — until this
+  // hook — no signal. did-finish-load is the reliable "renderer is back" edge for
+  // EVERY reload path. Skip reconcile ONLY for the genuine bootstrap load — the
+  // first renderer load that coincides with loadAll still running/just-finished.
+  // Any later load reconciles (a no-op when healthy, a recovery when not). We also
+  // reconcile the FIRST load when plugin bootstrap ALREADY completed before it —
+  // i.e. the first GUI window promoted after a headless start, whose loadAll ran
+  // with no renderer (R3/P2).
+  mainWindow.webContents.on('did-finish-load', () => {
+    const pm = pluginManagerRef;
+    if (!bootstrapRendererLoadComplete) {
+      bootstrapRendererLoadComplete = true;
+      // Bootstrap-with-no-renderer already finished (headless→GUI): treat this
+      // first GUI load as a reload and reconcile. Otherwise it's the normal
+      // bootstrap load — skip.
+      if (!pm || !pm.isBootstrapComplete()) return;
+    }
+    if (!pm) return;
+    void pm
+      .reconcileAfterRendererReload()
+      .then((result) => {
+        if (result.recovered.length || result.failed.length || result.stillDegraded.length) {
+          console.info(
+            `[${__BRAND_PRODUCT_NAME}] plugin crash-recovery: recovered=${result.recovered.length} ` +
+              `failed=${result.failed.length} stillDegraded=${result.stillDegraded.length}`,
+          );
+        }
+        // Fan out to ALL surfaces (desktop windows + web clients), not just this
+        // one webContents — a connected web UI needs the post-recovery set too.
+        pm.broadcastDegraded();
+      })
+      .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] plugin crash-recovery reconcile failed:`, err));
+  });
 
   // Sync titleBarOverlay colors when the system/user theme changes (Windows only)
   if (IS_WIN) {
