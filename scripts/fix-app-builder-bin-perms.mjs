@@ -3,51 +3,54 @@
 //
 // We pin app-builder-bin to 4.2.0 via pnpm.overrides because electron-builder's
 // default (app-builder-bin@5.0.0-alpha.12) is blocked by the Optum JFrog Xray
-// download policy (see build(deps) commit). Unlike the 5.x alpha tarball, the
+// download policy (see build(deps) commits). Unlike the 5.x alpha tarball, the
 // 4.2.0 tarball stores its `app-builder` binaries WITHOUT the execute bit and
-// ships no postinstall, so electron-builder fails at package time with
-// `spawn .../app-builder EACCES`. Restore +x here after every install.
+// ships no postinstall, so electron-builder fails at package time with:
+//   ⨯ spawn .../app-builder-bin@4.2.0/.../linux/x64/app-builder EACCES
 //
-// Best-effort and idempotent: missing files / non-app-builder-bin layouts are
-// skipped silently so this never breaks an install on an unrelated version.
-import { chmodSync, existsSync, statSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+// This runs both as a `postinstall` AND immediately before each electron-builder
+// invocation (build:linux/mac/win) — the latter is the reliable one, because
+// pnpm's content-addressable hardlink relinking can undo a postinstall chmod, and
+// the store layout (hoisted vs isolated `.pnpm`) may place multiple physical
+// copies. So rather than resolving a single path, we walk node_modules and chmod
+// EVERY `app-builder` binary we find. Best-effort + idempotent.
+import { chmodSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
-function resolveAppBuilderBinDir() {
+// Binary basenames app-builder-bin ships (Linux/mac; Windows .exe needs no chmod).
+const BINARY_NAMES = new Set(['app-builder', 'app-builder_amd64', 'app-builder_arm64']);
+
+let chmodded = 0;
+
+function walk(dir, depth) {
+  // Bound recursion: these binaries live at node_modules/**/app-builder-bin/<os>/<arch>/…,
+  // never deep. Cap depth to keep this fast on a large tree.
+  if (depth > 8) return;
+  let entries;
   try {
-    const require = createRequire(import.meta.url);
-    // Resolves to <pkg>/index.js regardless of hoisted vs isolated layout.
-    return dirname(require.resolve('app-builder-bin'));
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    return null;
+    return;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    try {
+      if (entry.isDirectory()) {
+        // Skip nested node_modules of unrelated packages only shallowly — app-builder-bin
+        // may itself be nested, so we DO descend into node_modules dirs.
+        walk(full, depth + 1);
+      } else if (entry.isFile() && BINARY_NAMES.has(entry.name) && full.includes('app-builder-bin')) {
+        const mode = statSync(full).mode;
+        chmodSync(full, mode | 0o111); // u+x,g+x,o+x
+        chmodded += 1;
+      }
+    } catch {
+      /* best-effort per entry */
+    }
   }
 }
 
-const binDir = resolveAppBuilderBinDir();
-if (binDir) {
-  // Every prebuilt binary the package ships, across platforms/arches. We chmod
-  // all of them (cheap) rather than just the current platform so a cross-platform
-  // CI matrix that shares a checkout is covered.
-  const candidates = [
-    'linux/x64/app-builder',
-    'linux/arm64/app-builder',
-    'linux/arm/app-builder',
-    'linux/ia32/app-builder',
-    'linux/riscv64/app-builder',
-    'mac/app-builder_amd64',
-    'mac/app-builder_arm64',
-    // .exe files are executable by extension on Windows; no chmod needed.
-  ];
-  for (const rel of candidates) {
-    const p = join(binDir, rel);
-    try {
-      if (!existsSync(p)) continue;
-      const mode = statSync(p).mode;
-      // Add u+x,g+x,o+x (0o111) on top of existing perms.
-      chmodSync(p, mode | 0o111);
-    } catch {
-      /* best-effort per binary */
-    }
-  }
+walk('node_modules', 0);
+if (chmodded > 0) {
+  console.info(`[fix-app-builder-bin-perms] set +x on ${chmodded} app-builder binary(ies)`);
 }
