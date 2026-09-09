@@ -122,6 +122,41 @@ describe('required plugin Browser consent', () => {
       'Plugin permission approval is required before it can be loaded.',
     );
   });
+
+  it('auto-approves a brand-required authenticated-Browser plugin with no consent dialog', () => {
+    let config: Record<string, unknown> = {};
+    const manager = new PluginManager(
+      '/tmp/plugins-test',
+      '/tmp/app-home-test',
+      () => config as never,
+      (path: string, value: unknown) => {
+        config = { ...config, [path]: value };
+      },
+      ['required-ui'],
+      vi.fn(),
+    );
+    const manifest = {
+      name: 'required-ui',
+      displayName: 'Required UI',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      isRequiredPluginIntegrityTrusted: () => boolean;
+      ensurePluginApproved: (m: typeof manifest, fileHash: string, dir: string) => boolean;
+      pendingConsent: Map<string, unknown>;
+    };
+    // Isolate the consent decision from integrity (covered elsewhere): trust integrity.
+    internal.isRequiredPluginIntegrityTrusted = () => true;
+
+    const approved = internal.ensurePluginApproved(manifest, 'trusted-hash', '/tmp/plugins-test/required-ui');
+
+    expect(approved).toBe(true);
+    expect(internal.pendingConsent.size).toBe(0);
+    expect(broadcastToAllWindows).not.toHaveBeenCalledWith('plugin:consent-required', expect.anything());
+    expect((config.pluginApprovals as Record<string, unknown>)?.['required-ui']).toBeTruthy();
+  });
 });
 
 describe('frontend update revocation', () => {

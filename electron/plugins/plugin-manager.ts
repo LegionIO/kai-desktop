@@ -739,14 +739,10 @@ export class PluginManager {
         return false;
       }
       if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
-        if (manifest.permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) {
-          this.pendingConsent.set(manifest.name, { manifest, fileHash });
-          broadcastToAllWindows('plugin:consent-required', this.buildConsentRequest(manifest, fileHash));
-          console.info(
-            `[PluginManager] Required plugin "${manifest.name}" needs consent for authenticated Browser access`,
-          );
-          return false;
-        }
+        // Brand-required plugins are fully trusted: auto-approve every
+        // permission (including authenticated Browser access) with no consent
+        // dialog, on first install and on every subsequent update. Integrity is
+        // still verified above and fails closed.
         this.persistPluginApproval(manifest.name, fileHash, manifest.permissions);
       }
       return true;
@@ -1022,9 +1018,9 @@ export class PluginManager {
       // (R31P2). Rejecting it would leave the owed plugin unloadable — its cleanup
       // hook never registers, installs stay blocked, and the debt is discarded at
       // the give-up cap. The hash+version already match the approved generation, so
-      // this is the same trusted code; and because the added permission IS the
-      // authenticated-Browser one, `ensurePluginApproved` still gates activation
-      // behind a fresh consent prompt — integrity tolerance never bypasses consent.
+      // this is the same trusted code. Brand-required plugins are fully trusted and
+      // `ensurePluginApproved` auto-approves all of their permissions (including the
+      // authenticated-Browser one) with no consent prompt.
       const permsOk = deferred
         ? deferredPermissionsTrusted(installedInfo.permissions, manifest.permissions, 'exact')
         : !!installedInfo.permissions && arePermissionSetsEqual(installedInfo.permissions, manifest.permissions);
@@ -1064,12 +1060,12 @@ export class PluginManager {
    * Permission-snapshot handling mirrors the marketplace branch, PLUS the legacy
    * hash-ONLY approval that predates permission snapshots entirely (`permissions`
    * undefined — R33P3): a hash match proves it's the approved code, so trust it for
-   * INTEGRITY and let consent gate activation. `ensurePluginApproved` re-prompts
-   * whenever the manifest carries `browser:authenticated-session` (the only permission
-   * the host infers), so this never activates un-consented Browser access — it just
-   * lets the preserved generation LOAD far enough to reach the consent gate and
-   * register its cleanup hook. A modern approval WITH a snapshot still goes through
-   * `deferredPermissionsTrusted` (exact match OR the narrow inferred-Browser delta).
+   * INTEGRITY. Brand-required plugins are fully trusted, so `ensurePluginApproved`
+   * auto-approves all of their permissions (including `browser:authenticated-session`,
+   * the only permission the host infers) with no consent prompt — this just lets the
+   * preserved generation LOAD far enough to register its cleanup hook. A modern
+   * approval WITH a snapshot still goes through `deferredPermissionsTrusted` (exact
+   * match OR the narrow inferred-Browser delta).
    */
   private isDeferredBundledApprovalTrusted(manifest: PluginManifest, fileHash: string): boolean {
     const approval = this.getConfig().pluginApprovals?.[manifest.name];

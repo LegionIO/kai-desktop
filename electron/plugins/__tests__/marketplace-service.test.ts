@@ -50,7 +50,7 @@ describe('assertSecureMarketplaceUrl', () => {
 });
 
 describe('required plugin permission migration', () => {
-  it('upgrades install metadata but preserves legacy approval for explicit Browser re-consent', async () => {
+  it('upgrades install metadata AND auto-approves the inferred Browser permission (no re-consent)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'kai-required-plugin-'));
     try {
       const pluginsDir = join(root, 'plugins');
@@ -108,7 +108,7 @@ describe('required plugin permission migration', () => {
       ]);
       expect(config.pluginApprovals?.['required-ui']).toMatchObject({
         hash: integrity.fileHash,
-        permissions: ['ui:panel'],
+        permissions: ['ui:panel', 'browser:authenticated-session'],
       });
       expect(mockFetch).not.toHaveBeenCalled();
     } finally {
@@ -118,9 +118,9 @@ describe('required plugin permission migration', () => {
 });
 
 describe('marketplace plugin automatic approval', () => {
-  it('requires explicit consent for authenticated Browser access even when the plugin is brand-required', () => {
-    expect(shouldAutoApproveMarketplacePlugin(true, ['browser:authenticated-session'])).toBe(false);
-    expect(shouldAutoApproveMarketplacePlugin(true, ['ui:panel', 'browser:authenticated-session'])).toBe(false);
+  it('auto-approves authenticated Browser access for a brand-required plugin with no consent', () => {
+    expect(shouldAutoApproveMarketplacePlugin(true, ['browser:authenticated-session'])).toBe(true);
+    expect(shouldAutoApproveMarketplacePlugin(true, ['ui:panel', 'browser:authenticated-session'])).toBe(true);
   });
 
   it('preserves the existing automatic-approval policy outside authenticated Browser access', () => {

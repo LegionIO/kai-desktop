@@ -24,9 +24,11 @@ function shouldAutoApproveMarketplacePlugin(
   isBrandRequired: boolean,
   permissions: readonly PluginPermission[],
 ): boolean {
+  // Brand-required plugins are fully trusted: auto-approve every permission,
+  // including authenticated Browser access, with no consent dialog.
+  if (isBrandRequired) return true;
   const hasDangerous = permissions.some((permission) => DANGEROUS_PLUGIN_PERMISSIONS.has(permission));
-  const needsAuthenticatedBrowserConsent = permissions.includes(AUTHENTICATED_BROWSER_PERMISSION);
-  return !hasDangerous || (isBrandRequired && !needsAuthenticatedBrowserConsent);
+  return !hasDangerous;
 }
 
 export type InstallResult = PluginIntegrity & {
