@@ -2,3 +2,8 @@
 # so it is not valid YAML until generation and prettier cannot parse it.
 electron-builder.template.yml
 electron-builder.yml
+
+# pnpm writes this file in its own canonical format; prettier's *.yaml rule
+# rewrites every resolution into flow-mapping style (a ~6.7k-line diff) and the
+# next pnpm install reverts it. Leave it to pnpm.
+pnpm-lock.yaml
