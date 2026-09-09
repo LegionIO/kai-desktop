@@ -29,6 +29,7 @@
     "build:mac": "pnpm generate:dmg-bg && pnpm build && node scripts/build-plugin-sea-host.mjs --targets darwin-arm64,darwin-x64 && pnpm generate:builder && pnpm assert:update-verification && node scripts/fix-app-builder-bin-perms.mjs && electron-builder --mac --publish never --config",
     "build:win": "pnpm build && pnpm generate:builder && pnpm assert:update-verification && node scripts/fix-app-builder-bin-perms.mjs && electron-builder --win --publish never --config",
     "build:linux": "pnpm build && pnpm generate:builder && node scripts/fix-app-builder-bin-perms.mjs && electron-builder --linux --publish never --config",
+    "build:linux:deb": "pnpm build && pnpm generate:builder && node scripts/fix-app-builder-bin-perms.mjs && electron-builder --linux deb --publish never --config",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
