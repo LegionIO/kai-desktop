@@ -50,7 +50,8 @@
     "test:browser:local": "playwright test --config playwright.browser.config.ts",
     "validate:linux-cli": "docker run --rm -v \"$PWD/bin:/work/bin:ro\" -v \"$PWD/scripts/validate-linux-launcher.sh:/validate.sh:ro\" debian:stable-slim sh /validate.sh",
     "smoke:cli:linux": "sh scripts/smoke-cli-linux.sh",
-    "prepare": "husky"
+    "prepare": "husky",
+    "postinstall": "node scripts/fix-app-builder-bin-perms.mjs"
   },
   "devDependencies": {
     "@electron/fuses": "^1.8.0",
