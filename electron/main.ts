@@ -4078,6 +4078,20 @@ app.on('before-quit', (event) => {
         browserShutdownComplete = true;
         quitDiagSession?.mark('browser-shutdown-complete-issuing-second-quit');
         app.quit();
+        // macOS footgun: after the first quit's event.preventDefault() returned
+        // the app to resident state with its window already destroyed, this
+        // second app.quit() often no-ops instead of advancing to will-quit —
+        // leaving the app parked in the dock until a THIRD quit arrives (the
+        // observed "needs two quits" bug; the event loop has already drained to
+        // zero handles by this point, so it is NOT a handle leak). Force an
+        // unconditional exit shortly after so the first quit actually
+        // terminates. Unref'd so it can never itself hold the loop open, and
+        // short enough to feel instant; if app.quit() DID progress cleanly, the
+        // process is already gone before this fires.
+        setTimeout(() => {
+          quitDiagSession?.mark('force-exit-after-quit-noop');
+          app.exit(0);
+        }, 250).unref();
       });
   }
 });
