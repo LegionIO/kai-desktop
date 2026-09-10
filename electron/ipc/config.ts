@@ -344,6 +344,7 @@ function getDefaultConfig() {
         },
       },
       rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },
+      quitDiagnostics: { enabled: false, logMaxBytes: 5242880 },
     },
     advanced: {
       temperature: 0.4,

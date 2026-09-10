@@ -525,6 +525,8 @@ type AppAPI = {
       windowHealthLogSizeBytes: number;
       debugTracePath: string;
       debugTraceSizeBytes: number;
+      quitDiagnosticsLogPath: string;
+      quitDiagnosticsLogSizeBytes: number;
       sinceBoot: string;
       totalErrors: number;
       counters: Array<{
@@ -562,6 +564,8 @@ type AppAPI = {
     clearWindowHealthLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
     tailDebugTrace: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
     clearDebugTrace: () => Promise<{ success: boolean; logSizeBytes: number }>;
+    tailQuitDiagnosticsLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
+    clearQuitDiagnosticsLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
     resetCounters: () => Promise<{ success: boolean }>;
   };
   plans: {

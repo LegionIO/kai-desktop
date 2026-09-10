@@ -21,6 +21,8 @@ export interface DiagnosticsSummary {
   windowHealthLogSizeBytes: number;
   debugTracePath: string;
   debugTraceSizeBytes: number;
+  quitDiagnosticsLogPath: string;
+  quitDiagnosticsLogSizeBytes: number;
   sinceBoot: string;
   totalErrors: number;
   counters: DiagnosticCounter[];
@@ -43,6 +45,7 @@ export function registerDiagnosticsHandlers(
   ipcMain: IpcMain,
   mainProcessLogPath: string,
   windowHealthLogPath: string,
+  quitDiagnosticsLogPath: string,
 ): void {
   ipcMain.handle('diagnostics:get-summary', async (): Promise<DiagnosticsSummary> => {
     await refreshPluginProcessPrivateMemory();
@@ -54,6 +57,8 @@ export function registerDiagnosticsHandlers(
       windowHealthLogSizeBytes: logSize(windowHealthLogPath),
       debugTracePath: getDiagnosticTracePath(),
       debugTraceSizeBytes: logSize(getDiagnosticTracePath()),
+      quitDiagnosticsLogPath,
+      quitDiagnosticsLogSizeBytes: logSize(quitDiagnosticsLogPath),
       sinceBoot: getDiagnosticsBootTs(),
       totalErrors: counters.reduce((sum, c) => sum + c.count, 0),
       counters,
@@ -103,6 +108,25 @@ export function registerDiagnosticsHandlers(
       /* noop */
     }
     return { success: true, logSizeBytes: logSize(windowHealthLogPath) };
+  });
+
+  ipcMain.handle('diagnostics:tail-quit-diagnostics-log', async (_event, maxBytes?: number) => {
+    const cap = Math.min(TAIL_MAX_BYTES, Math.max(1024, typeof maxBytes === 'number' ? maxBytes : TAIL_MAX_BYTES));
+    return readLogTail(quitDiagnosticsLogPath, cap);
+  });
+
+  ipcMain.handle('diagnostics:clear-quit-diagnostics-log', async () => {
+    try {
+      writeFileSync(quitDiagnosticsLogPath, '');
+    } catch {
+      /* file may not exist */
+    }
+    try {
+      rmSync(`${quitDiagnosticsLogPath}.1`, { force: true });
+    } catch {
+      /* noop */
+    }
+    return { success: true, logSizeBytes: logSize(quitDiagnosticsLogPath) };
   });
 
   ipcMain.handle('diagnostics:clear-debug-trace', async () => {

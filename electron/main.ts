@@ -42,6 +42,7 @@ import {
 } from './diagnostics/main-diagnostics.js';
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
+import { beginQuitDiagnostics, type QuitDiagnosticsSession } from './diagnostics/quit-diagnostics.js';
 import { captureHeapSnapshot } from './diagnostics/heap-snapshot.js';
 import { makeCdpHeapSnapshotTake } from './diagnostics/heap-snapshot-cdp.js';
 import { initDiagnosticTrace, sweepDiagnosticTraceRetention, traceDiagnostic } from './diagnostics/debug-trace.js';
@@ -499,6 +500,7 @@ let hasEverBeenWindowed = !IS_HEADLESS;
 
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
 const WINDOW_HEALTH_LOG = join(APP_HOME, 'logs', 'window-health.log');
+const QUIT_DIAGNOSTICS_LOG = join(APP_HOME, 'logs', 'quit-diagnostics.log');
 
 // Wall-clock of the last system resume / screen unlock, used to timestamp how
 // long after a wake the renderer crashed (the crash correlates with long idle +
@@ -838,6 +840,9 @@ let taskDispatcherRef: TaskDispatcher | null = null;
 let closeSettingsWatchersRef: (() => void) | null = null;
 let quitCleanupStarted = false;
 let browserShutdownComplete = false;
+// Opt-in quit instrumentation session (null when the toggle is off, or before
+// the first quit). Every call site treats null as a no-op.
+let quitDiagSession: QuitDiagnosticsSession | null = null;
 
 function ensureAppHome(): void {
   const dirs = [
@@ -2266,7 +2271,7 @@ if (gotSingleInstanceLock) {
     registerShellHandlers(ipcMain);
     registerBrowserHandlers(ipcMain, () => primaryWindowRef, isPrimaryRendererUrl);
     registerPartitionHandlers(ipcMain);
-    registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG, WINDOW_HEALTH_LOG);
+    registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG, WINDOW_HEALTH_LOG, QUIT_DIAGNOSTICS_LOG);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
@@ -3995,22 +4000,57 @@ app.on('before-quit', (event) => {
   // second quit that passes straight through. This also remains bounded by the
   // existing hard-exit fallbacks used by headless/update shutdown paths.
   if (!browserShutdownComplete) event.preventDefault();
-  if (quitCleanupStarted) return;
+  if (quitCleanupStarted) {
+    // The second (pass-through) quit request after cleanup finished. Recorded so
+    // the log shows the graceful two-phase quit reached its intended second pass.
+    quitDiagSession?.mark('second-quit-passthrough', { browserShutdownComplete });
+    return;
+  }
   quitCleanupStarted = true;
+  // Open the opt-in quit-diagnostics session (null when the toggle is off, so
+  // every session?.* below is a no-op). Reads the live config; writes the
+  // at-quit handle snapshot + arms the unref'd post-drain snapshot.
+  quitDiagSession = readEffectiveConfig(APP_HOME).diagnostics?.quitDiagnostics?.enabled
+    ? beginQuitDiagnostics(
+        QUIT_DIAGNOSTICS_LOG,
+        readEffectiveConfig(APP_HOME).diagnostics?.quitDiagnostics?.logMaxBytes,
+      )
+    : null;
   // Signal OTA rollback that this was a graceful quit (not a crash)
   signalGracefulQuit(__BRAND_APP_SLUG);
   cleanupOta();
   // Stop web UI server
-  stopWebServer().catch(() => {});
+  {
+    const done = quitDiagSession?.step('stopWebServer');
+    stopWebServer()
+      .catch(() => {})
+      .finally(() => done?.());
+  }
   // Stop the local CLI bridge (Phase 5 will add graceful leader handoff here)
-  stopLocalServer().catch(() => {});
+  {
+    const done = quitDiagSession?.step('stopLocalServer');
+    stopLocalServer()
+      .catch(() => {})
+      .finally(() => done?.());
+  }
   // Best-effort plugin cleanup (don't block quit on failures)
-  pluginManagerRef?.unloadAll().catch((err) => {
-    console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);
-  });
+  {
+    const done = quitDiagSession?.step('pluginManager.unloadAll');
+    pluginManagerRef
+      ?.unloadAll()
+      .catch((err) => {
+        console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);
+      })
+      .finally(() => done?.());
+  }
   // Close MCP connections so stdio child processes / network handles don't
   // survive as orphans (a child is not killed automatically when Electron exits).
-  disconnectAllMcpServers().catch(() => {});
+  {
+    const done = quitDiagSession?.step('disconnectAllMcpServers');
+    disconnectAllMcpServers()
+      .catch(() => {})
+      .finally(() => done?.());
+  }
   cleanupMicRecorder();
   cleanupDictation();
   cleanupAppShots();
@@ -4022,16 +4062,32 @@ app.on('before-quit', (event) => {
   // Stop the off-thread tokenizer worker (harmless no-op if never spawned).
   terminateTokenizerWorker();
   flushOutputBuffers();
+  quitDiagSession?.mark('sync-cleanup-complete');
   // Release the settings-file fs.watch handles so their native libuv handles
   // don't keep the event loop alive after app.quit() (they are also unref'd).
   closeSettingsWatchersRef?.();
   taskDispatcherRef?.stop();
-  void shutdownBrowserManager()
-    .catch((error) => {
-      console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to flush Browser profile data during shutdown:`, error);
-    })
-    .finally(() => {
-      browserShutdownComplete = true;
-      app.quit();
-    });
+  {
+    const done = quitDiagSession?.step('shutdownBrowserManager');
+    void shutdownBrowserManager()
+      .catch((error) => {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to flush Browser profile data during shutdown:`, error);
+      })
+      .finally(() => {
+        done?.();
+        browserShutdownComplete = true;
+        quitDiagSession?.mark('browser-shutdown-complete-issuing-second-quit');
+        app.quit();
+      });
+  }
+});
+
+// Pure logging: record whether/when the loop actually reaches will-quit → quit.
+// If a leaked handle keeps the loop alive after app.quit(), these never fire on
+// the first quit — their ABSENCE in the log is itself the diagnostic signal.
+app.on('will-quit', () => {
+  quitDiagSession?.mark('will-quit');
+});
+app.on('quit', (_event, exitCode) => {
+  quitDiagSession?.mark('quit', { exitCode });
 });

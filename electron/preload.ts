@@ -1215,6 +1215,8 @@ const appAPI = {
         windowHealthLogSizeBytes: number;
         debugTracePath: string;
         debugTraceSizeBytes: number;
+        quitDiagnosticsLogPath: string;
+        quitDiagnosticsLogSizeBytes: number;
         sinceBoot: string;
         totalErrors: number;
         counters: Array<{
@@ -1272,6 +1274,17 @@ const appAPI = {
       }>,
     clearDebugTrace: () =>
       ipcRenderer.invoke('diagnostics:clear-debug-trace') as Promise<{ success: boolean; logSizeBytes: number }>,
+    tailQuitDiagnosticsLog: (maxBytes?: number) =>
+      ipcRenderer.invoke('diagnostics:tail-quit-diagnostics-log', maxBytes) as Promise<{
+        text: string;
+        sizeBytes: number;
+        truncated: boolean;
+      }>,
+    clearQuitDiagnosticsLog: () =>
+      ipcRenderer.invoke('diagnostics:clear-quit-diagnostics-log') as Promise<{
+        success: boolean;
+        logSizeBytes: number;
+      }>,
     resetCounters: () => ipcRenderer.invoke('diagnostics:reset-counters') as Promise<{ success: boolean }>,
   },
 

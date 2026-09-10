@@ -747,6 +747,8 @@ export function getBridgeScript(): string {
       clearWindowHealthLog: function() { return invoke('diagnostics:clear-window-health-log'); },
       tailDebugTrace: function(maxBytes) { return invoke('diagnostics:tail-debug-trace', maxBytes); },
       clearDebugTrace: function() { return invoke('diagnostics:clear-debug-trace'); },
+      tailQuitDiagnosticsLog: function(maxBytes) { return invoke('diagnostics:tail-quit-diagnostics-log', maxBytes); },
+      clearQuitDiagnosticsLog: function() { return invoke('diagnostics:clear-quit-diagnostics-log'); },
       resetCounters: function() { return invoke('diagnostics:reset-counters'); }
     },
     dictation: {

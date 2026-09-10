@@ -107,6 +107,23 @@ describe('diagnostics debug trace schema', () => {
     });
     expect(ok.memoryDiagnostics.windowHealthLogMaxBytes).toBe(20971520);
   });
+
+  it('defaults quit diagnostics off with a 5 MiB log cap', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse(undefined);
+    expect(diagnostics.quitDiagnostics).toEqual({ enabled: false, logMaxBytes: 5242880 });
+  });
+
+  it('accepts quit diagnostics enabled and fills the log cap default', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse({ quitDiagnostics: { enabled: true } });
+    expect(diagnostics.quitDiagnostics.enabled).toBe(true);
+    expect(diagnostics.quitDiagnostics.logMaxBytes).toBe(5242880);
+  });
+
+  it('clamps an out-of-range quit-diagnostics log cap', () => {
+    expect(() => appConfigSchema.shape.diagnostics.parse({ quitDiagnostics: { logMaxBytes: 999 } })).toThrow();
+    const ok = appConfigSchema.shape.diagnostics.parse({ quitDiagnostics: { logMaxBytes: 10485760 } });
+    expect(ok.quitDiagnostics.logMaxBytes).toBe(10485760);
+  });
 });
 
 describe('unified App Shots config', () => {

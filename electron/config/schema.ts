@@ -1360,6 +1360,22 @@ export const appConfigSchema = z.object({
           gpuContextLossHardening: z.boolean().default(false),
         })
         .default({ reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false }),
+      /**
+       * Opt-in quit instrumentation. Off by default. When on, each app quit
+       * records which OS/Node handles fail to drain (an un-closed watcher,
+       * pending timer, open socket, or un-reaped child process keeps the event
+       * loop alive after app.quit(), which is why the app can require a second
+       * quit to fully exit). Writes to ~/.kai/logs/quit-diagnostics.log — the
+       * post-drain snapshot names the surviving handle. Pure logging; it does
+       * not change quit behavior.
+       */
+      quitDiagnostics: z
+        .object({
+          enabled: z.boolean().default(false),
+          /** Cap for quit-diagnostics.log (single-roll → `.1`). Bounded 1–50 MiB. */
+          logMaxBytes: z.number().int().min(1048576).max(52428800).default(5242880),
+        })
+        .default({ enabled: false, logMaxBytes: 5242880 }),
     })
     .default({
       debugTrace: {
@@ -1381,6 +1397,7 @@ export const appConfigSchema = z.object({
         },
       },
       rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },
+      quitDiagnostics: { enabled: false, logMaxBytes: 5242880 },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

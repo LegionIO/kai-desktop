@@ -66,6 +66,10 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           stallReloadMs?: number;
           gpuContextLossHardening?: boolean;
         };
+        quitDiagnostics?: {
+          enabled?: boolean;
+          logMaxBytes?: number;
+        };
       };
     }
   ).diagnostics;
@@ -73,6 +77,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
   const memoryDiagnostics = diagnostics?.memoryDiagnostics;
   const heapSnapshot = memoryDiagnostics?.heapSnapshot;
   const rendererRecovery = diagnostics?.rendererRecovery;
+  const quitDiagnostics = diagnostics?.quitDiagnostics;
   const ALL_SCOPES = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const;
   // Optimistic scope selection: rapid checkbox toggles before a config round-trip
   // must merge against the LATEST intended set, not the stale prop, or the second
@@ -98,6 +103,11 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
     truncated: boolean;
   } | null>(null);
   const [debugTraceTail, setDebugTraceTail] = useState<{
+    text: string;
+    sizeBytes: number;
+    truncated: boolean;
+  } | null>(null);
+  const [quitDiagnosticsTail, setQuitDiagnosticsTail] = useState<{
     text: string;
     sizeBytes: number;
     truncated: boolean;
@@ -174,6 +184,25 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
       await app.diagnostics.clearWindowHealthLog();
       await refresh();
       setWindowHealthTail(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const loadQuitDiagnosticsTail = useCallback(async () => {
+    try {
+      setQuitDiagnosticsTail(await app.diagnostics.tailQuitDiagnosticsLog());
+    } catch {
+      setQuitDiagnosticsTail(null);
+    }
+  }, []);
+
+  const clearQuitDiagnosticsLog = useCallback(async () => {
+    setBusy(true);
+    try {
+      await app.diagnostics.clearQuitDiagnosticsLog();
+      await refresh();
+      setQuitDiagnosticsTail(null);
     } finally {
       setBusy(false);
     }
@@ -620,6 +649,79 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             </div>
           )}
         </div>
+      </div>
+
+      {/* App quit diagnostics — names the handle that keeps the app alive after quit */}
+      <div className="rounded-xl border border-border/70 bg-card/60 p-4" data-setting-id="diagnostics.quitDiagnostics">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h4 className="text-xs font-semibold">App quit diagnostics</h4>
+            <p className="mt-1 max-w-2xl text-[11px] text-muted-foreground">
+              For diagnosing the “app won’t fully quit on the first try” bug. An un-closed file watcher, pending timer,
+              open socket, or un-reaped child process keeps the event loop alive after quit, so the app lingers in the
+              dock until a second quit. When on, each quit records which handles fail to drain (a snapshot taken ~3s
+              after quit begins names the survivor) to{' '}
+              <span className="select-text font-mono">~/.kai/logs/quit-diagnostics.log</span>. Pure logging — it does not
+              change quit behavior. Off by default.
+            </p>
+          </div>
+          <span
+            className={`text-[10px] font-semibold uppercase tracking-wide ${quitDiagnostics?.enabled ? 'text-emerald-500' : 'text-muted-foreground'}`}
+          >
+            {quitDiagnostics?.enabled ? 'On' : 'Off'}
+          </span>
+        </div>
+
+        <div className="mt-3">
+          <Toggle
+            id="diagnostics.quitDiagnostics.enabled"
+            label="Enable app quit diagnostics"
+            checked={quitDiagnostics?.enabled ?? false}
+            onChange={(value) => void updateConfig('diagnostics.quitDiagnostics.enabled', value)}
+          />
+        </div>
+
+        <CollapsibleSection id="diagnostics-quit-log-tail" title="Quit diagnostics log (tail)" defaultOpen={false}>
+          <div className="space-y-2">
+            <p className="text-[11px] text-muted-foreground">
+              The at-quit and post-drain handle snapshots for recent quits. Full log:{' '}
+              <span className="select-text font-mono">{summary?.quitDiagnosticsLogPath ?? '—'}</span>
+              {summary ? ` (${formatBytes(summary.quitDiagnosticsLogSizeBytes)})` : ''}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void loadQuitDiagnosticsTail()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs hover:bg-accent"
+              >
+                <RefreshCwIcon className="h-3.5 w-3.5" />
+                Load latest
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void clearQuitDiagnosticsLog()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/50 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive hover:bg-destructive/20 disabled:opacity-50"
+              >
+                <Trash2Icon className="h-3.5 w-3.5" />
+                Clear quit log
+              </button>
+            </div>
+            {quitDiagnosticsTail && (
+              <>
+                {quitDiagnosticsTail.truncated && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Showing the last {formatBytes(quitDiagnosticsTail.text.length)} of{' '}
+                    {formatBytes(quitDiagnosticsTail.sizeBytes)}.
+                  </p>
+                )}
+                <pre className="max-h-96 overflow-auto rounded-lg border border-border/70 bg-black/80 p-3 text-[11px] leading-relaxed text-green-300">
+                  {quitDiagnosticsTail.text || '(empty)'}
+                </pre>
+              </>
+            )}
+          </div>
+        </CollapsibleSection>
       </div>
 
       {/* Health summary card */}
