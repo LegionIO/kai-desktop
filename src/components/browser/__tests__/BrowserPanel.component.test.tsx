@@ -1103,7 +1103,7 @@ describe('BrowserPanel', () => {
     expect(omnibox).not.toHaveFocus();
   });
 
-  it('detaches a script-evaluated page behind a reload-required interstitial', async () => {
+  it('surfaces the scripted-page warning strip once an interaction is blocked', async () => {
     const mount = vi.fn().mockResolvedValue(undefined);
     const commandTab = vi.fn().mockResolvedValue(undefined);
     installAppBridgeStub({
@@ -1111,7 +1111,7 @@ describe('BrowserPanel', () => {
         available: async () => true,
         getState: async () => ({
           conversationId: 'chat-1',
-          tabs: [{ ...tab, reloadRequired: true }],
+          tabs: [{ ...tab, reloadRequired: true, scriptedWarningActive: true }],
           activeTabId: tab.id,
         }),
         mount,
@@ -1123,8 +1123,8 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
 
-    expect(await screen.findByText('Reload required')).toBeInTheDocument();
-    expect(screen.getByText(/Kai ran JavaScript/)).toBeInTheDocument();
+    const warning = await screen.findByRole('alert');
+    expect(within(warning).getByText(/Kai ran JavaScript/)).toBeInTheDocument();
     await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', null));
 
     fireEvent.click(screen.getByRole('button', { name: 'Reload page' }));

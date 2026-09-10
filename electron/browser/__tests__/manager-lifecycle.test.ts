@@ -13169,6 +13169,10 @@ describe('browser manager renderer lifecycle', () => {
   ])(
     'attributes user-tab downloads from $label without relying on broad action timing',
     ({ popupGesture, assistantDownloadAttribution, trustedGestureGeneration, expected, interactive }) => {
+      // The assistant branch writes into a private quarantine hierarchy that is
+      // created one directory level at a time with an O_NOFOLLOW ownership check
+      // (never `recursive`), so `appHome` must already exist on disk.
+      const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-download-tests-'));
       let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
       const store = {
         addDownload: vi.fn(() => []),
@@ -13189,7 +13193,7 @@ describe('browser manager renderer lifecycle', () => {
         },
       };
       const manager = managerWithoutConstructor({
-        appHome: '/tmp/kai-browser-download-tests',
+        appHome,
         activeDownloads: new Map(),
         assistantRuns: {
           generationIfActive: (_conversationId: string, runId: string) => (runId === 'run-1' ? 1 : null),
@@ -13241,7 +13245,9 @@ describe('browser manager renderer lifecycle', () => {
       if (expected === 'assistant') {
         expect(item.setSavePath).toHaveBeenCalledWith(
           expect.stringMatching(
-            /^\/tmp\/kai-browser-download-tests\/browser\/download-quarantine\/global\/Kai-[0-9a-f-]{36}\.download$/,
+            new RegExp(
+              `^${appHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/browser/download-quarantine/global/Kai-[0-9a-f-]{36}\\.download$`,
+            ),
           ),
         );
         expect(item.setSavePath.mock.calls[0]?.[0]).not.toContain('quarterly');
@@ -13266,6 +13272,7 @@ describe('browser manager renderer lifecycle', () => {
           ...(Reflect.get(manager, 'activeDownloads') as Map<unknown, { assistantOwnerId: string | null }>).values(),
         ]).toEqual([expect.objectContaining({ assistantOwnerId: expected === 'assistant' ? 'run-1' : null })]);
       }
+      rmSync(appHome, { recursive: true, force: true });
     },
   );
 
