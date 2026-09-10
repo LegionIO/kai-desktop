@@ -835,6 +835,7 @@ let marketplaceBootstrapIncomplete = false;
 let postUpdateReconcileDone: Promise<void> = Promise.resolve();
 let taskTerminalManagerRef: TaskTerminalManager | null = null;
 let taskDispatcherRef: TaskDispatcher | null = null;
+let closeSettingsWatchersRef: (() => void) | null = null;
 let quitCleanupStarted = false;
 let browserShutdownComplete = false;
 
@@ -2127,7 +2128,7 @@ if (gotSingleInstanceLock) {
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
     let workspaceHandlers: ReturnType<typeof registerWorkspaceHandlers> | null = null;
-    const { setConfig } = registerConfigHandlers(
+    const { setConfig, closeSettingsWatchers } = registerConfigHandlers(
       ipcMain,
       APP_HOME,
       handleConfigChanged,
@@ -2150,6 +2151,7 @@ if (gotSingleInstanceLock) {
     // only fires on subsequent changes, so the first turn needs this initial apply).
     applyMediaLimits(getConfig());
     setBrowserRollbackConfig = setConfig;
+    closeSettingsWatchersRef = closeSettingsWatchers;
     workspaceHandlers = registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     registerConversationHandlers(
       ipcMain,
@@ -4020,6 +4022,9 @@ app.on('before-quit', (event) => {
   // Stop the off-thread tokenizer worker (harmless no-op if never spawned).
   terminateTokenizerWorker();
   flushOutputBuffers();
+  // Release the settings-file fs.watch handles so their native libuv handles
+  // don't keep the event loop alive after app.quit() (they are also unref'd).
+  closeSettingsWatchersRef?.();
   taskDispatcherRef?.stop();
   void shutdownBrowserManager()
     .catch((error) => {

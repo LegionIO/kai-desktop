@@ -1,6 +1,6 @@
 import type { IpcMain } from 'electron';
 import { assertPluginLifecycleConfigWriteAllowed } from '../plugins/plugin-lifecycle-config-guard.js';
-import { readFileSync, existsSync, watch, mkdirSync, chmodSync, statSync } from 'fs';
+import { readFileSync, existsSync, watch, mkdirSync, chmodSync, statSync, type FSWatcher } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
@@ -1347,7 +1347,7 @@ export function registerConfigHandlers(
   mayWriteBrowserConfig: (event: unknown) => boolean = () => false,
   onBrowserChanged?: (config: AppConfig['browser']) => void,
   onWorkspaceConfigMutation?: (mutation: WorkspaceConfigMutation) => void,
-): { setConfig: (path: string, value: unknown) => void; reloadConfig: () => void } {
+): { setConfig: (path: string, value: unknown) => void; reloadConfig: () => void; closeSettingsWatchers: () => void } {
   let currentConfig = readEffectiveConfig(appHome);
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
   let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
@@ -1554,6 +1554,7 @@ export function registerConfigHandlers(
     set.add(basename(p));
     watchedBasenamesByDir.set(dir, set);
   }
+  const settingsWatchers: FSWatcher[] = [];
   for (const [dir, basenames] of watchedBasenamesByDir) {
     try {
       mkdirSync(dir, { recursive: true });
@@ -1576,6 +1577,14 @@ export function registerConfigHandlers(
       // watcher is best-effort, so do not let its EventEmitter error terminate
       // the main process.
       watcher.on('error', (error) => console.warn('[Config] Settings watcher stopped:', error));
+      // This watcher is best-effort background instrumentation and must never be
+      // the reason the process stays alive. Without unref() its live libuv
+      // handle keeps the event loop from draining after app.quit(), so on a
+      // normal quit Electron tears the window down but the process lingers
+      // (dock icon stays) until a SECOND quit force-exits it. unref() lets the
+      // first quit exit cleanly; we also close it explicitly on shutdown below.
+      watcher.unref?.();
+      settingsWatchers.push(watcher);
     } catch {
       // Watching is best-effort; config still loads and persists without it.
     }
@@ -1733,5 +1742,18 @@ export function registerConfigHandlers(
     return results;
   });
 
-  return { setConfig: setConfigImpl, reloadConfig };
+  // Close the settings file watchers. Called from app shutdown so their native
+  // OS handles are released promptly. Combined with unref() above, a normal quit
+  // exits on the first request instead of lingering until a second quit.
+  const closeSettingsWatchers = (): void => {
+    for (const watcher of settingsWatchers.splice(0)) {
+      try {
+        watcher.close();
+      } catch {
+        // Best-effort; the process is going down regardless.
+      }
+    }
+  };
+
+  return { setConfig: setConfigImpl, reloadConfig, closeSettingsWatchers };
 }
