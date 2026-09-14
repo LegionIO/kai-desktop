@@ -1598,6 +1598,7 @@ async function* generateWithSyntheticEvents(
           conversationId,
           type: 'retry',
           data: {
+            kind: 'transient',
             attempt: attempt + 1,
             maxRetries: MAX_RETRIES,
             delayMs: delay,
@@ -1687,6 +1688,10 @@ async function* streamWithRealEvents(
       let requestCompleted = false;
       let compatibilityRetryRequested = false;
       let sanitizationRetryRequested = false;
+      // The in-stream `error` chunk that triggered a compatibility/sanitization retry
+      // breaks out of the chunk loop, so carry the provider's own wording here for the
+      // `retry` notice yielded after the break (the raw error is out of scope by then).
+      let compatibilityStreamErrorMessage: string | undefined;
       const agent = await buildAgent(activeModelConfig);
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
@@ -1811,6 +1816,7 @@ async function* streamWithRealEvents(
                 activeModelSettings = omitTemperature(activeModelSettings);
                 activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
                 compatibilityRetryRequested = true;
+                compatibilityStreamErrorMessage = errorMessage;
                 console.warn(
                   `[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`,
                   errorMessage,
@@ -1821,6 +1827,7 @@ async function* streamWithRealEvents(
                 sanitizationRetried = true;
                 activeMessages = deepSanitizeMessages(activeMessages);
                 sanitizationRetryRequested = true;
+                compatibilityStreamErrorMessage = errorMessage;
                 console.warn(
                   `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`,
                   errorMessage,
@@ -1931,10 +1938,12 @@ async function* streamWithRealEvents(
               conversationId,
               type: 'retry',
               data: {
+                kind: 'provider-compatibility',
+                adjustment: compatibilityRetryRequested ? 'omit-temperature' : 'sanitize-messages',
                 attempt: attempt + 1,
                 maxRetries: MAX_RETRIES,
                 delayMs: 0,
-                reason: 'Adjusting request for provider compatibility',
+                reason: compatibilityStreamErrorMessage,
                 category: 'compatibility',
               },
             };
@@ -1962,10 +1971,12 @@ async function* streamWithRealEvents(
               conversationId,
               type: 'retry',
               data: {
+                kind: 'provider-compatibility',
+                adjustment: 'omit-temperature',
                 attempt: attempt + 1,
                 maxRetries: MAX_RETRIES,
                 delayMs: 0,
-                reason: 'Retrying without temperature for provider compatibility',
+                reason: exposedErrorMessage,
                 category: 'compatibility',
               },
             };
@@ -1984,10 +1995,12 @@ async function* streamWithRealEvents(
               conversationId,
               type: 'retry',
               data: {
+                kind: 'provider-compatibility',
+                adjustment: 'sanitize-messages',
                 attempt: attempt + 1,
                 maxRetries: MAX_RETRIES,
                 delayMs: 0,
-                reason: 'Retrying with sanitized messages for provider compatibility',
+                reason: exposedErrorMessage,
                 category: 'compatibility',
               },
             };
@@ -2010,6 +2023,7 @@ async function* streamWithRealEvents(
               conversationId,
               type: 'retry',
               data: {
+                kind: 'transient',
                 attempt: attempt + 1,
                 maxRetries: MAX_RETRIES,
                 delayMs: delay,

@@ -119,6 +119,11 @@ export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: stri
 
       for (const part of msg.content as RendererContentPart[]) {
         if (part.type === 'text') {
+          // `source: 'notice'` is a Kai-authored note about the REQUEST (a retry, a
+          // compact-and-resend), not something the assistant said. Replaying it as
+          // assistant speech would teach the model to narrate Kai's internals, so
+          // strip it — it exists purely for the user-facing transcript.
+          if (part.source === 'notice') continue;
           const text = typeof part.text === 'string' ? part.text : '';
           if (text) {
             assistantParts.push({ type: 'text', text });

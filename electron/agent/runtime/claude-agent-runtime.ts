@@ -1095,9 +1095,10 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
         conversationId,
         type: 'retry',
         data: {
+          kind: 'transient',
           attempt: (msg.attempt as number) ?? 1,
-          delay: (msg.delay_seconds as number) ?? 0,
-          error: (msg.error_message as string) ?? 'API retry',
+          delaySeconds: (msg.delay_seconds as number) ?? 0,
+          reason: (msg.error_message as string) ?? 'API retry',
         },
       });
       break;

@@ -194,4 +194,39 @@ describe('normalizeMessagesForApi — hardening', () => {
     const toolMsgs = out.filter((m) => m.role === 'tool');
     expect(toolMsgs).toHaveLength(1); // second (dup id) dropped, so only one tool message
   });
+
+  it('strips Kai notice text parts so they are never replayed as assistant speech', () => {
+    // `source: 'notice'` is Kai's own bookkeeping about the request (a retry, a
+    // compact-and-resend). Sending it back would teach the model to narrate Kai internals.
+    const out = normalizeMessagesForApi([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', source: 'notice', text: 'Kai re-sent the request without temperature.' },
+          { type: 'text', text: 'The real answer.' },
+        ],
+      },
+    ]);
+    const asst = out.find((m) => m.role === 'assistant')!;
+    const texts = (asst.content as Array<Record<string, unknown>>).filter((p) => p.type === 'text');
+    expect(texts).toHaveLength(1);
+    expect(texts[0].text).toBe('The real answer.');
+  });
+
+  it('drops an assistant message whose ONLY content was a notice', () => {
+    const out = normalizeMessagesForApi([
+      { role: 'assistant', content: [{ type: 'text', source: 'notice', text: 'Retried the request.' }] },
+      { role: 'user', content: 'keep me' },
+    ]);
+    // No empty assistant turn may be emitted — some providers reject it.
+    expect(out).toEqual([{ role: 'user', content: 'keep me' }]);
+  });
+
+  it('keeps observer text, which IS part of the response narration', () => {
+    const out = normalizeMessagesForApi([
+      { role: 'assistant', content: [{ type: 'text', source: 'observer', text: 'Watching the build...' }] },
+    ]);
+    const asst = out.find((m) => m.role === 'assistant')!;
+    expect((asst.content as Array<Record<string, unknown>>)[0].text).toBe('Watching the build...');
+  });
 });

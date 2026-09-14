@@ -14,6 +14,7 @@ import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
 import { extractImageMentions } from './images.js';
 import { assistantBlockNeedsHeader, formatSubAgentStatusNote } from './stream-reducer.js';
+import { formatRetryNoticeLine, type RetryNoticeData } from '../../shared/retry-notice.js';
 
 // TEMP debug (issue #217): trace which stream events reach the CLI and whether
 // the conversationId guard passes. Gated on the SAME env var as the backend's
@@ -728,15 +729,10 @@ export function App({
           break;
         }
         case 'retry': {
-          // Informational recovery note (e.g. overflow-recovery "compacting + retrying"). Show
-          // its raw text as a dim note; otherwise a formatted transient-retry line.
-          const rd = e.data as { text?: string; attempt?: number; maxRetries?: number; category?: string } | undefined;
-          const note =
-            rd && typeof rd.text === 'string' && rd.text.trim().length > 0
-              ? rd.text.replace(/^>\s*/, '').trim()
-              : rd
-                ? `retrying (${rd.attempt}/${rd.maxRetries}) — ${rd.category ?? 'transient error'}`
-                : '';
+          // A retry is Kai's own bookkeeping about the request, not model output — render it as a
+          // dim note row. Wording comes from the shared formatter so the CLI and the GUI describe
+          // the same event identically.
+          const note = formatRetryNoticeLine(e.data as RetryNoticeData | undefined);
           if (note) pushTurn({ kind: 'note', text: note });
           break;
         }

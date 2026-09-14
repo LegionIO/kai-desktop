@@ -8466,12 +8466,14 @@ export function registerAgentHandlers(
                 // assistant — mis-attributed, and after a preserved fallback variant it can collide
                 // with a duplicate id. The retry/observer path attaches to the current assistant
                 // without responseMessageId keying, so it survives the id change cleanly.
+                // `kind` (not a pre-baked `text`) so every surface words it in its own register —
+                // the renderer renders a chip, the CLI a plain note.
                 emit({
                   conversationId,
                   type: 'retry',
                   data: {
-                    reason: 'context-overflow',
-                    text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
+                    kind: 'context-overflow',
+                    category: 'context-overflow',
                   },
                 });
                 continue; // drain the rest of the failed stream; the do/while re-runs it

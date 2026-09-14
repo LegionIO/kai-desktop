@@ -18,7 +18,12 @@ import { brandDefines } from './vitest.config';
  */
 export default defineConfig({
   test: {
-    include: ['electron/**/*.test.ts', 'test-utils/**/*.test.ts', 'scripts/__tests__/**/*.test.ts'],
+    include: [
+      'electron/**/*.test.ts',
+      'shared/__tests__/**/*.test.ts',
+      'test-utils/**/*.test.ts',
+      'scripts/__tests__/**/*.test.ts',
+    ],
     // `*.darwin.test.ts` files load platform-specific native bindings
     // (e.g. `@mastra/libsql` → `@libsql/darwin-{arm64,x64}`) at module
     // evaluation time. Excluded on non-darwin runners so Linux CI (incl.

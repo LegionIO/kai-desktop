@@ -28,6 +28,7 @@ import {
   putConversationChecked,
 } from '@/lib/conversation-writes';
 import { normalizeTokenUsage, type TokenUsageData as NormalizedTokenUsageData } from '../../shared/token-usage';
+import { formatRetryNotice, type RetryNoticeData } from '../../shared/retry-notice';
 
 export type DebateEnrichment = {
   enabled: boolean;
@@ -57,7 +58,18 @@ export type PipelineEnrichments = {
 export type TokenUsageData = NormalizedTokenUsageData;
 
 type ContentPart =
-  | { type: 'text'; text: string; source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' }
+  // `notice` is Kai's OWN bookkeeping (a retry/recovery note), not model output. It rides on a
+  // `text` part rather than a bespoke part type because assistant-ui's converter THROWS on an
+  // unrecognized part type, while extra fields on a text part pass through untouched — the same
+  // mechanism `interrupt`/`unspoken` already rely on. Thread.tsx renders it as a chip so it can't
+  // be mistaken for the assistant's own words, and normalize-messages strips it from model input.
+  | {
+      type: 'text';
+      text: string;
+      source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' | 'notice';
+      /** Provider's own wording for a `notice` part — shown collapsed under the summary. */
+      noticeDetail?: string;
+    }
   | { type: 'image'; image: string; mimeType?: string }
   | { type: 'file'; data: string; mimeType: string; filename: string; displayOnly?: boolean }
   | { type: 'enrichments'; enrichments: PipelineEnrichments }
@@ -1967,6 +1979,34 @@ function applyObserverMessage(acc: MessageAccumulator, text: string, messageMeta
   const block = `${lastPart?.type === 'text' ? '\n\n' : ''}${normalized}\n\n`;
   content.push({ type: 'text', source: 'observer', text: block });
   acc.messages[idx] = applyAssistantMessageMeta({ ...msg, content: toStoredContent(content) }, messageMeta);
+}
+
+/**
+ * Append a Kai-authored notice (a retry / recovery note) to the current assistant.
+ *
+ * Distinct from applyObserverMessage: an observer message is narration meant to read
+ * inline with the response, whereas a notice is app bookkeeping about the REQUEST and
+ * must be visually separable from model output (Thread.tsx renders it as a chip). No
+ * surrounding blank lines — the chip supplies its own spacing, and unlike observer text
+ * this is never concatenated into a markdown flow.
+ *
+ * Consecutive identical notices are collapsed: all four MAX_RETRIES of one transient
+ * failure would otherwise stack the same sentence four times.
+ */
+export function applyNoticeMessage(acc: MessageAccumulator, title: string, detail?: string): void {
+  const { msg, idx } = getOrCreateAssistantInAcc(acc);
+  const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+  const normalized = title.trim();
+  if (!normalized) return;
+  const lastPart = content[content.length - 1];
+  if (lastPart?.type === 'text' && lastPart.source === 'notice' && lastPart.text === normalized) return;
+  content.push({
+    type: 'text',
+    source: 'notice',
+    text: normalized,
+    ...(detail && detail.trim().length > 0 ? { noticeDetail: detail.trim() } : {}),
+  });
+  acc.messages[idx] = { ...msg, content: toStoredContent(content) };
 }
 
 function applyToolCall(
@@ -4929,27 +4969,14 @@ export function RuntimeProvider({
           }
         }
       } else if (e.type === 'retry') {
-        // Retry events are informational — show as observer message (attached to the CURRENT
-        // assistant via applyObserverMessage, NOT keyed by responseMessageId, so it stays
-        // correctly attributed across an overflow-recovery retry that mints a fresh id).
-        const retryData = e.data as
-          | {
-              attempt?: number;
-              maxRetries?: number;
-              delayMs?: number;
-              reason?: string;
-              category?: string;
-              text?: string;
-            }
-          | undefined;
-        if (retryData) {
-          // A raw `text` (e.g. the overflow-recovery "compacted and retrying" note) is rendered
-          // verbatim; otherwise format the transient-retry attempt line.
-          const retryText =
-            typeof retryData.text === 'string' && retryData.text.trim().length > 0
-              ? retryData.text
-              : `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${Math.round((retryData.delayMs ?? 0) / 1000)}s — ${retryData.category ?? 'transient error'}`;
-          applyObserverMessage(acc, retryText);
+        // A retry is Kai's own bookkeeping about the REQUEST, not model output, so it renders as a
+        // notice chip rather than assistant prose. Attached to the CURRENT assistant (not keyed by
+        // responseMessageId) so it stays correctly attributed across an overflow-recovery retry
+        // that mints a fresh id. Wording lives in shared/retry-notice.ts so the GUI and the CLI
+        // describe the same event identically.
+        const notice = formatRetryNotice(e.data as RetryNoticeData | undefined);
+        if (notice) {
+          applyNoticeMessage(acc, notice.title, notice.detail);
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);

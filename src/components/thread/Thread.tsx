@@ -74,6 +74,7 @@ import { SubAgentInline } from './SubAgentInline';
 import { isSubAgentToolCall } from './sub-agent-routing';
 import { MessageContentErrorBoundary } from './MessageContentErrorBoundary';
 import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
+import { NoticeTextPart } from './NoticeTextPart';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
 import { ComposerInput } from './ComposerInput';
@@ -1216,7 +1217,16 @@ const userContentComponents = {
   File: UserFilePart,
 };
 
-const AssistantTextPart: FC<{ text: string }> = ({ text }) => {
+const AssistantTextPart: FC<{ text: string; source?: string; noticeDetail?: string }> = ({
+  text,
+  source,
+  noticeDetail,
+}) => {
+  // assistant-ui routes EVERY text part through this one component, so dispatch on the
+  // `source` discriminator here: a Kai-authored notice must not get the assistant's
+  // timeline dot + markdown treatment. (`interrupt`/`unspoken` are handled by the
+  // hasInterrupt branch in AssistantMessage, which bypasses this component entirely.)
+  if (source === 'notice') return <NoticeTextPart text={text} detail={noticeDetail} />;
   if (!text) return null;
   return (
     <div className="timeline-item py-0.5">
@@ -1328,8 +1338,12 @@ const AssistantMessage: FC = () => {
   const message = useMessage();
   const isRunning = message.status?.type === 'running';
   const content = message.content ?? [];
+  // A Kai notice ("…re-sent the request") is not model output, so it must NOT count as
+  // content — otherwise a turn that emitted only a retry notice before being cancelled
+  // would render the bare chip instead of "Response cancelled".
   const hasContent = content.some(
-    (p: { type: string; text?: string }) => p.type === 'tool-call' || (p.type === 'text' && p.text?.trim()),
+    (p: { type: string; text?: string; source?: string }) =>
+      p.type === 'tool-call' || (p.type === 'text' && p.source !== 'notice' && p.text?.trim()),
   );
   const isEmpty = !isRunning && !hasContent;
 
@@ -1453,13 +1467,24 @@ const AssistantMessage: FC = () => {
           ) : hasInterrupt ? (
             /* Render interrupted message with custom layout */
             <>
-              {content.map((part: { type: string; text?: string; source?: string }, idx: number) => {
-                if (part.type !== 'text') return null;
-                if (part.source === 'interrupt') return <InterruptDivider key={`interrupt-${idx}`} />;
-                if (part.source === 'unspoken')
-                  return <UnspokenTextPart key={`unspoken-${idx}`} text={part.text ?? ''} />;
-                return <AssistantTextPart key={`text-${idx}`} text={part.text ?? ''} />;
-              })}
+              {content.map(
+                (part: { type: string; text?: string; source?: string; noticeDetail?: string }, idx: number) => {
+                  if (part.type !== 'text') return null;
+                  if (part.source === 'interrupt') return <InterruptDivider key={`interrupt-${idx}`} />;
+                  if (part.source === 'unspoken')
+                    return <UnspokenTextPart key={`unspoken-${idx}`} text={part.text ?? ''} />;
+                  // Forward `source`/`noticeDetail` so a Kai notice inside an interrupted
+                  // message still renders as a chip rather than as assistant prose.
+                  return (
+                    <AssistantTextPart
+                      key={`text-${idx}`}
+                      text={part.text ?? ''}
+                      source={part.source}
+                      noticeDetail={part.noticeDetail}
+                    />
+                  );
+                },
+              )}
             </>
           ) : (
             <>
