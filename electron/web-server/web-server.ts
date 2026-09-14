@@ -554,6 +554,7 @@ export function getBridgeScript(): string {
       onCatalogChanged: function(cb) { return on('automations:catalog-changed', cb); }
     },
     modelCatalog: function() { return invoke('agent:model-catalog'); },
+    discoverProviderModels: function(providerName) { return invoke('agent:discover-provider-models', providerName); },
     realtime: {
       startSession: function(cId) { return invoke('realtime:start-session', cId); },
       endSession: function() { return invoke('realtime:end-session'); },

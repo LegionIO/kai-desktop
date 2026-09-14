@@ -1,8 +1,10 @@
 import { useState, type FC } from 'react';
-import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, ChevronUpIcon, ChevronDownIcon } from 'lucide-react';
+import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, CopyIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { EditableTextarea } from '@/components/EditableTextarea';
 import { Toggle, SliderField, settingsSelectClass, type SettingsProps } from './shared';
+import { SortableList } from './shared/SortableList';
+import { cn } from '@/lib/utils';
 
 type ProfileEntry = {
   key: string;
@@ -55,6 +57,42 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
         void updateConfig('defaultProfileKey', undefined);
       }
     }
+  };
+
+  /**
+   * Profile keys are identity: `defaultProfileKey` and each conversation's
+   * `selectedProfileKey` reference them, and resolution is a `.find()` by key
+   * (electron/agent/model-catalog.ts). A duplicate key would silently shadow the
+   * original, so derive a free one.
+   */
+  const uniqueProfileKey = (base: string): string => {
+    const taken = new Set(profiles.map((p) => p.key));
+    if (!taken.has(base)) return base;
+    let i = 2;
+    while (taken.has(`${base}-${i}`)) i++;
+    return `${base}-${i}`;
+  };
+
+  /**
+   * Clone a profile, inserted directly AFTER its source so the copy appears where the
+   * user is looking. Everything is copied except the key (must be unique) and the name
+   * (suffixed so the two are distinguishable in the picker). Deliberately does NOT
+   * become the default profile — cloning is a starting point for edits, and silently
+   * repointing the default would change which model new chats use.
+   */
+  const duplicateProfile = (i: number) => {
+    const source = profiles[i];
+    if (!source) return;
+    const copy: ProfileEntry = {
+      ...source,
+      key: uniqueProfileKey(`${source.key}-copy`),
+      name: `${source.name} copy`,
+      // Fresh array so later edits to the copy's chain can't alias the source's.
+      fallbackModelKeys: [...source.fallbackModelKeys],
+    };
+    const next = [...profiles];
+    next.splice(i + 1, 0, copy);
+    updateProfiles(next);
   };
 
   /** When the user picks a new default profile, sync defaultModelKey to match */
@@ -120,6 +158,7 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
                 profile={profile}
                 models={models}
                 onEdit={() => setEditIndex(i)}
+                onDuplicate={() => duplicateProfile(i)}
                 onDelete={() => deleteProfile(i)}
               />
             ),
@@ -156,10 +195,15 @@ const ProfileCard: FC<{
   profile: ProfileEntry;
   models: CatalogModel[];
   onEdit: () => void;
+  onDuplicate: () => void;
   onDelete: () => void;
-}> = ({ profile, models, onEdit, onDelete }) => {
+}> = ({ profile, models, onEdit, onDuplicate, onDelete }) => {
   const primaryModel = models.find((m) => m.key === profile.primaryModelKey);
   const fallbackCount = profile.fallbackModelKeys.length;
+  // A profile bundles a primary model, an ordered fallback chain, a system prompt and
+  // tuning params — all hand-entered and unrecoverable. Confirm inline (same pattern as
+  // ProviderRow in ModelSettings) rather than deleting on a single click next to Edit.
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   return (
     <div className="flex items-center gap-2 rounded-lg border px-3 py-2">
@@ -181,17 +225,48 @@ const ProfileCard: FC<{
           {profile.systemPrompt && <span>custom prompt</span>}
         </div>
       </div>
-      <button type="button" onClick={onEdit} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
-        <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
-      </button>
-      <button
-        type="button"
-        onClick={onDelete}
-        className="p-1 rounded hover:bg-destructive/10 transition-colors"
-        title="Delete"
-      >
-        <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
-      </button>
+      {confirmDelete ? (
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">Delete?</span>
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded bg-destructive/10 px-2 py-1 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/20"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(false)}
+            className="rounded p-1 transition-colors hover:bg-muted"
+            title="Cancel"
+          >
+            <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </div>
+      ) : (
+        <>
+          <button type="button" onClick={onEdit} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
+            <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={onDuplicate}
+            className="p-1 rounded hover:bg-muted transition-colors"
+            title="Duplicate"
+          >
+            <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(true)}
+            className="p-1 rounded hover:bg-destructive/10 transition-colors"
+            title="Delete"
+          >
+            <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </>
+      )}
     </div>
   );
 };
@@ -205,8 +280,7 @@ const ProfileForm: FC<{
 }> = ({ initial, models, onSave, onCancel, submitLabel }) => {
   const [key, setKey] = useState(initial.key);
   const [name, setName] = useState(initial.name);
-  const [primaryModelKey, setPrimaryModelKey] = useState(initial.primaryModelKey);
-  const [fallbackModelKeys, setFallbackModelKeys] = useState<string[]>(initial.fallbackModelKeys);
+  const [chain, setChain] = useState<string[]>(() => buildInitialChain(initial));
   const [systemPrompt, setSystemPrompt] = useState(initial.systemPrompt ?? '');
   const [temperature, setTemperature] = useState<number | undefined>(initial.temperature);
   const [maxSteps, setMaxSteps] = useState<number | undefined>(initial.maxSteps);
@@ -215,7 +289,7 @@ const ProfileForm: FC<{
   const [reasoningEffort, setReasoningEffort] = useState(initial.reasoningEffort ?? '');
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const canSave = key.trim() && name.trim() && primaryModelKey;
+  const canSave = key.trim() && name.trim() && chain.length > 0;
 
   const handleNameChange = (v: string) => {
     const wasAuto = !initial.key || key === toKey(initial.name);
@@ -228,8 +302,8 @@ const ProfileForm: FC<{
     const entry: ProfileEntry = {
       key: key.trim(),
       name: name.trim(),
-      primaryModelKey,
-      fallbackModelKeys,
+      primaryModelKey: chain[0]!,
+      fallbackModelKeys: chain.slice(1),
     };
     if (systemPrompt.trim()) entry.systemPrompt = systemPrompt.trim();
     if (temperature !== undefined) entry.temperature = temperature;
@@ -240,23 +314,17 @@ const ProfileForm: FC<{
     onSave(entry);
   };
 
-  const toggleFallback = (modelKey: string) => {
-    if (fallbackModelKeys.includes(modelKey)) {
-      setFallbackModelKeys(fallbackModelKeys.filter((k) => k !== modelKey));
-    } else {
-      setFallbackModelKeys([...fallbackModelKeys, modelKey]);
-    }
+  const addToChain = (modelKey: string) => {
+    if (chain.includes(modelKey)) return;
+    setChain([...chain, modelKey]);
   };
 
-  const moveFallback = (index: number, direction: -1 | 1) => {
-    const next = [...fallbackModelKeys];
-    const targetIndex = index + direction;
-    if (targetIndex < 0 || targetIndex >= next.length) return;
-    [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
-    setFallbackModelKeys(next);
+  const removeFromChain = (modelKey: string) => {
+    if (chain.length <= 1) return; // never allow an empty chain — see canSave
+    setChain(chain.filter((k) => k !== modelKey));
   };
 
-  const availableFallbacks = models.filter((m) => m.key !== primaryModelKey);
+  const availableToAdd = models.filter((m) => !chain.includes(m.key));
 
   return (
     <div className="rounded-lg border bg-card p-3 space-y-3">
@@ -282,89 +350,83 @@ const ProfileForm: FC<{
         </div>
       </div>
 
-      {/* Primary Model */}
+      {/* Model chain */}
       <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Primary Model</label>
-        <select
-          className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
-          value={primaryModelKey}
-          onChange={(e) => {
-            setPrimaryModelKey(e.target.value);
-            // Remove from fallbacks if it was there
-            setFallbackModelKeys(fallbackModelKeys.filter((k) => k !== e.target.value));
-          }}
-        >
-          {models.map((m) => (
-            <option key={m.key} value={m.key}>
-              {m.displayName}
-            </option>
-          ))}
-        </select>
-      </div>
+        <div className="flex items-center justify-between mb-0.5">
+          <label className="text-[10px] text-muted-foreground">Model chain</label>
+          {availableToAdd.length > 0 && (
+            <div className="relative">
+              <select
+                aria-label="Add model to chain"
+                className="cursor-pointer rounded-lg border border-dashed bg-transparent px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-muted/50 transition-colors"
+                value=""
+                onChange={(e) => {
+                  if (e.target.value) addToChain(e.target.value);
+                }}
+              >
+                <option value="">+ Add model</option>
+                {availableToAdd.map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.displayName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
 
-      {/* Fallback Models */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Fallback Models (in order)</label>
-        <p className="text-[10px] text-muted-foreground mb-1.5">
-          If the primary model fails, these are tried in order.
-        </p>
-
-        {/* Selected fallbacks with reorder */}
-        {fallbackModelKeys.length > 0 && (
-          <div className="space-y-1 mb-2">
-            {fallbackModelKeys.map((fbKey, i) => {
-              const model = models.find((m) => m.key === fbKey);
+        <div className="rounded-lg border bg-background/50 p-1">
+          <SortableList
+            items={chain}
+            onReorder={setChain}
+            ariaLabel="model chain"
+            getItemLabel={(modelKey) => models.find((m) => m.key === modelKey)?.displayName ?? modelKey}
+            itemClassName="relative flex items-center gap-1.5 px-2 py-1.5"
+            renderLeading={(index) => (
+              <div className="relative flex w-3 shrink-0 flex-col items-center self-stretch">
+                {/* Spine: hairline connecting rows into one sequence */}
+                {index > 0 && <div className="absolute top-0 h-1/2 w-px -translate-y-full bg-border" />}
+                <div
+                  className={cn(
+                    'z-10 mt-[calc(50%-1px)] h-1.5 w-1.5 shrink-0 rounded-full',
+                    index === 0 ? 'bg-primary' : 'border border-border bg-background',
+                  )}
+                />
+                {index < chain.length - 1 && <div className="absolute bottom-0 h-1/2 w-px translate-y-full bg-border" />}
+              </div>
+            )}
+            renderItem={(modelKey, index) => {
+              const model = models.find((m) => m.key === modelKey);
               return (
-                <div key={fbKey} className="flex items-center gap-1.5 rounded border bg-background/50 px-2 py-1">
-                  <span className="text-[10px] text-muted-foreground font-mono w-4">{i + 1}.</span>
-                  <span className="text-xs flex-1 truncate">{model?.displayName ?? fbKey}</span>
+                <>
+                  <span className="text-xs flex-1 truncate">{model?.displayName ?? modelKey}</span>
+                  {index === 0 && (
+                    <span
+                      key="primary-pill"
+                      className="motion-reduce:animate-none animate-in fade-in-0 zoom-in-95 rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary shrink-0"
+                    >
+                      Primary
+                    </span>
+                  )}
                   <button
                     type="button"
-                    onClick={() => moveFallback(i, -1)}
-                    disabled={i === 0}
-                    className="p-0.5 rounded hover:bg-muted disabled:opacity-30 transition-colors"
-                    title="Move up"
-                  >
-                    <ChevronUpIcon className="h-3 w-3" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => moveFallback(i, 1)}
-                    disabled={i === fallbackModelKeys.length - 1}
-                    className="p-0.5 rounded hover:bg-muted disabled:opacity-30 transition-colors"
-                    title="Move down"
-                  >
-                    <ChevronDownIcon className="h-3 w-3" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => toggleFallback(fbKey)}
-                    className="p-0.5 rounded hover:bg-destructive/10 transition-colors"
-                    title="Remove"
+                    onClick={() => removeFromChain(modelKey)}
+                    disabled={chain.length === 1}
+                    className="p-0.5 rounded hover:bg-destructive/10 disabled:opacity-30 disabled:hover:bg-transparent transition-colors shrink-0"
+                    title={chain.length === 1 ? 'A profile needs at least one model' : 'Remove'}
+                    aria-label={`Remove ${model?.displayName ?? modelKey} from chain`}
                   >
                     <XIcon className="h-3 w-3 text-muted-foreground" />
                   </button>
-                </div>
+                </>
               );
-            })}
-          </div>
-        )}
-
-        {/* Available models to add */}
-        <div className="flex flex-wrap gap-1.5">
-          {availableFallbacks
-            .filter((m) => !fallbackModelKeys.includes(m.key))
-            .map((m) => (
-              <button
-                key={m.key}
-                type="button"
-                onClick={() => toggleFallback(m.key)}
-                className="rounded-lg border border-dashed px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted/50 transition-colors"
-              >
-                + {m.displayName}
-              </button>
-            ))}
+            }}
+          />
         </div>
+
+        <p className="text-[10px] text-muted-foreground mt-1.5">
+          Drag to reorder. The top model runs; the rest are tried in order if it fails.
+        </p>
       </div>
 
       {/* System Prompt */}
@@ -487,3 +549,21 @@ function toKey(name: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
 }
+
+/**
+ * Builds the initial `chain` state (primary + fallbacks) for the model-chain
+ * list. Filters out empty/duplicate keys so a malformed config (e.g. a
+ * fallback that duplicates the primary, or a blank key from hand-edited
+ * config.json) can't produce a broken row in the reorderable list.
+ */
+function buildInitialChain(profile: Pick<ProfileEntry, 'primaryModelKey' | 'fallbackModelKeys'>): string[] {
+  const seen = new Set<string>();
+  const chain: string[] = [];
+  for (const key of [profile.primaryModelKey, ...profile.fallbackModelKeys]) {
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    chain.push(key);
+  }
+  return chain;
+}
+

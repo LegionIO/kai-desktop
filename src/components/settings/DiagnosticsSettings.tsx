@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import type { SettingsProps } from './shared';
-import { CollapsibleSection, Toggle } from './shared';
+import { ClampedNumberField, CollapsibleSection, Toggle } from './shared';
 
 type Summary = Awaited<ReturnType<typeof app.diagnostics.getSummary>>;
 type PluginList = Awaited<ReturnType<typeof app.plugins.list>>;
@@ -508,35 +508,23 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           <div className="mt-3 grid gap-3 sm:grid-cols-3">
             <label className="text-[11px] text-muted-foreground">
               Trigger at (% of limit)
-              <input
-                type="number"
+              <ClampedNumberField
                 min={50}
                 max={99}
                 disabled={!heapSnapshot?.enabled}
                 value={heapSnapshot?.thresholdPct ?? 85}
-                onChange={(event) =>
-                  void updateConfig(
-                    'diagnostics.memoryDiagnostics.heapSnapshot.thresholdPct',
-                    Math.min(99, Math.max(50, Number(event.target.value) || 85)),
-                  )
-                }
+                onCommit={(v) => void updateConfig('diagnostics.memoryDiagnostics.heapSnapshot.thresholdPct', v)}
                 className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
               />
             </label>
             <label className="text-[11px] text-muted-foreground">
               Floor (MB)
-              <input
-                type="number"
+              <ClampedNumberField
                 min={256}
                 max={16384}
                 disabled={!heapSnapshot?.enabled}
                 value={heapSnapshot?.triggerFloorMB ?? 3000}
-                onChange={(event) =>
-                  void updateConfig(
-                    'diagnostics.memoryDiagnostics.heapSnapshot.triggerFloorMB',
-                    Math.min(16384, Math.max(256, Number(event.target.value) || 3000)),
-                  )
-                }
+                onCommit={(v) => void updateConfig('diagnostics.memoryDiagnostics.heapSnapshot.triggerFloorMB', v)}
                 className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
               />
             </label>

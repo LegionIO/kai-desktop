@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, type FC } from 'react';
 import { EyeIcon, EyeOffIcon, WifiIcon, WifiOffIcon, LoaderIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
-import { Toggle, SliderField, NumberField, settingsSelectClass } from './shared';
+import { Toggle, SliderField, NumberField, ClampedNumberField, settingsSelectClass } from './shared';
 import { app } from '@/lib/ipc-client';
 
 type RealtimeProvider = 'openai' | 'azure' | 'custom';
@@ -491,23 +491,14 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
 
         {(autoEndCall?.enabled ?? true) && (
           <div className="space-y-3 pl-1">
-            <div>
-              <label className="text-[10px] text-muted-foreground block mb-0.5">Silence Timeout (seconds)</label>
-              <input
-                type="number"
-                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                value={autoEndCall?.silenceTimeoutSec ?? 60}
-                onChange={(e) => {
-                  const n = Number(e.target.value);
-                  if (!isNaN(n)) updateConfig('realtime.autoEndCall.silenceTimeoutSec', n);
-                }}
-                min={10}
-                max={600}
-              />
-              <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-                Automatically end the call after this many seconds without speech from you.
-              </span>
-            </div>
+            <ClampedNumberField
+              label="Silence Timeout (seconds)"
+              value={autoEndCall?.silenceTimeoutSec ?? 60}
+              onCommit={(v) => void updateConfig('realtime.autoEndCall.silenceTimeoutSec', v)}
+              min={10}
+              max={600}
+              hint="Automatically end the call after this many seconds without speech from you."
+            />
           </div>
         )}
       </fieldset>

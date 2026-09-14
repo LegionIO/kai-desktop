@@ -19,7 +19,7 @@ import { AutomationsSettings } from './AutomationsSettings';
 import { DiagnosticsSettings } from './DiagnosticsSettings';
 import { BrowserSettings } from './BrowserSettings';
 import { searchSettings, breadcrumb, type SettingsSearchEntry } from './search-index';
-import type { SettingsProps } from './shared';
+import { SettingsFocusContext, type SettingsFocusRequest, type SettingsProps } from './shared';
 
 export type SettingsSection =
   | 'models'
@@ -106,26 +106,55 @@ export const SettingsPanel: FC<{
   }, []);
 
   // After navigating from a search result, scroll the target field into view and pulse it.
+  //
+  // The exact anchor may not be in the DOM on the first frame: when it lives inside a
+  // collapsed `CollapsibleSection` (or a non-active inner tab), the container first has
+  // to see the focus request, open itself, and re-render. So poll for the EXACT anchor
+  // across a few frames and only settle for `fallbackId` once it clearly isn't coming —
+  // otherwise we'd highlight the closed section (the old behavior) even though it was
+  // about to open and reveal the real target.
   useEffect(() => {
     if (!focus?.anchorId) return;
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => {
-        const find = (id?: string) =>
-          id ? contentRef.current?.querySelector<HTMLElement>(`[data-setting-id="${id}"]`) : null;
-        const el = find(focus.anchorId) ?? find(focus.fallbackId);
-        if (el) {
-          el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-          el.classList.add('settings-highlight');
-          setTimeout(() => el.classList.remove('settings-highlight'), 1600);
-        } else {
-          contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-        }
-      });
-    });
+    let raf = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let highlighted: HTMLElement | null = null;
+    let attempts = 0;
+    // ~30 frames ≈ 500ms: long enough for an open+tab-switch re-render, short enough
+    // that a genuinely missing anchor still falls back promptly.
+    const MAX_ATTEMPTS = 30;
+
+    const find = (id?: string) =>
+      id ? contentRef.current?.querySelector<HTMLElement>(`[data-setting-id="${id}"]`) : null;
+
+    const reveal = (el: HTMLElement) => {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.classList.add('settings-highlight');
+      highlighted = el;
+      timer = setTimeout(() => el.classList.remove('settings-highlight'), 1600);
+    };
+
+    const tick = () => {
+      const exact = find(focus.anchorId);
+      if (exact) {
+        reveal(exact);
+        return;
+      }
+      if (attempts++ < MAX_ATTEMPTS) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      const fallback = find(focus.fallbackId);
+      if (fallback) reveal(fallback);
+      else contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
+    raf = requestAnimationFrame(tick);
     return () => {
-      cancelAnimationFrame(raf1);
-      if (raf2) cancelAnimationFrame(raf2);
+      cancelAnimationFrame(raf);
+      if (timer) clearTimeout(timer);
+      // Drop the pulse if we're torn down mid-animation, so a stale highlight class
+      // can't persist on an element the user navigates back to later.
+      highlighted?.classList.remove('settings-highlight');
     };
   }, [focus]);
 
@@ -149,9 +178,15 @@ export const SettingsPanel: FC<{
 
   const focusTab = focus?.tab;
   const focusNonce = focus?.nonce;
+  // Identity must change per navigation so `CollapsibleSection`'s effect re-fires when the
+  // user searches the same setting twice (the nonce carries that change).
+  const focusRequest: SettingsFocusRequest | null = focus
+    ? { anchorId: focus.anchorId, fallbackId: focus.fallbackId, nonce: focus.nonce }
+    : null;
 
   return (
-    <div className="flex h-full flex-col bg-background md:flex-row">
+    <SettingsFocusContext.Provider value={focusRequest}>
+      <div className="flex h-full flex-col bg-background md:flex-row">
       <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
         <div className="px-2 pt-2 md:px-3 md:pt-0 md:pb-2">
           <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-2.5 py-1.5">
@@ -270,7 +305,8 @@ export const SettingsPanel: FC<{
           <BrowserSettings config={config} updateConfig={updateConfig} conversationId={selectedConversationId} />
         )}
       </div>
-    </div>
+      </div>
+    </SettingsFocusContext.Provider>
   );
 };
 

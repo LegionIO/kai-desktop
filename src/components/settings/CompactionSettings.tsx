@@ -134,7 +134,7 @@ export const CompactionSettings: FC<SettingsProps & { hideTitle?: boolean }> = (
       </fieldset>
 
       {/* Media fitting */}
-      <fieldset className="rounded-lg border p-3 space-y-3">
+      <fieldset data-setting-id="compaction.media" className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Media Fitting</legend>
         <p className="text-[10px] text-muted-foreground">
           Controls how tool-result images/files that would exceed the model&apos;s context window (or a fixed size cap)

@@ -447,6 +447,11 @@ type AppAPI = {
     onModalCallback: (callback: (data: unknown) => void) => () => void;
   };
   modelCatalog: () => Promise<unknown>;
+  /** Ask a configured provider which models it serves (Models › Catalog “Discover”). */
+  discoverProviderModels: (providerName: string) => Promise<
+    | { ok: true; models: Array<{ id: string; displayName?: string; maxInputTokens?: number }> }
+    | { ok: false; error: string }
+  >;
   realtime: {
     startSession: (conversationId: string) => Promise<{ ok?: boolean; error?: string }>;
     endSession: () => Promise<{ ok?: boolean; error?: string }>;

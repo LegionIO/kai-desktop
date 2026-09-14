@@ -14,6 +14,7 @@ import { app, type AutomationRunRecord, type AutomationSourceCatalogEntry } from
 import { flattenJsonSchema } from '@/lib/schema-paths';
 import { generateId } from '@/lib/utils';
 import { NumberField, settingsSelectClass, TextArea, TextField, Toggle, type SettingsProps } from './shared';
+import { SortableList } from './shared/SortableList';
 
 type ConditionOp =
   | 'equals'
@@ -502,6 +503,36 @@ const RuleEditor: FC<{
   const [testResult, setTestResult] = useState<AutomationRunRecord | null>(null);
   const [testing, setTesting] = useState(false);
 
+  // `rule.actions` has no per-action `id` in the schema (and this change may
+  // not add one — see Part 3 notes), but the list is keyed by array index,
+  // which breaks under reorder: React would reuse the wrong ActionEditor
+  // instance and its internal field state would attach to the wrong action.
+  // We maintain a parallel array of synthetic ids local to this editor
+  // instance, kept 1:1 with `rule.actions` by construction — `addAction` /
+  // `removeAction` / `reorderActions` below are the ONLY places this
+  // component mutates `rule.actions`, and each keeps `actionIds` in lockstep.
+  // This RuleEditor instance is remounted fresh whenever its rule row is
+  // collapsed/expanded (see the `isOpen &&` guard in the parent), so a fresh
+  // `rule.actions.map(() => generateId())` on mount is always length-correct.
+  const [actionIds, setActionIds] = useState<string[]>(() => rule.actions.map(() => generateId()));
+
+  const addAction = () => {
+    onChange({ actions: [...rule.actions, newAction('notification')] });
+    setActionIds((ids) => [...ids, generateId()]);
+  };
+
+  const removeAction = (index: number) => {
+    onChange({ actions: rule.actions.filter((_, j) => j !== index) });
+    setActionIds((ids) => ids.filter((_, j) => j !== index));
+  };
+
+  const reorderActions = (nextIds: string[]) => {
+    const idToAction = new Map(actionIds.map((id, i) => [id, rule.actions[i]]));
+    const nextActions = nextIds.map((id) => idToAction.get(id)).filter((a): a is Action => a !== undefined);
+    setActionIds(nextIds);
+    onChange({ actions: nextActions });
+  };
+
   const pluginSources = catalog.filter((c) => c.source.startsWith('plugin.'));
 
   return (
@@ -676,29 +707,36 @@ const RuleEditor: FC<{
           <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Actions</span>
           <button
             type="button"
-            onClick={() => onChange({ actions: [...rule.actions, newAction('notification')] })}
+            onClick={addAction}
             className="inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
           >
             <PlusIcon className="h-3 w-3" /> add
           </button>
         </div>
-        <div className="space-y-2">
-          {rule.actions.map((action, i) => (
-            <ActionEditor
-              key={i}
-              index={i}
-              action={action}
-              catalog={catalog}
-              pluginSources={pluginSources}
-              onChange={(next) => onChange({ actions: rule.actions.map((a, j) => (j === i ? next : a)) })}
-              onRemove={
-                rule.actions.length > 1
-                  ? () => onChange({ actions: rule.actions.filter((_, j) => j !== i) })
-                  : undefined
-              }
-            />
-          ))}
-        </div>
+        <SortableList
+          items={actionIds}
+          onReorder={reorderActions}
+          ariaLabel="actions"
+          getItemLabel={(_, index) => `action ${index + 1}`}
+          className="space-y-2"
+          itemClassName="flex items-start gap-2"
+          renderItem={(_actionId, i) => {
+            const action = rule.actions[i];
+            if (!action) return null;
+            return (
+              <div className="min-w-0 flex-1">
+                <ActionEditor
+                  index={i}
+                  action={action}
+                  catalog={catalog}
+                  pluginSources={pluginSources}
+                  onChange={(next) => onChange({ actions: rule.actions.map((a, j) => (j === i ? next : a)) })}
+                  onRemove={rule.actions.length > 1 ? () => removeAction(i) : undefined}
+                />
+              </div>
+            );
+          }}
+        />
       </div>
 
       {/* Throttle + test */}

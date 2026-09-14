@@ -10,6 +10,9 @@ import {
   EyeOffIcon,
   CopyIcon,
   ChevronDownIcon,
+  SearchIcon,
+  LoaderIcon,
+  AlertCircleIcon,
 } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
@@ -422,6 +425,12 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
     updateCatalog([...models.catalog, entry]);
   };
 
+  /** Append several models in ONE config write (used by provider model discovery). */
+  const addModels = (entries: CatalogEntry[]) => {
+    if (entries.length === 0) return;
+    updateCatalog([...models.catalog, ...entries]);
+  };
+
   const updateModel = (index: number, entry: CatalogEntry) => {
     const next = [...models.catalog];
     next[index] = entry;
@@ -432,6 +441,32 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
     updateCatalog(models.catalog.filter((_, i) => i !== index));
   };
 
+  /**
+   * Clone a catalog entry, inserted right after its source. `key` is the identity used by
+   * profiles (`primaryModelKey`/`fallbackModelKeys`), conversations and
+   * `models.defaultModelKey`, so it must be unique — a duplicate would shadow the
+   * original during `byKey` resolution in electron/agent/model-catalog.ts.
+   */
+  const duplicateModel = (index: number) => {
+    const source = models.catalog[index];
+    if (!source) return;
+    const taken = new Set(models.catalog.map((m) => m.key));
+    const base = `${source.key}-copy`;
+    let key = base;
+    let n = 2;
+    while (taken.has(key)) key = `${base}-${n++}`;
+    const copy: CatalogEntry = {
+      ...source,
+      key,
+      displayName: `${source.displayName} copy`,
+      // Fresh nested object so editing the copy's caching can't mutate the source's.
+      ...(source.promptCaching ? { promptCaching: { ...source.promptCaching } } : {}),
+    };
+    const next = [...models.catalog];
+    next.splice(index + 1, 0, copy);
+    updateCatalog(next);
+  };
+
   return (
     <div data-setting-id="models.catalog">
       <ModelCatalog
@@ -439,7 +474,9 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
         providerKeys={providerKeys}
         providers={models.providers}
         onAdd={addModel}
+        onAddMany={addModels}
         onUpdate={updateModel}
+        onDuplicate={duplicateModel}
         onDelete={deleteModel}
       />
     </div>
@@ -604,16 +641,53 @@ const ModelCatalog: FC<{
   providerKeys: string[];
   providers: Record<string, Provider>;
   onAdd: (entry: CatalogEntry) => void;
+  onAddMany: (entries: CatalogEntry[]) => void;
   onUpdate: (index: number, entry: CatalogEntry) => void;
+  onDuplicate: (index: number) => void;
   onDelete: (index: number) => void;
-}> = ({ catalog, providerKeys, providers, onAdd, onUpdate, onDelete }) => {
+}> = ({ catalog, providerKeys, providers, onAdd, onAddMany, onUpdate, onDuplicate, onDelete }) => {
   const [showAdd, setShowAdd] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverOpen, setDiscoverOpen] = useState(false);
+  const [filter, setFilter] = useState('');
+
+  // Filter for display only. Every mutation is by the entry's INDEX in the real
+  // `catalog` array, so filtered rows must carry their original index — never the
+  // position within the filtered view.
+  const needle = filter.trim().toLowerCase();
+  const visible = needle
+    ? catalog
+        .map((m, i) => ({ m, i }))
+        .filter(
+          ({ m }) =>
+            m.displayName.toLowerCase().includes(needle) ||
+            m.key.toLowerCase().includes(needle) ||
+            m.modelName.toLowerCase().includes(needle) ||
+            m.provider.toLowerCase().includes(needle),
+        )
+    : catalog.map((m, i) => ({ m, i }));
 
   return (
     <div className="space-y-2">
+      {catalog.length > 8 && (
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder={`Filter ${catalog.length} models…`}
+            className="flex-1 rounded-xl border border-border/70 bg-card/80 px-3 py-1.5 text-xs outline-none"
+          />
+          {needle && (
+            <span className="shrink-0 text-[10px] text-muted-foreground">
+              {visible.length} of {catalog.length}
+            </span>
+          )}
+        </div>
+      )}
       <div className="space-y-1.5">
-        {catalog.map((m, i) =>
+        {visible.map(({ m, i }) =>
           editIndex === i ? (
             <ModelForm
               key={`edit-${i}`}
@@ -628,42 +702,17 @@ const ModelCatalog: FC<{
               submitLabel="Save"
             />
           ) : (
-            <div key={m.key} className="flex items-center gap-2 rounded-lg border px-3 py-2">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium truncate">{formatModelDisplayName(m.displayName)}</span>
-                  <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5 shrink-0">
-                    {m.provider}
-                  </span>
-                  {m.computerUseSupport && m.computerUseSupport !== 'none' && (
-                    <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">
-                      Autopilot
-                    </span>
-                  )}
-                </div>
-                <div className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">
-                  {m.modelName}
-                  {m.maxInputTokens ? ` · ${Math.round(m.maxInputTokens / 1000)}k ctx` : ''}
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setEditIndex(i)}
-                className="p-1 rounded hover:bg-muted transition-colors"
-                title="Edit"
-              >
-                <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              </button>
-              <button
-                type="button"
-                onClick={() => onDelete(i)}
-                className="p-1 rounded hover:bg-destructive/10 transition-colors"
-                title="Delete"
-              >
-                <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
-              </button>
-            </div>
+            <CatalogRow
+              key={m.key}
+              entry={m}
+              onEdit={() => setEditIndex(i)}
+              onDuplicate={() => onDuplicate(i)}
+              onDelete={() => onDelete(i)}
+            />
           ),
+        )}
+        {visible.length === 0 && needle && (
+          <p className="px-1 py-2 text-[11px] text-muted-foreground/70">No models match “{filter}”.</p>
         )}
       </div>
 
@@ -679,15 +728,390 @@ const ModelCatalog: FC<{
           onCancel={() => setShowAdd(false)}
           submitLabel="Add Model"
         />
+      ) : discovering || discoverOpen ? (
+        <DiscoverModelsButton
+          providers={providers}
+          existingCatalog={catalog}
+          onImport={onAddMany}
+          busy={discovering}
+          setBusy={setDiscovering}
+          open
+          setOpen={setDiscoverOpen}
+        />
       ) : (
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setShowAdd(true)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/50 transition-colors"
+          >
+            <PlusIcon className="h-3.5 w-3.5" />
+            Add Model
+          </button>
+          <DiscoverModelsButton
+            providers={providers}
+            existingCatalog={catalog}
+            onImport={onAddMany}
+            busy={discovering}
+            setBusy={setDiscovering}
+            open={false}
+            setOpen={setDiscoverOpen}
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * One catalog row. Owns its own delete-confirm state so a misclick can't wipe a
+ * hand-entered 9-field entry (the row's Delete sits directly beside Edit, and the
+ * key is referenced by profiles + defaultModelKey).
+ */
+const CatalogRow: FC<{
+  entry: CatalogEntry;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}> = ({ entry: m, onEdit, onDuplicate, onDelete }) => {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  return (
+    <div className="flex items-center gap-2 rounded-lg border px-3 py-2">
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium truncate">{formatModelDisplayName(m.displayName)}</span>
+          <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5 shrink-0">
+            {m.provider}
+          </span>
+          {m.computerUseSupport && m.computerUseSupport !== 'none' && (
+            <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">Autopilot</span>
+          )}
+        </div>
+        <div className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">
+          {m.modelName}
+          {m.maxInputTokens ? ` · ${Math.round(m.maxInputTokens / 1000)}k ctx` : ''}
+        </div>
+      </div>
+      {confirmDelete ? (
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">Delete?</span>
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded bg-destructive/10 px-2 py-1 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/20"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(false)}
+            className="rounded p-1 transition-colors hover:bg-muted"
+            title="Cancel"
+          >
+            <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </div>
+      ) : (
+        <>
+          <button type="button" onClick={onEdit} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
+            <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={onDuplicate}
+            className="p-1 rounded hover:bg-muted transition-colors"
+            title="Duplicate"
+          >
+            <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(true)}
+            className="p-1 rounded hover:bg-destructive/10 transition-colors"
+            title="Delete"
+          >
+            <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </>
+      )}
+    </div>
+  );
+};
+
+/* ── Model Discovery ── */
+
+type DiscoveredModel = { id: string; displayName?: string; maxInputTokens?: number };
+
+/** Provider types that expose an HTTP model-list endpoint (Bedrock uses SigV4 — excluded). */
+const DISCOVERABLE_TYPES = new Set(['openai-compatible', 'anthropic', 'google']);
+
+/**
+ * "Discover" flow: pick a configured provider, fetch the models it actually serves, then
+ * check off which to import. Replaces hand-typing ~9 fields per model (the real cost with
+ * a 40-model gateway) with one round-trip plus a multi-select.
+ *
+ * Imports are appended in a SINGLE config write via `onImport`, because `updateConfig`
+ * replaces the whole config object per call — importing 36 models one-at-a-time would be
+ * 36 disk rewrites and 36 renderer-wide config swaps.
+ */
+const DiscoverModelsButton: FC<{
+  providers: Record<string, Provider>;
+  existingCatalog: CatalogEntry[];
+  onImport: (entries: CatalogEntry[]) => void;
+  busy: boolean;
+  setBusy: (v: boolean) => void;
+  /** Owned by the parent so the collapsed button can sit inline while the expanded
+   *  panel takes the full row. */
+  open: boolean;
+  setOpen: (v: boolean) => void;
+}> = ({ providers, existingCatalog, onImport, busy, setBusy, open, setOpen }) => {
+  const [providerName, setProviderName] = useState<string>('');
+  const [models, setModels] = useState<DiscoveredModel[] | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState('');
+
+  // Only offer providers that are configured AND have a listable endpoint.
+  const candidates = Object.keys(providers).filter(
+    (name) => providers[name] && DISCOVERABLE_TYPES.has(providers[name].type) && providers[name].enabled !== false,
+  );
+
+  const reset = () => {
+    setModels(null);
+    setSelected(new Set());
+    setError(null);
+    setFilter('');
+  };
+
+  const start = () => {
+    reset();
+    setProviderName(candidates[0] ?? '');
+    setOpen(true);
+  };
+
+  const run = async (name: string) => {
+    if (!name) return;
+    reset();
+    setBusy(true);
+    try {
+      const res = await app.discoverProviderModels(name);
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setModels(res.models);
+      // Pre-select only models not already in the catalog for THIS provider, so the
+      // common case (first run, or a provider that added new models) is one click.
+      const already = new Set(
+        existingCatalog.filter((m) => m.provider === name).map((m) => m.modelName.toLowerCase()),
+      );
+      setSelected(new Set(res.models.filter((m) => !already.has(m.id.toLowerCase())).map((m) => m.id)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const alreadyImported = (id: string) =>
+    existingCatalog.some((m) => m.provider === providerName && m.modelName.toLowerCase() === id.toLowerCase());
+
+  const handleImport = () => {
+    if (!models) return;
+    const provider = providers[providerName];
+    const takenKeys = new Set(existingCatalog.map((m) => m.key));
+    const entries: CatalogEntry[] = [];
+
+    for (const m of models) {
+      if (!selected.has(m.id)) continue;
+      if (alreadyImported(m.id)) continue;
+      const displayName = m.displayName ?? m.id;
+      // Match manual-entry key derivation, and de-dupe against both the existing
+      // catalog and keys minted earlier in this same batch.
+      let key = toKey(m.id) || toKey(displayName);
+      if (!key) continue;
+      if (takenKeys.has(key)) {
+        const base = key;
+        let n = 2;
+        while (takenKeys.has(`${base}-${n}`)) n++;
+        key = `${base}-${n}`;
+      }
+      takenKeys.add(key);
+
+      const entry: CatalogEntry = { key, displayName, provider: providerName, modelName: m.id };
+      if (m.maxInputTokens) entry.maxInputTokens = m.maxInputTokens;
+      // Mirror ModelForm's provider/model-aware caching default so a discovered
+      // Claude model behaves the same as a hand-added one.
+      const isAnthropicFamily =
+        provider?.type === 'anthropic' ||
+        (provider?.type === 'amazon-bedrock' && /anthropic|claude/i.test(m.id));
+      if (isAnthropicFamily) {
+        entry.promptCaching = { enabled: true, ...(provider?.type === 'anthropic' ? { ttl: '5m' as const } : {}) };
+      }
+      entries.push(entry);
+    }
+
+    onImport(entries);
+    setOpen(false);
+    reset();
+  };
+
+  if (candidates.length === 0) return null;
+
+  const needle = filter.trim().toLowerCase();
+  const visible = models?.filter((m) => !needle || m.id.toLowerCase().includes(needle)) ?? [];
+  const selectableVisible = visible.filter((m) => !alreadyImported(m.id));
+  const importCount = models ? [...selected].filter((id) => !alreadyImported(id)).length : 0;
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={start}
+        className="flex shrink-0 items-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50"
+        title="Fetch the model list from a configured provider"
+      >
+        <SearchIcon className="h-3.5 w-3.5" />
+        Discover
+      </button>
+    );
+  }
+
+  return (
+    <div className="w-full space-y-2 rounded-lg border bg-card p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold">Discover models</span>
         <button
           type="button"
-          onClick={() => setShowAdd(true)}
-          className="flex items-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/50 transition-colors w-full"
+          onClick={() => {
+            setOpen(false);
+            reset();
+          }}
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted"
+          title="Close"
         >
-          <PlusIcon className="h-3.5 w-3.5" />
-          Add Model
+          <XIcon className="h-3.5 w-3.5" />
         </button>
+      </div>
+
+      <div className="flex items-end gap-2">
+        <div className="flex-1">
+          <label className="mb-0.5 block text-[10px] text-muted-foreground">Provider</label>
+          <select
+            className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
+            value={providerName}
+            onChange={(e) => {
+              setProviderName(e.target.value);
+              reset();
+            }}
+          >
+            {candidates.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button
+          type="button"
+          onClick={() => void run(providerName)}
+          disabled={busy || !providerName}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+        >
+          {busy ? <LoaderIcon className="h-3 w-3 animate-spin" /> : <SearchIcon className="h-3 w-3" />}
+          {busy ? 'Fetching…' : 'Fetch models'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-start gap-1.5 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1.5 text-[10px] text-destructive">
+          <AlertCircleIcon className="mt-[1px] h-3 w-3 shrink-0" />
+          <span className="min-w-0 break-words">{error}</span>
+        </div>
+      )}
+
+      {models && (
+        <>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder={`Filter ${models.length} models…`}
+              className="flex-1 rounded-lg border border-border/70 bg-background px-2 py-1 text-xs outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => setSelected(new Set(selectableVisible.map((m) => m.id)))}
+              className="rounded px-1.5 py-1 text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              All
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelected(new Set())}
+              className="rounded px-1.5 py-1 text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              None
+            </button>
+          </div>
+
+          <div className="max-h-[260px] space-y-0.5 overflow-y-auto rounded-md border border-border/60 p-1">
+            {visible.map((m) => {
+              const imported = alreadyImported(m.id);
+              return (
+                <label
+                  key={m.id}
+                  className={`flex items-center gap-2 rounded px-2 py-1 text-xs ${
+                    imported ? 'opacity-50' : 'cursor-pointer hover:bg-muted/60'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="rounded"
+                    disabled={imported}
+                    checked={imported || selected.has(m.id)}
+                    onChange={(e) => {
+                      setSelected((prev) => {
+                        const next = new Set(prev);
+                        if (e.target.checked) next.add(m.id);
+                        else next.delete(m.id);
+                        return next;
+                      });
+                    }}
+                  />
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{m.id}</span>
+                  {m.maxInputTokens && (
+                    <span className="shrink-0 text-[10px] text-muted-foreground">
+                      {Math.round(m.maxInputTokens / 1000)}k
+                    </span>
+                  )}
+                  {imported && <span className="shrink-0 text-[10px] text-muted-foreground">added</span>}
+                </label>
+              );
+            })}
+            {visible.length === 0 && (
+              <p className="px-2 py-2 text-[11px] text-muted-foreground/70">No models match “{filter}”.</p>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleImport}
+              disabled={importCount === 0}
+              className="flex items-center gap-1 rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+            >
+              <CheckIcon className="h-3 w-3" />
+              Add {importCount} model{importCount === 1 ? '' : 's'}
+            </button>
+            <span className="text-[10px] text-muted-foreground">
+              Imported models use the provider’s ids; edit any entry afterward to set context size or Autopilot
+              support.
+            </span>
+          </div>
+        </>
       )}
     </div>
   );

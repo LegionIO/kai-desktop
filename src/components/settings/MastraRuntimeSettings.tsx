@@ -1,12 +1,27 @@
-import { useState, type FC } from 'react';
-import { CollapsibleSection, type SettingsProps } from './shared';
+import { useState, useEffect, type FC } from 'react';
+import { CollapsibleSection, useSettingsFocus, type SettingsProps } from './shared';
 import { MemorySettings } from './MemorySettings';
 import { CompactionSettings } from './CompactionSettings';
 
 type RuntimeTab = 'memory' | 'compaction';
 
+/**
+ * Search entries whose anchor lives under a specific inner tab here. Without this the
+ * enclosing CollapsibleSection would open but the target would still be unmounted
+ * behind the non-active tab, so the highlight would never land.
+ */
+const TAB_FOR_ANCHOR: Record<string, RuntimeTab> = {
+  'compaction.media': 'compaction',
+};
+
 export const MastraRuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const [activeTab, setActiveTab] = useState<RuntimeTab>('memory');
+  const focus = useSettingsFocus();
+
+  useEffect(() => {
+    const wanted = focus?.anchorId ? TAB_FOR_ANCHOR[focus.anchorId] : undefined;
+    if (wanted) setActiveTab(wanted);
+  }, [focus]);
 
   const tabs: Array<{ key: RuntimeTab; label: string }> = [
     { key: 'memory', label: 'Memory' },

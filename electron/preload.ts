@@ -667,6 +667,13 @@ const appAPI = {
 
   modelCatalog: () => ipcRenderer.invoke('agent:model-catalog'),
 
+  /** Ask a configured provider which models it serves (Models › Catalog “Discover”). */
+  discoverProviderModels: (providerName: string) =>
+    ipcRenderer.invoke('agent:discover-provider-models', providerName) as Promise<
+      | { ok: true; models: Array<{ id: string; displayName?: string; maxInputTokens?: number }> }
+      | { ok: false; error: string }
+    >,
+
   realtime: {
     startSession: (conversationId: string) =>
       ipcRenderer.invoke('realtime:start-session', conversationId) as Promise<{ ok?: boolean; error?: string }>,

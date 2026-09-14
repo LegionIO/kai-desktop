@@ -11078,6 +11078,28 @@ export function registerAgentHandlers(
     }
   });
 
+  // Provider model discovery: ask a configured provider which models it serves so the
+  // user doesn't hand-type dozens of catalog entries.
+  //
+  // Takes only the provider NAME and reads credentials from the on-disk config, so an
+  // API key never crosses IPC and a caller can't smuggle in an arbitrary endpoint to
+  // fetch (the SSRF guard inside discoverProviderModels still applies to the configured
+  // endpoint, which an operator may legitimately point at an on-prem gateway).
+  ipcMain.handle('agent:discover-provider-models', async (_event, providerName: unknown) => {
+    if (typeof providerName !== 'string' || !providerName.trim()) {
+      return { ok: false as const, error: 'A provider name is required.' };
+    }
+    try {
+      const config = readEffectiveConfig(appHome);
+      const provider = config.models.providers[providerName];
+      if (!provider) return { ok: false as const, error: `Unknown provider "${providerName}".` };
+      const { discoverProviderModels } = await import('../agent/model-discovery.js');
+      return await discoverProviderModels(provider);
+    } catch (err) {
+      return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
   // Runtime introspection endpoints
   ipcMain.handle('agent:get-available-runtimes', async () => {
     const { getAvailableRuntimes } = await import('../agent/runtime/index.js');
