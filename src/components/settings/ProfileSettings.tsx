@@ -352,28 +352,7 @@ const ProfileForm: FC<{
 
       {/* Model chain */}
       <div>
-        <div className="flex items-center justify-between mb-0.5">
-          <label className="text-[10px] text-muted-foreground">Model chain</label>
-          {availableToAdd.length > 0 && (
-            <div className="relative">
-              <select
-                aria-label="Add model to chain"
-                className="cursor-pointer rounded-lg border border-dashed bg-transparent px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-muted/50 transition-colors"
-                value=""
-                onChange={(e) => {
-                  if (e.target.value) addToChain(e.target.value);
-                }}
-              >
-                <option value="">+ Add model</option>
-                {availableToAdd.map((m) => (
-                  <option key={m.key} value={m.key}>
-                    {m.displayName}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-        </div>
+        <label className="text-[10px] text-muted-foreground block mb-0.5">Model chain</label>
 
         <div className="rounded-lg border bg-background/50 p-1">
           <SortableList
@@ -383,16 +362,28 @@ const ProfileForm: FC<{
             getItemLabel={(modelKey) => models.find((m) => m.key === modelKey)?.displayName ?? modelKey}
             itemClassName="relative flex items-center gap-1.5 px-2 py-1.5"
             renderLeading={(index) => (
-              <div className="relative flex w-3 shrink-0 flex-col items-center self-stretch">
-                {/* Spine: hairline connecting rows into one sequence */}
-                {index > 0 && <div className="absolute top-0 h-1/2 w-px -translate-y-full bg-border" />}
+              <div className="relative flex w-3 shrink-0 flex-col items-center justify-center self-stretch">
+                {/* Spine: one continuous hairline through the stack, clipped to
+                    the vertical center on the first/last row so it starts and
+                    ends at the dot rather than the row's edge. Percentage-based
+                    (top-1/2 / bottom-1/2), so it holds regardless of row height
+                    — including a row that wraps to two lines. */}
+                {chain.length > 1 && (
+                  <div
+                    className={cn(
+                      'absolute left-1/2 w-px -translate-x-1/2 bg-border',
+                      index === 0 && 'top-1/2 bottom-0',
+                      index === chain.length - 1 && 'top-0 bottom-1/2',
+                      index > 0 && index < chain.length - 1 && 'top-0 bottom-0',
+                    )}
+                  />
+                )}
                 <div
                   className={cn(
-                    'z-10 mt-[calc(50%-1px)] h-1.5 w-1.5 shrink-0 rounded-full',
+                    'z-10 h-1.5 w-1.5 shrink-0 rounded-full',
                     index === 0 ? 'bg-primary' : 'border border-border bg-background',
                   )}
                 />
-                {index < chain.length - 1 && <div className="absolute bottom-0 h-1/2 w-px translate-y-full bg-border" />}
               </div>
             )}
             renderItem={(modelKey, index) => {
@@ -423,6 +414,21 @@ const ProfileForm: FC<{
             }}
           />
         </div>
+
+        {availableToAdd.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-1.5">
+            {availableToAdd.map((m) => (
+              <button
+                key={m.key}
+                type="button"
+                onClick={() => addToChain(m.key)}
+                className="rounded-lg border border-dashed px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted/50 transition-colors"
+              >
+                + {m.displayName}
+              </button>
+            ))}
+          </div>
+        )}
 
         <p className="text-[10px] text-muted-foreground mt-1.5">
           Drag to reorder. The top model runs; the rest are tried in order if it fails.

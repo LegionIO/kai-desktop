@@ -509,12 +509,25 @@ const RuleEditor: FC<{
   // instance and its internal field state would attach to the wrong action.
   // We maintain a parallel array of synthetic ids local to this editor
   // instance, kept 1:1 with `rule.actions` by construction — `addAction` /
-  // `removeAction` / `reorderActions` below are the ONLY places this
-  // component mutates `rule.actions`, and each keeps `actionIds` in lockstep.
-  // This RuleEditor instance is remounted fresh whenever its rule row is
-  // collapsed/expanded (see the `isOpen &&` guard in the parent), so a fresh
-  // `rule.actions.map(() => generateId())` on mount is always length-correct.
+  // `removeAction` / `reorderActions` below are the ONLY places THIS
+  // component mutates `rule.actions`. But `rule.actions` can also change out
+  // from under us via a route none of those three control: `updateConfig` is
+  // an async round-trip that replaces the whole config object while this
+  // (non-remounted) editor stays open — a concurrent config write, a
+  // hot-reloaded automation, or a rejected zod write snapping the array back
+  // to its previous shape can all change `rule.actions.length` without going
+  // through `addAction`/`removeAction`. If that happens, reconcile rather
+  // than trust the invariant: truncate stale trailing ids, or mint fresh ones
+  // for newly-appeared actions.
   const [actionIds, setActionIds] = useState<string[]>(() => rule.actions.map(() => generateId()));
+
+  useEffect(() => {
+    setActionIds((ids) => {
+      if (ids.length === rule.actions.length) return ids;
+      if (ids.length > rule.actions.length) return ids.slice(0, rule.actions.length);
+      return [...ids, ...rule.actions.slice(ids.length).map(() => generateId())];
+    });
+  }, [rule.actions.length]);
 
   const addAction = () => {
     onChange({ actions: [...rule.actions, newAction('notification')] });

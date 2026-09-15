@@ -57,7 +57,7 @@ function baseConfig() {
             { type: 'notification', title: 'First action title' },
             { type: 'notification', title: 'Second action title' },
             { type: 'notification', title: 'Third action title' },
-          ],
+          ] as Array<Record<string, unknown>>,
         },
       ],
     },
@@ -71,6 +71,18 @@ afterEach(() => {
 
 describe('AutomationsSettings action reordering', () => {
   it('preserves each action row\'s own field values after a keyboard reorder (index-key regression guard)', async () => {
+    // `TextField` re-syncs its displayed value from `value` via a `useEffect`
+    // whenever the field isn't focused (see shared.tsx) — so asserting on a
+    // TextField's `.value` after a reorder only proves the reordered *data*
+    // landed in the right slot, not that React reused the correct component
+    // instance. The instance-identity risk (stale index-keyed rows reusing
+    // the wrong child, dragging along whatever *local, non-prop-derived*
+    // state that child held) only shows up through state that is NOT synced
+    // from props. `JsonField`'s parse-error banner (`useState<string|null>`,
+    // set only inside its own `onBlur` handler, never reset from `value`) is
+    // exactly that kind of state, so this test drives an error into one
+    // action's JSON textarea and confirms the error follows that action
+    // across a reorder rather than staying pinned to its old slot index.
     installAppBridgeStub({
       automations: {
         catalog: async () => [],
@@ -84,24 +96,38 @@ describe('AutomationsSettings action reordering', () => {
     });
     const updateConfig = vi.fn(async () => undefined);
     const config = baseConfig();
+    config.automations.rules[0]!.actions = [
+      { type: 'tool', toolName: 'alpha', input: {} },
+      { type: 'tool', toolName: 'beta', input: {} },
+    ];
 
     const { rerender } = render(<AutomationsSettings config={config} updateConfig={updateConfig} />);
 
     // Expand the rule to render its actions.
     fireEvent.click(getRuleChevron(document.body));
-    expect(await screen.findByDisplayValue('First action title')).toBeInTheDocument();
+    expect(await screen.findByDisplayValue('alpha')).toBeInTheDocument();
 
     const list = screen.getByRole('list', { name: 'actions' });
     stubRowRects(list);
 
-    // Reorder: move action #1 ("First action title") down one slot, past
-    // action #2. If the list were still keyed by array index (the bug this
-    // change fixes), React would reuse the ActionEditor DOM node in slot 0
-    // for whatever action now occupies index 0 in the underlying array —
-    // any locally-buffered/uncommitted field state would appear attached to
-    // the wrong action. Reading the value straight out of the rendered
-    // inputs below verifies the fields travel WITH their action, not with
-    // their slot.
+    // Put row 0 (toolName "alpha") into a parse-error state via its JSON
+    // textarea. This error lives only in JsonField's local useState — never
+    // written to config, never derived from `value` — so it will NOT follow
+    // the data through a prop-driven re-render; it only follows the DOM node
+    // React chooses to reuse.
+    const jsonFields = within(list).getAllByRole('textbox').filter((el) => el.tagName === 'TEXTAREA');
+    fireEvent.change(jsonFields[0]!, { target: { value: '{ not valid json' } });
+    fireEvent.blur(jsonFields[0]!);
+    // Exact browser/V8 JSON.parse error text; match narrowly because the
+    // "Input (JSON)" label text itself would also match a loose /JSON/ regex.
+    expect(await screen.findByText(/Expected property name/)).toBeInTheDocument();
+
+    const rowsBefore = within(list).getAllByRole('listitem');
+    expect(rowsBefore[0]?.textContent).toMatch(/Expected property name/);
+    expect(rowsBefore[1]?.textContent).not.toMatch(/Expected property name/);
+
+    // Reorder: move action #1 ("alpha", currently erroring) down one slot,
+    // past action #2 ("beta").
     const handles = within(list).getAllByRole('button', { name: /^Reorder action \d$/ });
     const handleFirst = handles[0]!;
     handleFirst.focus();
@@ -121,17 +147,13 @@ describe('AutomationsSettings action reordering', () => {
     rerender(<AutomationsSettings config={nextConfig} updateConfig={updateConfig} />);
 
     const reorderedList = screen.getByRole('list', { name: 'actions' });
-    const titleInputs = within(reorderedList)
-      .getAllByRole('textbox')
-      // Each notification action renders two text fields, Title then Body,
-      // in that order — Title is always the first of each pair.
-      .filter((_, i) => i % 2 === 0);
-    // Second action should now be first, First action second, Third unchanged.
-    expect(titleInputs.map((el) => (el as HTMLInputElement).value)).toEqual([
-      'Second action title',
-      'First action title',
-      'Third action title',
-    ]);
+    const rowsAfter = within(reorderedList).getAllByRole('listitem');
+    // "beta" (no error) is now first; "alpha" (still erroring) is now second.
+    // If the row keyed by array index instead of the action's own identity,
+    // the error banner would stay attached to slot 0 (now "beta") instead of
+    // travelling with "alpha" into slot 1.
+    expect(rowsAfter[0]?.textContent).not.toMatch(/Expected property name/);
+    expect(rowsAfter[1]?.textContent).toMatch(/Expected property name/);
   });
 
   it('keeps the remove guard: a rule with only one action cannot remove it', async () => {
