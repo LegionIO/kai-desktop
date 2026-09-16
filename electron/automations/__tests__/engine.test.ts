@@ -6,7 +6,7 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: { getAllWindows: () => [] },
 }));
-vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
+vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0, hasAnyConsumer: () => true }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
 vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: '', modelKey: 'test', toolCalls: [] })),

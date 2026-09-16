@@ -7,7 +7,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const broadcast = vi.fn();
-vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: (...a: unknown[]) => broadcast(...a) }));
+// `hasAnyConsumer` gates the high-volume `plugin:event` fan-out. Defaults to true
+// so the pre-existing broadcast assertions below describe a listening renderer;
+// the gating suite drives it explicitly.
+const hasAnyConsumer = vi.fn(() => true);
+vi.mock('../../utils/window-send.js', () => ({
+  broadcastToAllWindows: (...a: unknown[]) => broadcast(...a),
+  hasAnyConsumer: (...a: unknown[]) => hasAnyConsumer(...(a as [])),
+}));
 
 import { AutomationEventBus } from '../event-bus.js';
 import type { SourceCatalogEntry, AutomationEvent } from '../types.js';
@@ -16,6 +23,8 @@ let bus: AutomationEventBus;
 beforeEach(() => {
   bus = new AutomationEventBus();
   broadcast.mockClear();
+  hasAnyConsumer.mockClear();
+  hasAnyConsumer.mockReturnValue(true);
 });
 
 const source = (name: string): SourceCatalogEntry => ({ source: name, events: [] }) as unknown as SourceCatalogEntry;
@@ -114,5 +123,55 @@ describe('validator cache invalidation', () => {
     bus.registerSource(withSchema({}));
     // Emitting again must still work (recompiled validator), no throw.
     expect(() => bus.emit('sys', 'ping', { n: 2 })).not.toThrow();
+  });
+});
+
+/**
+ * The `plugin:event` fan-out is the highest-volume broadcast in the app and every
+ * delivery deep-proxies its payload across the contextBridge, charging the
+ * allocation to the renderer heap. An unconsumed stream of these exhausted V8
+ * overnight (renderer SIGTRAP via partition_alloc OOM). Gating it on a live
+ * consumer is what prevents that, so these tests pin the gate's exact semantics.
+ */
+describe('plugin:event consumer gating', () => {
+  it('broadcasts plugin events when a consumer is listening', () => {
+    hasAnyConsumer.mockReturnValue(true);
+    bus.emit('plugin.msgraph', 'message-received', { id: 'm1' });
+    expect(broadcast).toHaveBeenCalledWith('plugin:event', {
+      pluginName: 'msgraph',
+      eventName: 'message-received',
+      data: { id: 'm1' },
+    });
+  });
+
+  it('SKIPS the broadcast entirely when nothing consumes the channel', () => {
+    hasAnyConsumer.mockReturnValue(false);
+    bus.emit('plugin.msgraph', 'message-received', { id: 'm1' });
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it('gates on the plugin:event channel specifically', () => {
+    bus.emit('plugin.msgraph', 'message-received', {});
+    expect(hasAnyConsumer).toHaveBeenCalledWith('plugin:event');
+  });
+
+  it('still delivers to in-process listeners (automation rules) when the renderer gate is closed', () => {
+    // Automation rules consume the in-process listener set, NOT plugin:event.
+    // Gating the renderer fan-out must never disable automations.
+    hasAnyConsumer.mockReturnValue(false);
+    const seen: AutomationEvent[] = [];
+    bus.subscribe((e) => seen.push(e));
+    bus.emit('plugin.msgraph', 'message-received', { id: 'm1' });
+    expect(broadcast).not.toHaveBeenCalled();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ key: 'plugin.msgraph:message-received', source: 'plugin.msgraph' });
+  });
+
+  it('does not consult the gate for non-plugin sources', () => {
+    // Non-plugin sources never used this channel; they must not start paying a
+    // gate check, and must not be broadcast on plugin:event.
+    bus.emit('sys', 'ping', {});
+    expect(hasAnyConsumer).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalledWith('plugin:event', expect.anything());
   });
 });

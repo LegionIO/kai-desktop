@@ -245,6 +245,11 @@ import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
+import {
+  addRendererSubscription,
+  clearRendererSubscriptions,
+  removeRendererSubscription,
+} from './utils/renderer-subscriptions.js';
 import { resolveBoundedSuffixRange, safeReadFileWithin, safeReadRangeWithin } from './utils/safe-file-read.js';
 import { overrideCommittedQuitUnloadVeto } from './quit-lifecycle.js';
 import {
@@ -953,6 +958,13 @@ function runApplicationMenuCommand(command: BrowserAwareApplicationMenuCommand):
 
 let updateDownloaded = false;
 let primaryWindowRef: BrowserWindow | null = null;
+
+/**
+ * webContents ids that already have a `destroyed` cleanup hook installed for
+ * gated-channel subscription bookkeeping. Prevents stacking one listener per
+ * subscribe call on a renderer that attaches many listeners.
+ */
+const subscriptionCleanupBound = new Set<number>();
 
 /** A primary renderer realm owns every native Browser capability. Losing that
  * realm must revoke manager, text, and Realtime authority as one operation. */
@@ -1711,6 +1723,15 @@ if (gotSingleInstanceLock) {
       windowHealthMonitor.recordChildProcessGone({ ...details });
     });
     app.on('render-process-gone', (_event, contents, details) => {
+      // Release every gated-channel subscription this renderer held. A crashed
+      // renderer never runs its teardown callbacks, so without this its counts
+      // linger forever and high-volume broadcast gates (see
+      // utils/renderer-subscriptions.ts) stay permanently open.
+      try {
+        clearRendererSubscriptions(contents.id);
+      } catch {
+        /* subscription bookkeeping must never break crash handling */
+      }
       // A Browser page renderer crash is handled by BrowserManager itself. Only
       // loss of the primary React renderer invalidates all native child views.
       if (primaryWindowRef && contents === primaryWindowRef.webContents) {
@@ -2265,6 +2286,30 @@ if (gotSingleInstanceLock) {
             ? (candidate.fields as Record<string, unknown>)
             : undefined,
       });
+    });
+    // Renderer subscription bookkeeping for gated high-volume channels. The
+    // preload `on<Event>` wrappers report attach/detach so main can skip
+    // broadcasts nothing consumes (see utils/renderer-subscriptions.ts). Both
+    // are `on` (fire-and-forget): a lost report must never block the renderer,
+    // and the gate fails open.
+    ipcMain.on('ipc:subscribe', (event, channel: unknown) => {
+      if (typeof channel !== 'string' || !channel) return;
+      addRendererSubscription(channel, event.sender.id);
+      // First subscription from this webContents: arrange cleanup so a reload or
+      // close can't leak the count. `destroyed` covers the normal teardown path;
+      // `render-process-gone` (above) covers the crash path.
+      if (!subscriptionCleanupBound.has(event.sender.id)) {
+        subscriptionCleanupBound.add(event.sender.id);
+        const senderId = event.sender.id;
+        event.sender.once('destroyed', () => {
+          subscriptionCleanupBound.delete(senderId);
+          clearRendererSubscriptions(senderId);
+        });
+      }
+    });
+    ipcMain.on('ipc:unsubscribe', (event, channel: unknown) => {
+      if (typeof channel !== 'string' || !channel) return;
+      removeRendererSubscription(channel, event.sender.id);
     });
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);

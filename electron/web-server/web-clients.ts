@@ -23,6 +23,20 @@ export function registerBroadcastSink(sink: BroadcastSink): () => void {
 }
 
 /**
+ * True when some remote transport (web client or registered sink such as the
+ * `kai` CLI bridge) would receive a broadcast. Lets a caller skip preparing and
+ * sending a high-volume event when nothing outside the Electron windows is
+ * listening — see `hasAnyConsumer` in ../utils/renderer-subscriptions.ts.
+ *
+ * Deliberately counts sinks as consumers without asking whether they care about
+ * a specific channel: a sink is an opaque forwarder, so assuming it listens is
+ * the fail-open (never-drop-an-event) choice.
+ */
+export function hasRemoteConsumers(): boolean {
+  return webClients.size > 0 || extraSinks.size > 0;
+}
+
+/**
  * Push an event to every connected web client AND every registered extra sink.
  * Mirrors the shape sent over the WebSocket protocol so the bridge client
  * script can dispatch it to the matching `on<Event>` callback.

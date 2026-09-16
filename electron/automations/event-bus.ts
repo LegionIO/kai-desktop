@@ -1,7 +1,10 @@
 import type { z } from 'zod';
 import { convertJsonSchemaToZod } from '../tools/json-schema-zod.js';
-import { broadcastToAllWindows } from '../utils/window-send.js';
+import { broadcastToAllWindows, hasAnyConsumer } from '../utils/window-send.js';
 import type { AutomationEvent, SourceCatalogEntry } from './types.js';
+
+/** Renderer channel carrying plugin-sourced events. Gated by subscriber count. */
+const PLUGIN_EVENT_CHANNEL = 'plugin:event';
 
 type Listener = (event: AutomationEvent) => void;
 
@@ -66,8 +69,19 @@ export class AutomationEventBus {
 
     // Preserve the pre-existing renderer contract: plugin-sourced events continue
     // to arrive on the `plugin:event` channel with the bare plugin name.
-    if (source.startsWith('plugin.')) {
-      broadcastToAllWindows('plugin:event', {
+    //
+    // Gated on an actual consumer. This is the highest-volume broadcast in the
+    // app (a chatty plugin emits thousands per day), and each delivery
+    // deep-proxies `payload` across the contextBridge — allocation proportional
+    // to the object graph, charged to the renderer heap. With no listener that
+    // work is pure churn, and enough of it exhausted V8's heap overnight.
+    // `hasAnyConsumer` is fail-open: it only reports false when we positively
+    // know no renderer subscribed and no remote transport is attached.
+    //
+    // Automation rules do NOT come through here — they consume the in-process
+    // `listeners` set above, so gating this fan-out cannot affect them.
+    if (source.startsWith('plugin.') && hasAnyConsumer(PLUGIN_EVENT_CHANNEL)) {
+      broadcastToAllWindows(PLUGIN_EVENT_CHANNEL, {
         pluginName: source.slice('plugin.'.length),
         eventName: event,
         data: payload,

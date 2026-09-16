@@ -5,6 +5,7 @@ import { join } from 'path';
 import type { NativeImage, ProcessMetric, WebContents } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  CRASH_RELOAD_DELAY_MS,
   probeWindowHealth,
   sampleRendererHeap,
   WindowHealthMonitor,
@@ -182,12 +183,13 @@ describe('WindowHealthMonitor recovery policy', () => {
         onNativeSettled?: () => void,
       ) => void | Promise<void>;
       getRendererRecoveryPolicy?: () => { reloadStalledRenderer: boolean; stallReloadMs: number } | null;
+      getPrimaryWindow?: () => HealthWindow | null;
       skipLoad?: boolean;
     } = {},
   ): WindowHealthMonitor {
     const monitor = new WindowHealthMonitor({
       logPath,
-      getPrimaryWindow: () => asHealthWindow(window),
+      getPrimaryWindow: options.getPrimaryWindow ?? (() => asHealthWindow(window)),
       getProcessMetrics: () => [] as ProcessMetric[],
       hasActiveWork: options.active ?? (() => false),
       reviveNativeSurface: options.revive,
@@ -255,23 +257,127 @@ describe('WindowHealthMonitor recovery policy', () => {
   });
 
   it('automatically reloads a crashed primary renderer but suppresses a reload loop', () => {
-    let now = 1_000_000;
-    const monitor = makeMonitor({ now: () => now });
-    const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+    vi.useFakeTimers();
+    try {
+      let now = 1_000_000;
+      const monitor = makeMonitor({ now: () => now });
+      const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
 
-    monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
-    monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
-    now += 61_000;
-    monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
-    now += 61_000;
-    monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+      // Each crash arms a DEFERRED reload (see reloadAfterRendererCrash); the
+      // timer is drained between crashes so this exercises the cooldown guard
+      // rather than the coalescing of one burst.
+      const crash = () => {
+        monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+        vi.advanceTimersByTime(CRASH_RELOAD_DELAY_MS + 50);
+      };
 
-    expect(window.webContents.reload).toHaveBeenCalledTimes(2);
-    const log = readFileSync(logPath, 'utf-8');
-    expect(log).toContain('event=render-process-gone');
-    expect(log).toContain('event=auto-reload-suppressed');
-    expect(log).not.toContain('approval=secret');
-    monitor.detachWindow();
+      crash(); // reloads
+      crash(); // within cooldown → suppressed
+      now += 61_000;
+      crash(); // cooldown expired → reloads
+      now += 61_000;
+      crash(); // per-window cap reached → suppressed
+
+      expect(window.webContents.reload).toHaveBeenCalledTimes(2);
+      const log = readFileSync(logPath, 'utf-8');
+      expect(log).toContain('event=render-process-gone');
+      expect(log).toContain('event=auto-reload-suppressed');
+      expect(log).not.toContain('approval=secret');
+      monitor.detachWindow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces a burst of crash events into a single deferred reload', () => {
+    // Repeat `render-process-gone` events before the timer fires must not stack
+    // reloads or push the reload further out — one recovery, one loop-guard slot.
+    vi.useFakeTimers();
+    try {
+      const monitor = makeMonitor({});
+      const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+      monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+      monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+      monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+      vi.advanceTimersByTime(300);
+      expect(window.webContents.reload).toHaveBeenCalledTimes(1);
+      expect(readFileSync(logPath, 'utf-8')).toContain('event=auto-reload-coalesced');
+      monitor.detachWindow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Regression guard for the main-process crash that turned a recoverable renderer
+   * crash into total app loss. Reloading synchronously from `render-process-gone`
+   * reuses the just-dead RenderProcessHost before the browser process untracks it,
+   * tripping CHECK(GetRenderer(host) != nullptr || !IsSameContext(...)) in
+   * extensions/browser/renderer_startup_helper.cc:288 — a hard SIGTRAP in the main
+   * process ~80ms after the renderer died.
+   */
+  describe('crash-reload deferral', () => {
+    it('does NOT reload inline from the crash handler', () => {
+      vi.useFakeTimers();
+      try {
+        const monitor = makeMonitor({});
+        const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+        monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+        // The critical assertion: still no reload while the stack that delivered
+        // the crash event is unwinding.
+        expect(window.webContents.reload).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(250);
+        expect(window.webContents.reload).toHaveBeenCalledTimes(1);
+        monitor.detachWindow();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('logs the deferral so the delay is visible in window-health.log', () => {
+      vi.useFakeTimers();
+      try {
+        const monitor = makeMonitor({});
+        const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+        monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+        expect(readFileSync(logPath, 'utf-8')).toContain('deferredMs');
+        monitor.detachWindow();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('skips the reload when the window disappears during the delay', () => {
+      vi.useFakeTimers();
+      try {
+        let win: HealthWindow | null = asHealthWindow(window);
+        const monitor = makeMonitor({ getPrimaryWindow: () => win });
+        const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+        monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+        // Updater teardown / user close during the 250ms window.
+        win = null;
+        vi.advanceTimersByTime(300);
+        expect(window.webContents.reload).not.toHaveBeenCalled();
+        expect(readFileSync(logPath, 'utf-8')).toContain('event=auto-reload-skipped');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('cancels a pending crash reload on detachWindow', () => {
+      vi.useFakeTimers();
+      try {
+        const monitor = makeMonitor({});
+        const contents = window.webContents as unknown as Pick<WebContents, 'id' | 'getURL' | 'getOSProcessId'>;
+        monitor.recordRendererGone(contents, { reason: 'crashed', exitCode: 5 });
+        monitor.detachWindow();
+        vi.advanceTimersByTime(300);
+        // A detached monitor must not reload a window it no longer owns.
+        expect(window.webContents.reload).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it('records GPU exits with process context and schedules recovery', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
+vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0, hasAnyConsumer: () => true }));
 
 import type { AutomationRule } from '../../config/schema.js';
 import { AutomationEventBus } from '../event-bus.js';

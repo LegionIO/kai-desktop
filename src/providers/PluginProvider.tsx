@@ -164,13 +164,6 @@ type ModalCallbackData = {
   data: unknown;
 };
 
-type PluginEventRecord = {
-  pluginName: string;
-  eventName: string;
-  data: unknown;
-  receivedAt: number;
-};
-
 type PluginRendererStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 type PluginNavigationRequestRecord = {
@@ -182,7 +175,6 @@ type PluginNavigationRequestRecord = {
 type PluginContextValue = {
   uiState: PluginUIState | null;
   modalCallbacks: ModalCallbackData[];
-  pluginEvents: PluginEventRecord[];
   navigationRequests: PluginNavigationRequestRecord[];
   rendererLoadCount: number;
   pluginUpdateCount: number;
@@ -201,13 +193,11 @@ type PluginContextValue = {
   consumeModalCallback: (pluginName: string, modalId: string) => ModalCallbackData | null;
   consumeNavigationRequest: () => PluginNavigationRequestRecord | null;
   injectNavigationRequest: (pluginName: string, target: PluginNavigationTarget) => void;
-  consumePluginEvent: (pluginName?: string, eventName?: string) => PluginEventRecord | null;
 };
 
 const PluginContext = createContext<PluginContextValue>({
   uiState: null,
   modalCallbacks: [],
-  pluginEvents: [],
   navigationRequests: [],
   rendererLoadCount: 0,
   pluginUpdateCount: 0,
@@ -226,7 +216,6 @@ const PluginContext = createContext<PluginContextValue>({
   consumeModalCallback: () => null,
   consumeNavigationRequest: () => null,
   injectNavigationRequest: () => {},
-  consumePluginEvent: () => null,
 });
 
 function loadPluginRendererScripts(
@@ -307,7 +296,6 @@ function applyPluginRendererStyles(styles: PluginRendererStyle[], loadedRef: Map
 export function PluginProvider({ children }: { children: ReactNode }) {
   const [uiState, setUIState] = useState<PluginUIState | null>(null);
   const [modalCallbacks, setModalCallbacks] = useState<ModalCallbackData[]>([]);
-  const [pluginEvents, setPluginEvents] = useState<PluginEventRecord[]>([]);
   const [navigationRequests, setNavigationRequests] = useState<PluginNavigationRequestRecord[]>([]);
   const [rendererLoadCount, setRendererLoadCount] = useState(0);
   const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
@@ -377,18 +365,18 @@ export function PluginProvider({ children }: { children: ReactNode }) {
       }
     });
 
-    const unsubEvent = app.plugins.onEvent((event) => {
-      const typed = event as { pluginName?: string; eventName?: string; data?: unknown };
-      setPluginEvents((prev) => [
-        ...prev.slice(-49),
-        {
-          pluginName: typed.pluginName ?? '',
-          eventName: typed.eventName ?? 'event',
-          data: typed.data,
-          receivedAt: Date.now(),
-        },
-      ]);
-    });
+    // NOTE: deliberately no `app.plugins.onEvent` subscription here.
+    //
+    // This provider used to accumulate every plugin event into a `pluginEvents`
+    // array that nothing ever read. Because main gates `plugin:event` on live
+    // subscriber count, NOT subscribing means a chatty plugin's events stop
+    // crossing the contextBridge altogether — each crossing deep-proxies the
+    // payload graph and charges the allocation to the renderer heap, which is
+    // what exhausted V8 overnight.
+    //
+    // Automation rules consume these events in the main process and are
+    // unaffected. If a renderer feature ever needs plugin events, subscribe here
+    // (which reopens the gate) and give it a bounded, actually-read buffer.
 
     const unsubNavigation = app.plugins.onNavigationRequest((request) => {
       const typed = request as { pluginName?: string; target?: PluginNavigationTarget };
@@ -430,7 +418,6 @@ export function PluginProvider({ children }: { children: ReactNode }) {
 
     return () => {
       unsubUI();
-      unsubEvent();
       unsubNavigation();
       unsubCallback();
       unsubNavigateDirect?.();
@@ -534,27 +521,11 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const consumePluginEvent = useCallback((pluginName?: string, eventName?: string): PluginEventRecord | null => {
-    let found: PluginEventRecord | null = null;
-    setPluginEvents((prev) => {
-      const index = prev.findIndex((event) => {
-        if (pluginName && event.pluginName !== pluginName) return false;
-        if (eventName && event.eventName !== eventName) return false;
-        return true;
-      });
-      if (index < 0) return prev;
-      found = prev[index];
-      return [...prev.slice(0, index), ...prev.slice(index + 1)];
-    });
-    return found;
-  }, []);
-
   return (
     <PluginContext.Provider
       value={{
         uiState,
         modalCallbacks,
-        pluginEvents,
         navigationRequests,
         rendererLoadCount,
         pluginUpdateCount,
@@ -573,7 +544,6 @@ export function PluginProvider({ children }: { children: ReactNode }) {
         consumeModalCallback,
         consumeNavigationRequest,
         injectNavigationRequest,
-        consumePluginEvent,
       }}
     >
       {children}

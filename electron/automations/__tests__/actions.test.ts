@@ -10,7 +10,7 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: { getAllWindows: () => [] },
 }));
-vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
+vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0, hasAnyConsumer: () => true }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
 vi.mock('../../ipc/agent.js', () => ({
   broadcastAgentStreamEvent: vi.fn(),

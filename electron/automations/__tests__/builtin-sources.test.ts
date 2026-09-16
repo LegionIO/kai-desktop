@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() }));
+vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn(), hasAnyConsumer: () => true }));
 
 import { AutomationEventBus } from '../event-bus.js';
 import { registerBuiltinSources } from '../builtin-sources.js';

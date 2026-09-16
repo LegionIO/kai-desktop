@@ -25,6 +25,32 @@ import type {
 
 export type AppAPI = typeof appAPI;
 
+/**
+ * Subscribe to a channel that main gates on subscriber count, reporting attach
+ * and detach so an unconsumed high-volume event can be skipped before it crosses
+ * the contextBridge (see electron/utils/renderer-subscriptions.ts).
+ *
+ * Use ONLY for channels main actually gates. A plain `ipcRenderer.on` stays
+ * correct for everything else; reporting a channel main doesn't gate is harmless
+ * but pointless.
+ *
+ * The returned teardown is idempotent: double-invoking it (React effect cleanup
+ * re-running) must not decrement the count twice and close the gate while
+ * another listener is still attached.
+ */
+function onGatedChannel(channel: string, handler: (...args: unknown[]) => void): () => void {
+  const listener = (_event: Electron.IpcRendererEvent, ...args: unknown[]) => handler(...args);
+  ipcRenderer.on(channel, listener);
+  ipcRenderer.send('ipc:subscribe', channel);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    ipcRenderer.removeListener(channel, listener);
+    ipcRenderer.send('ipc:unsubscribe', channel);
+  };
+}
+
 const appAPI = {
   config: {
     get: () => ipcRenderer.invoke('config:get'),
@@ -624,9 +650,11 @@ const appAPI = {
       return () => ipcRenderer.removeListener('plugin:failed-updates-changed', handler);
     },
     onEvent: (callback: (event: unknown) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
-      ipcRenderer.on('plugin:event', handler);
-      return () => ipcRenderer.removeListener('plugin:event', handler);
+      // Gated channel: main skips this broadcast entirely when no renderer is
+      // subscribed, so the subscription must be reported. Highest-volume event
+      // in the app — an unconsumed delivery still pays full contextBridge
+      // proxying cost against the renderer heap.
+      return onGatedChannel('plugin:event', (data) => callback(data));
     },
     onNavigationRequest: (callback: (request: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);

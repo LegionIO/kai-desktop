@@ -10,6 +10,12 @@ const ACTIVE_WORK_RETRY_MS = 15_000;
 const AUTO_RELOAD_COOLDOWN_MS = 60_000;
 const AUTO_RELOAD_WINDOW_MS = 10 * 60_000;
 const MAX_AUTO_RELOADS_PER_WINDOW = 2;
+// Delay between a renderer crash and the recovery reload. Reloading inline from
+// the `render-process-gone` handler reuses the dead RenderProcessHost and trips a
+// hard CHECK in the browser process (renderer_startup_helper.cc:288), turning a
+// recoverable renderer crash into total app loss. One event-loop yield of this
+// length lets the host be untracked first. See reloadAfterRendererCrash.
+export const CRASH_RELOAD_DELAY_MS = 250;
 // A renderer normally finishes loading in well under 2s. If it stays unloaded
 // past this and recovery keeps getting skipped (the display-reconfigure / GPU
 // context-loss zombie: `did-finish-load` never re-fires), treat it as wedged and
@@ -403,6 +409,9 @@ export async function sampleRendererHeap(window: HealthWindow): Promise<Renderer
 export class WindowHealthMonitor {
   private readonly now: () => number;
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Armed by reloadAfterRendererCrash; deferring the reload avoids a browser-process
+  // CHECK on RenderProcessHost reuse. Tracked so detach can cancel it.
+  private crashReloadTimer: ReturnType<typeof setTimeout> | null = null;
   // Bookkeeping so a newly-requested recovery can tell whether it wants to run
   // sooner than the currently-armed timer (and pre-empt it) vs. coalesce.
   private recoveryTimerArmedAt: number | null = null;
@@ -869,6 +878,10 @@ export class WindowHealthMonitor {
 
   detachWindow(): void {
     this.stopHeapHeartbeat();
+    if (this.crashReloadTimer) {
+      clearTimeout(this.crashReloadTimer);
+      this.crashReloadTimer = null;
+    }
     if (this.recoveryTimer) {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = null;
@@ -1191,16 +1204,71 @@ export class WindowHealthMonitor {
     }
   }
 
+  /**
+   * Reload the primary window after its renderer died.
+   *
+   * The reload is DEFERRED rather than issued inline. Reloading synchronously
+   * from inside the `render-process-gone` handler reuses the just-dead
+   * RenderProcessHost before the browser process has finished tearing down its
+   * per-process extension state, tripping this CHECK in
+   * extensions/browser/renderer_startup_helper.cc:288 —
+   *
+   *   CHECK(GetRenderer(host) != nullptr ||
+   *         !client->IsSameContext(browser_context_, host->GetBrowserContext()));
+   *
+   * which is a hard crash of the MAIN process: a recoverable renderer crash
+   * becomes total app loss. (Chromium guards exactly this reuse-after-failed-start
+   * case by re-registering instead of CHECKing, but only under
+   * BUILDFLAG(IS_ANDROID); on macOS the CHECK is live.) Observed as a
+   * deterministic pair of SIGTRAP reports ~80ms apart, renderer then main.
+   *
+   * Yielding to the event loop first lets RenderProcessHostImpl finish
+   * `RenderProcessExited` → `UntrackProcess` so the reload allocates a fresh
+   * host. The destroyed-checks are repeated inside the callback because the
+   * window can close, or the updater can tear it down, during the delay.
+   */
   private reloadAfterRendererCrash(reason: string): void {
     const window = this.options.getPrimaryWindow();
     if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
+    // A reload is already armed and hasn't fired yet — it will reload the current
+    // primary window, which is exactly what this crash wants. Coalesce into it
+    // rather than clearing and re-arming (which would push the reload further out
+    // on every repeat crash event) or stacking a second timer (which would
+    // double-reload and burn the loop-guard budget twice for one recovery).
+    if (this.crashReloadTimer) {
+      this.log('auto-reload-coalesced', { trigger: 'primary-renderer-gone', reason }, true);
+      return;
+    }
     if (!this.canAutoReload()) {
       this.log('auto-reload-suppressed', { trigger: 'primary-renderer-gone', reason: 'reload-loop-guard' }, true);
       return;
     }
+    // Count the attempt now, not in the callback: the loop guard must see this
+    // reload even if a burst of crash events arrives before the timer fires.
     this.reloadHistory.push(this.now());
-    this.log('auto-reload', { trigger: 'primary-renderer-gone', reason }, true);
-    window.webContents.reload();
+    this.log('auto-reload', { trigger: 'primary-renderer-gone', reason, deferredMs: CRASH_RELOAD_DELAY_MS }, true);
+    this.crashReloadTimer = setTimeout(() => {
+      this.crashReloadTimer = null;
+      // Re-resolve rather than closing over `window`: the primary window may have
+      // been replaced during the delay, and reloading a stale one is wrong.
+      const target = this.options.getPrimaryWindow();
+      if (!target || target.isDestroyed() || target.webContents.isDestroyed()) {
+        this.log('auto-reload-skipped', { trigger: 'primary-renderer-gone', reason: 'window-gone' }, true);
+        return;
+      }
+      try {
+        target.webContents.reload();
+      } catch (err) {
+        // A reload can still throw if the contents died between the check and
+        // the call. Never let it escape into the timer callback.
+        this.log(
+          'auto-reload-failed',
+          { trigger: 'primary-renderer-gone', error: err instanceof Error ? err.message : String(err) },
+          true,
+        );
+      }
+    }, CRASH_RELOAD_DELAY_MS);
+    this.crashReloadTimer.unref?.();
   }
 
   private canAutoReload(): boolean {
