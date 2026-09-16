@@ -12,6 +12,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { screen, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '../../../../test-utils/render';
 import { installAppBridgeStub, uninstallAppBridgeStub } from '../../../../test-utils/app-bridge-stub';
@@ -70,5 +72,58 @@ describe('NoticeTextPart', () => {
   it('omits the disclosure entirely when there is no detail', () => {
     renderWithProviders(<NoticeTextPart text="The request exceeded the context window." />);
     expect(screen.queryByRole('button', { name: 'Details' })).toBeNull();
+  });
+
+  /**
+   * A retry notice is emitted MID-turn, while the re-sent request is still streaming.
+   * The spinner-hiding rule in globals.css keys off "is there a sibling content part
+   * before the dots", so without an explicit exemption the chip counted as content and
+   * hid the thinking spinner for the rest of the turn — Kai looked idle while the model
+   * was still generating. The between-tools spinner cannot cover the gap either: it
+   * requires `hasContent`, which deliberately excludes notices.
+   *
+   * jsdom does not evaluate the stylesheet's sibling selector, so this pins the two
+   * halves of the contract separately: the marker class on the element, and the
+   * exemption inside the rule that consumes it.
+   */
+  it('carries the spinner-exemption marker class so a mid-turn notice cannot hide the spinner', () => {
+    renderWithProviders(
+      <NoticeTextPart text="This model rejected the temperature setting, so Kai re-sent the request without it." />,
+    );
+    expect(screen.getByTestId('assistant-notice')).toHaveClass('aui-assistant-notice');
+  });
+
+  it('globals.css exempts the notice class from the typing-dots hide rule', () => {
+    const css = readFileSync(resolve(__dirname, '../../../styles/globals.css'), 'utf-8');
+    // Locate the rule that hides the spinner once a preceding sibling exists.
+    const rule = css
+      .split('}')
+      .map((block) => block.trim())
+      .find((block) => block.includes('~ .aui-typing-dots') && block.includes('display: none'));
+    expect(rule, 'typing-dots hide rule not found in globals.css').toBeDefined();
+    expect(rule).toContain(':not(.aui-assistant-notice)');
+  });
+
+  /**
+   * The icon sat visibly high in the chip. It is `items-start`-aligned (so that expanding
+   * "Details" grows the text column downward without dragging the icon along), which means
+   * its offset must be set explicitly to optically center it on the FIRST text line:
+   * text is `leading-5` (20px), icon is `h-3` (12px) → (20-12)/2 = 4px = `mt-1`.
+   * The old `mt-[1px]` was 3px short.
+   */
+  it('optically centers the info icon on the first text line', () => {
+    const { container } = renderWithProviders(
+      <NoticeTextPart text="This model rejected the temperature setting, so Kai re-sent the request without it." />,
+    );
+    const icon = container.querySelector('svg');
+    expect(icon, 'info icon not rendered').not.toBeNull();
+    // 4px top offset == half the 8px difference between the line box and the icon.
+    expect(icon).toHaveClass('mt-1');
+    expect(icon).toHaveClass('h-3');
+    // Guard the regression specifically: any hand-tuned near-zero offset is wrong here.
+    // (`svg.className` is an SVGAnimatedString, so read the attribute as a string.)
+    expect(icon?.getAttribute('class') ?? '').not.toMatch(/mt-\[1px\]/);
+    // The container must stay items-start for the Details-expansion behavior above.
+    expect(screen.getByTestId('assistant-notice')).toHaveClass('items-start');
   });
 });

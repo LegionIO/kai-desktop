@@ -19,9 +19,17 @@ export const NoticeTextPart: FC<{ text: string; detail?: string }> = ({ text, de
   return (
     <div
       data-testid="assistant-notice"
-      className="my-1.5 flex items-start gap-2 rounded-lg border border-border/40 bg-muted/30 px-2.5 py-1.5"
+      // `aui-assistant-notice` is load-bearing, not cosmetic: it exempts this chip from the
+      // CSS rule that hides the thinking spinner once a content part renders. A retry notice
+      // arrives mid-turn while the re-sent request is still streaming, so treating it as
+      // content made Kai look idle for the rest of the turn. See globals.css.
+      className="aui-assistant-notice my-1.5 flex items-start gap-2 rounded-lg border border-border/40 bg-muted/30 px-2.5 py-1.5"
     >
-      <InfoIcon className="mt-[1px] h-3 w-3 shrink-0 text-muted-foreground/70" aria-hidden="true" />
+      {/* Optically centered against the FIRST text line, not the whole chip: the text is
+          `leading-5` (20px) and the icon is `h-3` (12px), so (20-12)/2 = 4px = `mt-1`.
+          Pairs with `items-start` on the container so expanding "Details" grows the text
+          column downward without dragging the icon with it. */}
+      <InfoIcon className="mt-1 h-3 w-3 shrink-0 text-muted-foreground/70" aria-hidden="true" />
       <div className="min-w-0 flex-1">
         <span className="text-[11px] leading-5 text-muted-foreground">{text}</span>
         {detail && (

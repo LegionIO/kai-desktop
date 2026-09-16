@@ -313,11 +313,22 @@
 
 /* Typing dots inside assistant bubble: hide once real content parts are rendered.
    The dots div is always the last child. If a sibling before it exists (a content part),
-   hide the dots. The :only-child case means no content parts → show dots. */
+   hide the dots. The :only-child case means no content parts → show dots.
+
+   `.aui-assistant-notice` is EXEMPT. A Kai notice ("This model rejected the temperature
+   setting, so Kai re-sent the request without it.") is not model output — it is emitted
+   mid-turn while the retried request is still in flight. Counting it as a content part
+   hid the thinking spinner for the rest of the turn: the retry chip appeared and the
+   app looked idle even though the model was still generating. The between-tools spinner
+   below could not cover the gap either, since it requires `hasContent`, which a
+   notice-only turn never satisfies. Once real model output arrives, that text part is
+   NOT exempt, so the spinner hides as before. */
 .aui-assistant-content .aui-typing-dots {
   display: block;
 }
-.aui-assistant-content > :not(.aui-typing-dots):not(.aui-assistant-badge) ~ .aui-typing-dots {
+.aui-assistant-content
+  > :not(.aui-typing-dots):not(.aui-assistant-badge):not(.aui-assistant-notice)
+  ~ .aui-typing-dots {
   display: none;
 }
 
