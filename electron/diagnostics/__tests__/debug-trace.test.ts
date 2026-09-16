@@ -250,4 +250,56 @@ describe('diagnostic trace', () => {
     expect(row.fields.body).toBe('hello');
     expect(row.fields.password).toBe('[redacted]');
   });
+  /**
+   * Parallel tool-batch timing (tool.timing.* from ipc/agent.ts) is meant to be left
+   * ENABLED so the next natural occurrence is captured. That only works if its fields
+   * survive metadata-only mode — the default. Numbers/booleans always pass sanitize,
+   * and toolName is on the exact allowlist; this pins that so a future tightening of
+   * the redaction rules can't silently blank the timing data.
+   */
+  it('keeps tool-timing metadata (durations, phases, ids) without a content opt-in', () => {
+    mutateTrace({ enabled: true, scopes: ['agent'] });
+    traceDiagnostic({
+      scope: 'agent',
+      event: 'tool.timing.exec-return',
+      conversationId: 'conv-1',
+      fields: {
+        toolName: 'grep',
+        toolCallId: 'call_abc123',
+        elapsedMs: 4200,
+        extractionDurationMs: 3900,
+        originalLength: 88000,
+        compacted: true,
+        wasCompacted: true,
+        useAI: true,
+        phase: 'start',
+        deliveryMode: 'queued',
+        queueLength: 2,
+        queuedToFlush: 1,
+      },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.event).toBe('tool.timing.exec-return');
+    expect(row.fields.toolName).toBe('grep');
+    expect(row.fields.toolCallId).toBe('call_abc123');
+    // The measurements: without these the log cannot attribute the stall.
+    expect(row.fields.elapsedMs).toBe(4200);
+    expect(row.fields.extractionDurationMs).toBe(3900);
+    expect(row.fields.originalLength).toBe(88000);
+    expect(row.fields.compacted).toBe(true);
+    expect(row.fields.queueLength).toBe(2);
+    expect(row.fields.queuedToFlush).toBe(1);
+    // `phase`/`deliveryMode` are the immediate-vs-queued discriminator (NOT `delivery` —
+    // that key is not on the metadata allowlist and would be blanked) — identifier-shaped
+    // so they survive as real strings, not {omitted:true}.
+    expect(row.fields.phase).toBe('start');
+    expect(row.fields.deliveryMode).toBe('queued');
+  });
+
+  it('does not record tool timing when the agent scope is off', () => {
+    mutateTrace({ enabled: true, scopes: ['automation'] });
+    expect(isDiagnosticTraceEnabled('agent')).toBe(false);
+    traceDiagnostic({ scope: 'agent', event: 'tool.timing.work-done', fields: { toolName: 'grep' } });
+    expect(() => statSync(getDiagnosticTracePath())).toThrow();
+  });
 });

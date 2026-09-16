@@ -66,7 +66,7 @@ import {
   removeInject,
 } from '../agent/inject-queue.js';
 import { capRemoteEvent } from '../agent/remote-frame-cap.js';
-import { traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { isDiagnosticTraceEnabled, traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
   shouldCompactAsync,
@@ -119,6 +119,59 @@ function ipcDebugLog(msg: string): void {
     appendFileSync(IPC_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
   } catch {
     /* ignore */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel tool-batch timing.
+//
+// When a model emits several tool calls at once and one is slow, the fast ones
+// can appear stuck on "Running…" until the whole batch settles. Two candidate
+// causes, which these events distinguish:
+//   1. `maybeCompactToolOutput` is awaited INSIDE the wrapped `execute`, and it
+//      may run a full LLM extraction pass — so the tool's `execute` doesn't
+//      resolve until summarization ends, the SDK never emits its `tool-result`
+//      chunk, and the card can't leave "Running…".
+//   2. The `phase:'start'` compaction signal that should flip the card to
+//      "Summarizing…" is QUEUED (not emitted) until exec↔stream id pairing
+//      happens — a parallel-specific stall.
+//
+// Routed through the `agent` debugTrace scope so it is enable-able from
+// Settings → Diagnostics and captures the next NATURAL occurrence, rather than
+// needing a targeted repro. Emits ids/names/durations/booleans only — all of
+// which survive metadata-only mode, so no content opt-in is required.
+//
+// `elapsedMs` is per tool-call id from the first event seen for that id, so a row
+// reads as "+Nms into this tool's lifecycle" rather than wall-clock.
+// ---------------------------------------------------------------------------
+const toolTimingOrigin = new Map<string, number>();
+/** Bound the origin map: a long session with many tool calls must not grow it forever. */
+const TOOL_TIMING_ORIGIN_MAX = 500;
+function toolTimingTrace(
+  event: string,
+  conversationId: string,
+  fields: { toolName?: string; toolCallId?: string } & Record<string, unknown>,
+): void {
+  // Cheap scope check first: this can fire several times per tool call, and the
+  // whole point is that it stays affordable to leave enabled.
+  if (!isDiagnosticTraceEnabled('agent')) return;
+  try {
+    const id = fields.toolCallId;
+    const now = Date.now();
+    if (id) {
+      if (!toolTimingOrigin.has(id)) {
+        if (toolTimingOrigin.size >= TOOL_TIMING_ORIGIN_MAX) toolTimingOrigin.clear();
+        toolTimingOrigin.set(id, now);
+      }
+    }
+    traceDiagnostic({
+      scope: 'agent',
+      event: `tool.timing.${event}`,
+      conversationId,
+      fields: { ...fields, elapsedMs: id ? now - (toolTimingOrigin.get(id) ?? now) : 0 },
+    });
+  } catch {
+    /* instrumentation must never break a turn */
   }
 }
 import type { ToolCompactionConfig } from '../agent/compaction.js';
@@ -5315,6 +5368,12 @@ export function registerAgentHandlers(
 
         const streamToolCallId = streamToolCallIdByExecId.get(executeToolCallId);
         if (streamToolCallId) {
+          toolTimingTrace('compact-signal', conversationId, {
+            toolName,
+            toolCallId: executeToolCallId,
+            phase: data.phase,
+            deliveryMode: 'immediate',
+          });
           logToolCompactionDebug('broadcast-tool-compaction-after-pair', {
             conversationId,
             toolCallId: executeToolCallId,
@@ -5338,6 +5397,16 @@ export function registerAgentHandlers(
         const pending = pendingToolCompactionByExecId.get(executeToolCallId) ?? [];
         pending.push({ toolName, data });
         pendingToolCompactionByExecId.set(executeToolCallId, pending);
+        // SUSPECT PATH: the "Summarizing…" signal is being withheld because this
+        // exec id has no stream id yet. If a parallel batch lands here for
+        // phase:'start', the card cannot leave "Running…" until pairing flushes it.
+        toolTimingTrace('compact-signal', conversationId, {
+          toolName,
+          toolCallId: executeToolCallId,
+          phase: data.phase,
+          deliveryMode: 'queued',
+          queueLength: pending.length,
+        });
         logToolCompactionDebug('queue-tool-compaction', {
           conversationId,
           toolCallId: executeToolCallId,
@@ -5408,6 +5477,12 @@ export function registerAgentHandlers(
 
         streamToolCallIdByExecId.set(executeToolCallId, streamToolCallId);
         execToolCallIdByStreamId.set(streamToolCallId, executeToolCallId);
+        toolTimingTrace('pair-ids', conversationId, {
+          toolName,
+          toolCallId: executeToolCallId,
+          streamToolCallId,
+          queuedToFlush: pendingToolCompactionByExecId.get(executeToolCallId)?.length ?? 0,
+        });
         logToolCompactionDebug('pair-tool-call-ids', {
           conversationId,
           toolName,
@@ -6118,6 +6193,12 @@ export function registerAgentHandlers(
         );
 
         try {
+          toolTimingTrace('compact-llm-start', conversationId, {
+            toolName,
+            toolCallId,
+            useAI: Boolean(toolCompaction.useAI),
+            originalLength: originalText.length,
+          });
           const compactionResult = await compactToolResult(
             originalText,
             toolName,
@@ -6127,6 +6208,12 @@ export function registerAgentHandlers(
             modelEntry?.modelConfig.modelName,
             controller.signal, // Stop cancels a hung tool-compaction extraction
           );
+          toolTimingTrace('compact-llm-end', conversationId, {
+            toolName,
+            toolCallId,
+            wasCompacted: Boolean(compactionResult.wasCompacted),
+            extractionDurationMs: compactionResult.extractionDurationMs ?? 0,
+          });
 
           if (compactionResult.wasCompacted && !controller.signal.aborted) {
             queueOrBroadcastToolCompaction(
@@ -7822,6 +7909,10 @@ export function registerAgentHandlers(
             await observer?.waitForLinkedLaunchedTools(toolCallId);
             observer?.onToolExecutionResult(toolCallId, toolName, result);
             const observerAugmented = withObserverAugmentation(result, observer?.getToolAugmentation(toolCallId));
+            // The tool's own work is DONE here. Everything after this point delays
+            // the `execute` return — and therefore the SDK's tool-result chunk and
+            // the UI card flipping off "Running…".
+            toolTimingTrace('work-done', conversationId, { toolName, toolCallId });
             const compacted = await maybeCompactToolOutput(
               toolCallId,
               toolName,
@@ -7829,6 +7920,11 @@ export function registerAgentHandlers(
               'defer-until-stream-id',
               postArgs,
             );
+            toolTimingTrace('exec-return', conversationId, {
+              toolName,
+              toolCallId,
+              compacted: Boolean(compacted.compaction),
+            });
             if (compacted.compaction) {
               compactionByExecuteId.set(toolCallId, compacted.compaction);
             }
@@ -8101,6 +8197,11 @@ export function registerAgentHandlers(
               }
             }
             if (event.type === 'tool-result' && event.toolCallId) {
+              // This is the moment the renderer can finally mark the card done.
+              toolTimingTrace('emit-result', conversationId, {
+                toolName: event.toolName ?? 'unknown',
+                toolCallId: event.toolCallId,
+              });
               observer?.onToolExecutionEnd(event.toolCallId);
               // Inject compaction metadata into the event's data field
               const execId = execToolCallIdByStreamId.get(event.toolCallId) ?? event.toolCallId;
