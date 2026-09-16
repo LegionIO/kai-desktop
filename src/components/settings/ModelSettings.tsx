@@ -18,7 +18,7 @@ import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { app } from '@/lib/ipc-client';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
-import { ProfileSettings } from './ProfileSettings';
+import { ProfileSettings, type ProfileEntry } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
 import { MastraRuntimeSettings } from './MastraRuntimeSettings';
 import { AdvancedSettings } from './AdvancedSettings';
@@ -437,8 +437,59 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
     updateCatalog(next);
   };
 
+  /**
+   * Delete a catalog entry AND scrub the key from everything that references it.
+   *
+   * A model `key` is the identity used by `models.defaultModelKey` and by each
+   * profile's `primaryModelKey` / `fallbackModelKeys`. Deleting the entry alone
+   * left those pointing at a model that no longer exists: the dangling fallback
+   * keys are silently dropped during `byKey` resolution in
+   * electron/agent/model-catalog.ts, so a profile's failover chain quietly got
+   * shorter with nothing in the UI to explain it — and a profile whose PRIMARY
+   * was deleted falls back to `catalog.defaultEntry`, i.e. a different model
+   * than the user configured.
+   *
+   * So: drop the key from every fallback chain, repoint any profile whose
+   * primary was deleted (promoting its first surviving fallback when it has
+   * one), and repoint `models.defaultModelKey` if it named the deleted model.
+   * A profile left with NO surviving model is still written with the first
+   * remaining catalog entry as its primary, because `primaryModelKey` is not
+   * optional in the schema.
+   */
   const deleteModel = (index: number) => {
-    updateCatalog(models.catalog.filter((_, i) => i !== index));
+    const removed = models.catalog[index];
+    const remaining = models.catalog.filter((_, i) => i !== index);
+    updateCatalog(remaining);
+    if (!removed) return;
+
+    const fallbackPrimary = remaining[0]?.key;
+
+    const profiles = (config.profiles as ProfileEntry[] | undefined) ?? [];
+    let profilesChanged = false;
+    const nextProfiles = profiles.map((p) => {
+      const chainWithoutRemoved = p.fallbackModelKeys.filter((k) => k !== removed.key);
+      const primaryWasRemoved = p.primaryModelKey === removed.key;
+      if (!primaryWasRemoved && chainWithoutRemoved.length === p.fallbackModelKeys.length) return p;
+      profilesChanged = true;
+      if (!primaryWasRemoved) return { ...p, fallbackModelKeys: chainWithoutRemoved };
+      // Promote the first surviving fallback so the profile keeps the user's own
+      // ordering; only reach for an arbitrary catalog entry when nothing is left.
+      const promoted = chainWithoutRemoved[0] ?? fallbackPrimary ?? '';
+      return {
+        ...p,
+        primaryModelKey: promoted,
+        fallbackModelKeys: chainWithoutRemoved.filter((k) => k !== promoted),
+      };
+    });
+    if (profilesChanged) void updateConfig('profiles', nextProfiles);
+
+    if ((config.models as { defaultModelKey?: string }).defaultModelKey === removed.key) {
+      // Keep defaultModelKey in step with the default profile's new primary when
+      // there is one, so the two can't disagree after a delete.
+      const defaultProfileKey = config.defaultProfileKey as string | undefined;
+      const defaultProfile = nextProfiles.find((p) => p.key === defaultProfileKey);
+      void updateConfig('models.defaultModelKey', defaultProfile?.primaryModelKey ?? fallbackPrimary ?? '');
+    }
   };
 
   /**

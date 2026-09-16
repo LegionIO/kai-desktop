@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react';
-import { EyeIcon, EyeOffIcon, Volume2Icon, SquareIcon, SearchIcon, XIcon, MicIcon } from 'lucide-react';
+import { Volume2Icon, SquareIcon, SearchIcon, XIcon, MicIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
-import { Toggle, SliderField, settingsSelectClass } from './shared';
+import { Toggle, SliderField, TextField, PasswordField, settingsSelectClass } from './shared';
 import { createAzureSpeechAdapter, type AzureTtsConfig } from '@/lib/audio/azure-speech-adapters';
 import type { SpeechSynthesisUtterance } from '@/lib/audio/speech-adapters';
 import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
@@ -435,19 +435,13 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
 
             {/* Language (native provider only) */}
             {provider === 'native' && (
-              <div>
-                <label className="text-[10px] text-muted-foreground block mb-0.5">Language (BCP-47)</label>
-                <input
-                  type="text"
-                  className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                  value={recording?.language ?? 'en-US'}
-                  onChange={(e) => updateConfig('audio.recording.language', e.target.value)}
-                  placeholder="en-US"
-                />
-                <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-                  e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP
-                </span>
-              </div>
+              <TextField
+                label="Language (BCP-47)"
+                value={recording?.language ?? 'en-US'}
+                onChange={(v) => updateConfig('audio.recording.language', v)}
+                placeholder="en-US"
+                hint="e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP"
+              />
             )}
           </div>
         )}
@@ -458,37 +452,6 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
 
 // ─── Azure Configuration Panel ───────────────────────────────────────────────
 
-const PasswordField: FC<{
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-}> = ({ label, value, onChange, placeholder }) => {
-  const [visible, setVisible] = useState(false);
-
-  return (
-    <div>
-      <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
-      <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 pr-2">
-        <input
-          type={visible ? 'text' : 'password'}
-          className="min-w-0 flex-1 bg-transparent px-3 py-2 text-xs font-mono outline-none"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-        />
-        <button
-          type="button"
-          onClick={() => setVisible((v) => !v)}
-          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          title={visible ? 'Hide value' : 'Show value'}
-        >
-          {visible ? <EyeOffIcon className="h-3.5 w-3.5" /> : <EyeIcon className="h-3.5 w-3.5" />}
-        </button>
-      </div>
-    </div>
-  );
-};
 
 const AzureConfigPanel: FC<{
   azure?: AzureConfig;
@@ -529,34 +492,25 @@ const AzureConfigPanel: FC<{
       />
 
       {/* Region */}
-      <div data-setting-id="audio.azure.region">
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Region</label>
-        <input
-          type="text"
-          className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-          value={azure?.region ?? 'eastus'}
-          onChange={(e) => updateConfig('audio.azure.region', e.target.value)}
-          placeholder="eastus"
-        />
-        <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-          e.g. eastus, westus2, westeurope, southeastasia
-        </span>
-      </div>
+      <TextField
+        id="audio.azure.region"
+        label="Region"
+        value={azure?.region ?? 'eastus'}
+        onChange={(v) => updateConfig('audio.azure.region', v)}
+        placeholder="eastus"
+        hint="e.g. eastus, westus2, westeurope, southeastasia"
+      />
 
       {/* Custom Endpoint */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Endpoint (optional)</label>
-        <input
-          type="text"
-          className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none"
-          value={azure?.endpoint ?? ''}
-          onChange={(e) => updateConfig('audio.azure.endpoint', e.target.value || undefined)}
-          placeholder="https://your-resource.cognitiveservices.azure.com"
-        />
-        <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-          Base URL for your Azure AI Speech resource. If blank, the standard regional endpoint is used.
-        </span>
-      </div>
+      <TextField
+        label="Endpoint (optional)"
+        value={azure?.endpoint ?? ''}
+        onChange={(v) => updateConfig('audio.azure.endpoint', v)}
+        placeholder="https://your-resource.cognitiveservices.azure.com"
+        mono
+        emptyAsUndefined
+        hint="Base URL for your Azure AI Speech resource. If blank, the standard regional endpoint is used."
+      />
 
       <div className="flex items-center gap-2 pt-1 pb-1">
         <div className="flex-1 h-px bg-border/40" />
@@ -610,19 +564,13 @@ const AzureConfigPanel: FC<{
       </div>
 
       {/* STT Language */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">STT Language (BCP-47)</label>
-        <input
-          type="text"
-          className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-          value={azure?.sttLanguage ?? 'en-US'}
-          onChange={(e) => updateConfig('audio.azure.sttLanguage', e.target.value)}
-          placeholder="en-US"
-        />
-        <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-          e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP, zh-CN
-        </span>
-      </div>
+      <TextField
+        label="STT Language (BCP-47)"
+        value={azure?.sttLanguage ?? 'en-US'}
+        onChange={(v) => updateConfig('audio.azure.sttLanguage', v)}
+        placeholder="en-US"
+        hint="e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP, zh-CN"
+      />
     </fieldset>
   );
 };

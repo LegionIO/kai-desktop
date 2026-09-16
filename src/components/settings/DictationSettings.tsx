@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback, type FC, type ReactNode } from 'react';
 import { AlertTriangleIcon, ExternalLinkIcon, InfoIcon, KeyboardIcon, MicIcon, SparklesIcon } from 'lucide-react';
-import { SliderField, Toggle, settingsSelectClass, type SettingsProps } from './shared';
+import { SliderField, Toggle, TextField, PasswordField, settingsSelectClass, type SettingsProps } from './shared';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { app } from '@/lib/ipc-client';
 
@@ -515,39 +515,27 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         {/* OpenAI config fields (shown when openai selected) */}
         {(dictation.provider ?? 'azure') === 'openai' && (
           <div className="space-y-2 rounded-lg border border-border/40 bg-muted/20 p-2.5">
-            <div>
-              <label className="text-[10px] text-muted-foreground block mb-1">Base URL</label>
-              <input
-                type="text"
-                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                placeholder="wss://api.openai.com"
-                value={dictation.openai?.baseUrl ?? ''}
-                onChange={(e) => void updateConfig('dictation.openai.baseUrl', e.target.value || undefined)}
-              />
-              <p className="mt-0.5 text-[9px] text-muted-foreground">
-                WebSocket endpoint for the OpenAI Realtime API. Leave blank for official OpenAI.
-              </p>
-            </div>
-            <div>
-              <label className="text-[10px] text-muted-foreground block mb-1">API Key</label>
-              <input
-                type="password"
-                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                placeholder="sk-..."
-                value={dictation.openai?.apiKey ?? ''}
-                onChange={(e) => void updateConfig('dictation.openai.apiKey', e.target.value || undefined)}
-              />
-            </div>
-            <div>
-              <label className="text-[10px] text-muted-foreground block mb-1">Model</label>
-              <input
-                type="text"
-                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                placeholder="gpt-realtime-whisper"
-                value={dictation.openai?.model ?? ''}
-                onChange={(e) => void updateConfig('dictation.openai.model', e.target.value || undefined)}
-              />
-            </div>
+            <TextField
+              label="Base URL"
+              value={dictation.openai?.baseUrl ?? ''}
+              onChange={(v) => void updateConfig('dictation.openai.baseUrl', v)}
+              placeholder="wss://api.openai.com"
+              emptyAsUndefined
+              hint="WebSocket endpoint for the OpenAI Realtime API. Leave blank for official OpenAI."
+            />
+            <PasswordField
+              label="API Key"
+              value={dictation.openai?.apiKey ?? ''}
+              onChange={(v) => void updateConfig('dictation.openai.apiKey', v)}
+              placeholder="sk-..."
+            />
+            <TextField
+              label="Model"
+              value={dictation.openai?.model ?? ''}
+              onChange={(v) => void updateConfig('dictation.openai.model', v)}
+              placeholder="gpt-realtime-whisper"
+              emptyAsUndefined
+            />
           </div>
         )}
 
@@ -734,19 +722,14 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         </div>
 
         {/* Language */}
-        <div>
-          <label className="text-[10px] text-muted-foreground block mb-1">Language (BCP-47)</label>
-          <input
-            type="text"
-            className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-            placeholder="en-US"
-            value={dictation.language ?? ''}
-            onChange={(e) => void updateConfig('dictation.language', e.target.value || undefined)}
-          />
-          <p className="mt-0.5 text-[9px] text-muted-foreground">
-            Leave blank to use the language from Audio &amp; Voice settings.
-          </p>
-        </div>
+        <TextField
+          label="Language (BCP-47)"
+          value={dictation.language ?? ''}
+          onChange={(v) => void updateConfig('dictation.language', v)}
+          placeholder="en-US"
+          emptyAsUndefined
+          hint="Leave blank to use the language from Audio & Voice settings."
+        />
       </fieldset>
 
       {/* Recognition tuning */}

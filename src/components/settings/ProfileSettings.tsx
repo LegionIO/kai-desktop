@@ -6,7 +6,7 @@ import { Toggle, SliderField, settingsSelectClass, type SettingsProps } from './
 import { SortableList } from './shared/SortableList';
 import { cn } from '@/lib/utils';
 
-type ProfileEntry = {
+export type ProfileEntry = {
   key: string;
   name: string;
   primaryModelKey: string;

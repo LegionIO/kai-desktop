@@ -372,6 +372,30 @@ const PatternList: FC<{
     setNewPattern('');
   };
 
+  /**
+   * Add several entries in ONE update — used by a multi-line paste. Previously a
+   * pasted list was flattened to spaces and committed as a single unusable
+   * entry, silently. Dedupes against what's already in the list and within the
+   * pasted batch, preserving order.
+   */
+  const addPatterns = (values: string[]): boolean => {
+    const seen = new Set(patterns);
+    const additions: string[] = [];
+    for (const raw of values) {
+      const v = raw.trim();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      additions.push(v);
+    }
+    if (additions.length === 0) {
+      setNewPattern('');
+      return true;
+    }
+    onChange([...patterns, ...additions]);
+    setNewPattern('');
+    return true;
+  };
+
   const removePattern = (index: number) => {
     // The remove button's onMouseDown set skipBlurAddRef to suppress the input's
     // blur-commit; clear it here now that we've folded the draft in ourselves, so
@@ -438,6 +462,7 @@ const PatternList: FC<{
             value={newPattern}
             onChange={setNewPattern}
             onSubmit={() => addPattern()}
+            onPasteMultiline={addPatterns}
             onBlur={() => {
               // Commit a typed-but-unsubmitted value on blur — unless a mousedown
               // on the +/Browse button just set the skip flag (that button's own
@@ -448,7 +473,7 @@ const PatternList: FC<{
               if (skip) return;
               addPattern();
             }}
-            placeholder={filePicker ? 'Add path (or Browse)…' : 'Add pattern...'}
+            placeholder={filePicker ? 'Add path, or paste a list…' : 'Add pattern, or paste a list…'}
           />
           {filePicker && (
             <button

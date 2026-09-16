@@ -1,7 +1,6 @@
 import { useState, useEffect, type FC } from 'react';
-import { EyeIcon, EyeOffIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
-import { Toggle, NumberField, settingsSelectClass } from './shared';
+import { Toggle, NumberField, TextField, PasswordField, settingsSelectClass } from './shared';
 
 type MediaProvider = 'openai' | 'azure' | 'custom';
 
@@ -28,38 +27,6 @@ type MediaGenConfig = {
 };
 
 // ─── Password Field ──────────────────────────────────────────────────────────
-
-const PasswordField: FC<{
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-}> = ({ label, value, onChange, placeholder }) => {
-  const [visible, setVisible] = useState(false);
-
-  return (
-    <div>
-      <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
-      <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 pr-2">
-        <input
-          type={visible ? 'text' : 'password'}
-          className="min-w-0 flex-1 bg-transparent px-3 py-2 text-xs font-mono outline-none"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-        />
-        <button
-          type="button"
-          onClick={() => setVisible((v) => !v)}
-          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          title={visible ? 'Hide value' : 'Show value'}
-        >
-          {visible ? <EyeOffIcon className="h-3.5 w-3.5" /> : <EyeIcon className="h-3.5 w-3.5" />}
-        </button>
-      </div>
-    </div>
-  );
-};
 
 // ─── Provider Config Section ─────────────────────────────────────────────────
 
@@ -111,19 +78,15 @@ const ProviderConfigSection: FC<{
         <fieldset className="rounded-lg border p-3 space-y-3">
           <legend className="text-xs font-semibold px-1">Azure OpenAI Configuration</legend>
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Endpoint</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none"
-              value={config?.azure?.endpoint ?? ''}
-              onChange={(e) => updateConfig(`${prefix}.azure.endpoint`, e.target.value || undefined)}
-              placeholder="https://your-resource.openai.azure.com"
-            />
-            <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-              Your Azure OpenAI resource base URL.
-            </span>
-          </div>
+          <TextField
+            label="Endpoint"
+            value={config?.azure?.endpoint ?? ''}
+            onChange={(v) => updateConfig(`${prefix}.azure.endpoint`, v)}
+            placeholder="https://your-resource.openai.azure.com"
+            mono
+            emptyAsUndefined
+            hint="Your Azure OpenAI resource base URL."
+          />
 
           <PasswordField
             label="API Key"
@@ -132,27 +95,19 @@ const ProviderConfigSection: FC<{
             placeholder="Enter your Azure OpenAI API key"
           />
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Deployment Name</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-              value={config?.azure?.deploymentName ?? ''}
-              onChange={(e) => updateConfig(`${prefix}.azure.deploymentName`, e.target.value)}
-              placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
-            />
-          </div>
+          <TextField
+            label="Deployment Name"
+            value={config?.azure?.deploymentName ?? ''}
+            onChange={(v) => updateConfig(`${prefix}.azure.deploymentName`, v)}
+            placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
+          />
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">API Version</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-              value={config?.azure?.apiVersion ?? ''}
-              onChange={(e) => updateConfig(`${prefix}.azure.apiVersion`, e.target.value)}
-              placeholder="2024-02-15-preview"
-            />
-          </div>
+          <TextField
+            label="API Version"
+            value={config?.azure?.apiVersion ?? ''}
+            onChange={(v) => updateConfig(`${prefix}.azure.apiVersion`, v)}
+            placeholder="2024-02-15-preview"
+          />
         </fieldset>
       )}
 
@@ -161,19 +116,15 @@ const ProviderConfigSection: FC<{
         <fieldset className="rounded-lg border p-3 space-y-3">
           <legend className="text-xs font-semibold px-1">Custom Provider Configuration</legend>
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Base URL</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none"
-              value={config?.custom?.baseUrl ?? ''}
-              onChange={(e) => updateConfig(`${prefix}.custom.baseUrl`, e.target.value || undefined)}
-              placeholder="https://your-proxy.example.com/v1"
-            />
-            <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-              Your ai-gateway or proxy base URL. The generation API path will be appended automatically.
-            </span>
-          </div>
+          <TextField
+            label="Base URL"
+            value={config?.custom?.baseUrl ?? ''}
+            onChange={(v) => updateConfig(`${prefix}.custom.baseUrl`, v)}
+            placeholder="https://your-proxy.example.com/v1"
+            mono
+            emptyAsUndefined
+            hint="Your ai-gateway or proxy base URL. The generation API path will be appended automatically."
+          />
 
           <PasswordField
             label="API Key"
@@ -185,16 +136,12 @@ const ProviderConfigSection: FC<{
       )}
 
       {/* Model */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Model</label>
-        <input
-          type="text"
-          className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-          value={config?.model ?? ''}
-          onChange={(e) => updateConfig(`${prefix}.model`, e.target.value)}
-          placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
-        />
-      </div>
+      <TextField
+        label="Model"
+        value={config?.model ?? ''}
+        onChange={(v) => updateConfig(`${prefix}.model`, v)}
+        placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
+      />
     </fieldset>
   );
 };

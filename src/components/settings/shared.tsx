@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useContext, createContext, type FC, type ReactNode } from 'react';
-import { ChevronDownIcon, ChevronRightIcon } from 'lucide-react';
+import { useState, useEffect, useId, useRef, useContext, createContext, type FC, type ReactNode } from 'react';
+import { ChevronDownIcon, ChevronRightIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
 
 /**
  * Broadcasts the setting the user navigated to from settings search, so containers
@@ -206,10 +206,20 @@ export const TextField: FC<{
   placeholder?: string;
   mono?: boolean;
   hint?: string;
-}> = ({ id, label, value, onChange, placeholder, mono, hint }) => {
+  /**
+   * Emit `undefined` instead of `''` when the field is cleared — for optional
+   * config keys where an empty string is not the same as "unset" (e.g. an
+   * endpoint override that should fall back to a default when blank).
+   */
+  emptyAsUndefined?: boolean;
+}> = ({ id, label, value, onChange, placeholder, mono, hint, emptyAsUndefined }) => {
+  const inputId = useId();
   const [local, setLocal] = useState(value);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusedRef = useRef(false);
+  // Kept in a ref so the unmount cleanup below always flushes the LATEST draft
+  // without re-running (and cancelling its own timer) on every keystroke.
+  const pendingRef = useRef<{ value: string; committed: string } | null>(null);
 
   // Sync from parent when not focused (e.g. config reload from another source)
   useEffect(() => {
@@ -219,19 +229,41 @@ export const TextField: FC<{
   const flush = (v: string) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = null;
-    if (v !== value) onChange(v);
+    pendingRef.current = null;
+    if (v !== value) onChange(emptyAsUndefined && v === '' ? (undefined as unknown as string) : v);
   };
 
   const handleChange = (v: string) => {
     setLocal(v);
+    pendingRef.current = { value: v, committed: value };
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => flush(v), 600);
   };
 
+  // A field unmounted mid-debounce (switching tabs/provider, collapsing a
+  // section) would otherwise drop the last ≤600ms of typing on the floor.
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const pending = pendingRef.current;
+      if (pending && pending.value !== pending.committed) {
+        onChange(
+          emptyAsUndefined && pending.value === '' ? (undefined as unknown as string) : pending.value,
+        );
+      }
+    },
+    // Mount-only: the cleanup reads the latest draft from `pendingRef`, so it
+    // must NOT re-subscribe (and cancel its own timer) on every keystroke.
+    [],
+  );
+
   return (
     <div data-setting-id={id}>
-      <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
+      <label htmlFor={inputId} className="text-[10px] text-muted-foreground block mb-0.5">
+        {label}
+      </label>
       <input
+        id={inputId}
         type="text"
         className={`w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none${mono ? ' font-mono' : ''}`}
         value={local}
@@ -245,6 +277,92 @@ export const TextField: FC<{
         }}
         placeholder={placeholder}
       />
+      {hint && <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">{hint}</span>}
+    </div>
+  );
+};
+
+/**
+ * Secret-bearing sibling of {@link TextField}: same local-buffer + focus-guard +
+ * debounce, plus a show/hide toggle. Three settings panels had grown their own
+ * unbuffered `PasswordField` copies, so every keystroke of an API key was an IPC
+ * round-trip that re-parsed the schema and rewrote the whole config file.
+ */
+export const PasswordField: FC<{
+  id?: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  hint?: string;
+}> = ({ id, label, value, onChange, placeholder, hint }) => {
+  const inputId = useId();
+  const [visible, setVisible] = useState(false);
+  const [local, setLocal] = useState(value);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const focusedRef = useRef(false);
+  const pendingRef = useRef<{ value: string; committed: string } | null>(null);
+
+  useEffect(() => {
+    if (!focusedRef.current) setLocal(value);
+  }, [value]);
+
+  const flush = (v: string) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    pendingRef.current = null;
+    if (v !== value) onChange(v);
+  };
+
+  const handleChange = (v: string) => {
+    setLocal(v);
+    pendingRef.current = { value: v, committed: value };
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => flush(v), 600);
+  };
+
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const pending = pendingRef.current;
+      if (pending && pending.value !== pending.committed) onChange(pending.value);
+    },
+    // Mount-only: the cleanup reads the latest draft from `pendingRef`, so it
+    // must NOT re-subscribe (and cancel its own timer) on every keystroke.
+    [],
+  );
+
+  return (
+    <div data-setting-id={id}>
+      <label htmlFor={inputId} className="text-[10px] text-muted-foreground block mb-0.5">
+        {label}
+      </label>
+      <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 pr-2">
+        <input
+          id={inputId}
+          type={visible ? 'text' : 'password'}
+          className="min-w-0 flex-1 bg-transparent px-3 py-2 text-xs font-mono outline-none"
+          value={local}
+          onChange={(e) => handleChange(e.target.value)}
+          onFocus={() => {
+            focusedRef.current = true;
+          }}
+          onBlur={() => {
+            focusedRef.current = false;
+            flush(local);
+          }}
+          placeholder={placeholder}
+        />
+        <button
+          type="button"
+          onClick={() => setVisible((v) => !v)}
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          title={visible ? 'Hide value' : 'Show value'}
+          aria-label={visible ? `Hide ${label}` : `Show ${label}`}
+        >
+          {visible ? <EyeOffIcon className="h-3.5 w-3.5" /> : <EyeIcon className="h-3.5 w-3.5" />}
+        </button>
+      </div>
       {hint && <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">{hint}</span>}
     </div>
   );

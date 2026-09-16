@@ -1,7 +1,15 @@
 import { useState, useRef, useCallback, type FC } from 'react';
-import { EyeIcon, EyeOffIcon, WifiIcon, WifiOffIcon, LoaderIcon } from 'lucide-react';
+import { WifiIcon, WifiOffIcon, LoaderIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
-import { Toggle, SliderField, NumberField, ClampedNumberField, settingsSelectClass } from './shared';
+import {
+  Toggle,
+  SliderField,
+  NumberField,
+  ClampedNumberField,
+  TextField,
+  PasswordField,
+  settingsSelectClass,
+} from './shared';
 import { app } from '@/lib/ipc-client';
 
 type RealtimeProvider = 'openai' | 'azure' | 'custom';
@@ -43,37 +51,6 @@ type RealtimeConfig = {
 
 // ─── Password Field ──────────────────────────────────────────────────────────
 
-const PasswordField: FC<{
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-}> = ({ label, value, onChange, placeholder }) => {
-  const [visible, setVisible] = useState(false);
-
-  return (
-    <div>
-      <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
-      <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 pr-2">
-        <input
-          type={visible ? 'text' : 'password'}
-          className="min-w-0 flex-1 bg-transparent px-3 py-2 text-xs font-mono outline-none"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-        />
-        <button
-          type="button"
-          onClick={() => setVisible((v) => !v)}
-          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          title={visible ? 'Hide value' : 'Show value'}
-        >
-          {visible ? <EyeOffIcon className="h-3.5 w-3.5" /> : <EyeIcon className="h-3.5 w-3.5" />}
-        </button>
-      </div>
-    </div>
-  );
-};
 
 // ─── Test Connection Button ──────────────────────────────────────────────────
 
@@ -235,19 +212,15 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <fieldset className="rounded-lg border p-3 space-y-3">
           <legend className="text-xs font-semibold px-1">Azure OpenAI Configuration</legend>
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Endpoint</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none"
-              value={realtime?.azure?.endpoint ?? ''}
-              onChange={(e) => updateConfig('realtime.azure.endpoint', e.target.value || undefined)}
-              placeholder="https://your-resource.cognitiveservices.azure.com"
-            />
-            <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-              Your Azure OpenAI resource base URL. The realtime path will be appended automatically.
-            </span>
-          </div>
+          <TextField
+            label="Endpoint"
+            value={realtime?.azure?.endpoint ?? ''}
+            onChange={(v) => updateConfig('realtime.azure.endpoint', v)}
+            placeholder="https://your-resource.cognitiveservices.azure.com"
+            mono
+            emptyAsUndefined
+            hint="Your Azure OpenAI resource base URL. The realtime path will be appended automatically."
+          />
 
           <PasswordField
             label="API Key"
@@ -256,27 +229,19 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             placeholder="Enter your Azure OpenAI API key"
           />
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Deployment Name</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-              value={realtime?.azure?.deploymentName ?? ''}
-              onChange={(e) => updateConfig('realtime.azure.deploymentName', e.target.value)}
-              placeholder="gpt-4o-realtime-preview"
-            />
-          </div>
+          <TextField
+            label="Deployment Name"
+            value={realtime?.azure?.deploymentName ?? ''}
+            onChange={(v) => updateConfig('realtime.azure.deploymentName', v)}
+            placeholder="gpt-4o-realtime-preview"
+          />
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">API Version</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-              value={realtime?.azure?.apiVersion ?? ''}
-              onChange={(e) => updateConfig('realtime.azure.apiVersion', e.target.value)}
-              placeholder="2024-10-01-preview"
-            />
-          </div>
+          <TextField
+            label="API Version"
+            value={realtime?.azure?.apiVersion ?? ''}
+            onChange={(v) => updateConfig('realtime.azure.apiVersion', v)}
+            placeholder="2024-10-01-preview"
+          />
         </fieldset>
       )}
 
@@ -285,16 +250,14 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <fieldset className="rounded-lg border p-3 space-y-3">
           <legend className="text-xs font-semibold px-1">Custom Provider Configuration</legend>
 
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-0.5">Base URL</label>
-            <input
-              type="text"
-              className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none"
-              value={realtime?.custom?.baseUrl ?? ''}
-              onChange={(e) => updateConfig('realtime.custom.baseUrl', e.target.value || undefined)}
-              placeholder="https://api.example.com/v1/realtime"
-            />
-          </div>
+          <TextField
+            label="Base URL"
+            value={realtime?.custom?.baseUrl ?? ''}
+            onChange={(v) => updateConfig('realtime.custom.baseUrl', v)}
+            placeholder="https://api.example.com/v1/realtime"
+            mono
+            emptyAsUndefined
+          />
 
           <PasswordField
             label="API Key"
@@ -308,16 +271,13 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       {/* ── Model & Voice ── */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Model & Voice</legend>
-        <div data-setting-id="realtime.model">
-          <label className="text-[10px] text-muted-foreground block mb-0.5">Model</label>
-          <input
-            type="text"
-            className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-            value={realtime?.model ?? 'gpt-4o-realtime-preview'}
-            onChange={(e) => updateConfig('realtime.model', e.target.value)}
-            placeholder="gpt-4o-realtime-preview"
-          />
-        </div>
+        <TextField
+          id="realtime.model"
+          label="Model"
+          value={realtime?.model ?? 'gpt-4o-realtime-preview'}
+          onChange={(v) => updateConfig('realtime.model', v)}
+          placeholder="gpt-4o-realtime-preview"
+        />
         <div data-setting-id="realtime.voice">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Voice</label>
           <select

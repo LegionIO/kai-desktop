@@ -22,6 +22,15 @@ type EditableInputProps = {
   placeholder?: string;
   type?: 'text' | 'password';
   highlightBrand?: boolean;
+  /**
+   * Called when the pasted text spans multiple lines, INSTEAD of inserting it.
+   * The field stays single-line (newlines would otherwise be flattened to
+   * spaces, silently fusing a pasted list into one mangled entry), so a caller
+   * that owns a list — e.g. the allow/deny pattern editors — can add one entry
+   * per line. Return `true` to signal the paste was consumed; return `false` (or
+   * omit the prop) to fall back to the flatten-to-spaces behavior.
+   */
+  onPasteMultiline?: (lines: string[]) => boolean;
 };
 
 /**
@@ -37,6 +46,7 @@ export const EditableInput: FC<EditableInputProps> = ({
   placeholder,
   type = 'text',
   highlightBrand = false,
+  onPasteMultiline,
 }) => {
   const editorRef = useRef<HTMLDivElement>(null);
   const lastValueRef = useRef(value);
@@ -172,7 +182,18 @@ export const EditableInput: FC<EditableInputProps> = ({
 
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const text = e.clipboardData.getData('text/plain').replace(/[\n\r]/g, ' ');
+    const raw = e.clipboardData.getData('text/plain');
+    // Offer a multi-line paste to the owner before flattening it. Collapsing
+    // newlines to spaces turns a pasted list of paths/globs into ONE unusable
+    // entry with no warning, so a list-owning caller gets first refusal.
+    if (onPasteMultiline && /[\n\r]/.test(raw)) {
+      const lines = raw
+        .split(/\r\n|\r|\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (lines.length > 1 && onPasteMultiline(lines)) return;
+    }
+    const text = raw.replace(/[\n\r]/g, ' ');
     document.execCommand('insertText', false, text);
   };
 

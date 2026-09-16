@@ -246,6 +246,13 @@ const AppListPicker: FC<{
 type DisplayInfo = { name: string; displayId: string; pixelWidth: number; pixelHeight: number; isPrimary: boolean };
 
 /**
+ * Schema default for `computerUse.capture.maxDimension` (see the defaults in
+ * electron/ipc/config.ts). Auto-fitting only touches the value while it still
+ * matches this, so any other value is treated as the user's own choice.
+ */
+const DEFAULT_CAPTURE_MAX_DIMENSION = 1920;
+
+/**
  * Picker for connected displays. Shows discovered displays with resolution info,
  * lets users toggle which ones computer-use is allowed to capture. Empty selection
  * means all displays are used.
@@ -471,13 +478,28 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
     };
   }, []);
 
+  // Auto-fit the capture ceiling to the enabled displays — but never CLOBBER a
+  // value the user chose. `maxDimension` is a screenshot cost/quality dial
+  // (lower = fewer tokens per frame), and it has a schema default of 1920, so
+  // there is no "unset" state to detect. Previously this wrote the largest
+  // panel dimension on every displays-changed callback, including the one fired
+  // by simply checking/unchecking a display — so a user who lowered it to 1024
+  // to cut token spend silently lost that on an unrelated click.
+  //
+  // Only RAISE it, and only from the untouched default: that keeps the original
+  // intent (a fresh install on a 4K panel shouldn't downscale by surprise)
+  // while treating any other value as a deliberate choice to leave alone.
+  // Lowering, and any change away from the default, stays manual via the
+  // "Max Dimension (px)" field in Capture (Advanced).
   const handleDisplaysDiscovered = useCallback(
     (enabledDisplays: DisplayInfo[]) => {
       if (enabledDisplays.length === 0) return;
+      const current = computerUse.capture.maxDimension;
+      if (current !== DEFAULT_CAPTURE_MAX_DIMENSION) return;
       const maxX = Math.max(...enabledDisplays.map((d) => d.pixelWidth));
       const maxY = Math.max(...enabledDisplays.map((d) => d.pixelHeight));
       const largestDim = Math.max(maxX, maxY);
-      if (largestDim > 0 && largestDim !== computerUse.capture.maxDimension) {
+      if (largestDim > current) {
         updateConfig('computerUse.capture.maxDimension', largestDim);
       }
     },
