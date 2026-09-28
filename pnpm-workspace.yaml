@@ -1,0 +1,15 @@
+# Publicly hoist the per-platform native packages that are loaded at runtime.
+#
+# Under pnpm's default isolated linker (what CI uses), these optional
+# platform packages only exist under node_modules/.pnpm/…. electron-builder's
+# pnpm collector can't locate them there and silently skips them as "optional
+# dependency doesn't exist", so the packaged app ships the JS wrappers WITHOUT
+# their native binaries: sharp can't load (every tool-result image is dropped
+# as "resize or re-encode the image smaller"), plus node-pty, esbuild and the
+# Claude Agent SDK CLI. Hoisting them to node_modules/<scope>/<name> lets the
+# collector find them. Dev machines with node-linker=hoisted are unaffected.
+publicHoistPattern:
+  - '@img/*'
+  - '@esbuild/*'
+  - '@lydell/node-pty-*'
+  - '@anthropic-ai/claude-agent-sdk-*'
