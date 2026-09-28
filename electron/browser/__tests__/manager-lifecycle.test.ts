@@ -78,6 +78,7 @@ const {
   BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS,
   BrowserManager,
   MAX_BROWSER_TARGET_DOM_VISITS,
+  loadUrlAllowingRedirect,
   popupInitiatorFrameTreeNodeId,
 } = await import('../manager.js');
 const {
@@ -5465,6 +5466,35 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.networkRequests).toHaveLength(1);
     expect(tab.networkRequests.get(1)).toMatchObject({ statusCode: 200, completedAt: expect.any(Number) });
     expect(tab.networkRequestSequence).toBe(1);
+  });
+
+  it('treats a page redirecting itself mid-load as a successful load', async () => {
+    // Electron's loadURL() rejects like this when an SSO/SAML page navigates
+    // away before its first document finishes. It surfaced to the user as
+    // "Error invoking remote method 'browser:mount': Error: ERR_ABORTED (-3)".
+    const aborted = Object.assign(new Error("ERR_ABORTED (-3) loading 'https://idp.example/saml2'"), {
+      code: 'ERR_ABORTED',
+      errno: -3,
+    });
+    const contents = { loadURL: vi.fn(async () => Promise.reject(aborted)), isDestroyed: () => false };
+
+    await expect(loadUrlAllowingRedirect(contents as never, 'https://app.example/')).resolves.toBeUndefined();
+    expect(contents.loadURL).toHaveBeenCalledWith('https://app.example/');
+  });
+
+  it('still rejects real load failures and aborts of a destroyed renderer', async () => {
+    const refused = Object.assign(new Error('ERR_CONNECTION_REFUSED (-102)'), {
+      code: 'ERR_CONNECTION_REFUSED',
+      errno: -102,
+    });
+    await expect(
+      loadUrlAllowingRedirect({ loadURL: async () => Promise.reject(refused), isDestroyed: () => false } as never, 'x'),
+    ).rejects.toBe(refused);
+
+    const aborted = Object.assign(new Error('ERR_ABORTED (-3)'), { code: 'ERR_ABORTED', errno: -3 });
+    await expect(
+      loadUrlAllowingRedirect({ loadURL: async () => Promise.reject(aborted), isDestroyed: () => true } as never, 'x'),
+    ).rejects.toBe(aborted);
   });
 
   it('retains failed navigation request diagnostics when ERR_ABORTED restores the committed document', () => {

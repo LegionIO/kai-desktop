@@ -43,6 +43,7 @@ type BrowserIntegrationDriver = {
 let handle: ElectronHandle;
 let server: Server;
 let origin: string;
+let ssoVisits = 0;
 
 test.beforeAll(async () => {
   server = createServer((request, response) => {
@@ -82,6 +83,26 @@ test.beforeAll(async () => {
         <button id="button" onclick="document.body.dataset.clicked='yes'">Click</button>
         <iframe id="cross" src="http://localhost:${port}/framed-child"></iframe>
         <iframe id="inline" srcdoc="<p>inline</p>"></iframe>`);
+      return;
+    }
+    if (path === '/sso-slow') {
+      setTimeout(() => response.end('x'), 1_500);
+      return;
+    }
+    if (path === '/sso-landed') {
+      response.end('<!doctype html><title>SSO landed</title><p id="landed">landed</p>');
+      return;
+    }
+    if (path === '/sso') {
+      // Like a SAML endpoint: the first visit waits on the user (e.g. passkey);
+      // every later load auto-continues before its document finishes, which
+      // makes Electron's loadURL() reject with ERR_ABORTED (-3).
+      ssoVisits += 1;
+      response.end(
+        ssoVisits === 1
+          ? '<!doctype html><title>SSO prompt</title><p>sign in</p>'
+          : `<!doctype html><script>location.href='/sso-landed'</script><img src="/sso-slow">`,
+      );
       return;
     }
     if (path === '/unguardable') {
@@ -1096,6 +1117,50 @@ test('a guard failure on the visible tab reloads it instead of leaving a blank p
     .toMatchObject({ discarded: false, loading: false });
   await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({ attached: true });
   await callIntegrationDriver('endAssistantRun', [conversationId, runId]);
+  await handle.page.evaluate(async (id) => {
+    await (
+      window as unknown as {
+        app: { browser: { mount: (conversationId: string, bounds: Record<string, number> | null) => Promise<void> } };
+      }
+    ).app.browser.mount(id, null);
+  }, conversationId);
+});
+
+test('restoring an unloaded tab whose page redirects itself (SSO bounce) does not fail', async () => {
+  const conversationId = 'browser-sso-restore';
+  await persistBrowserTestConversation(conversationId);
+  const tab = await handle.page.evaluate(
+    async ({ conversationId: id, url }) =>
+      (
+        window as unknown as {
+          app: { browser: { createTab: (request: Record<string, unknown>) => Promise<BrowserTabResult> } };
+        }
+      ).app.browser.createTab({ conversationId: id, url, owner: 'user' }),
+    { conversationId, url: `${origin}/sso` },
+  );
+  const firstContentsId = await callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]);
+  if (firstContentsId === null) throw new Error('SSO tab did not create a renderer.');
+  // Unload the renderer so the next mount has to restore it from its URL.
+  await handle.app.evaluate(
+    ({ webContents }, id) => webContents.fromId(id)?.forcefullyCrashRenderer(),
+    firstContentsId,
+  );
+  await expect
+    .poll(async () => (await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id)?.discarded)
+    .toBe(true);
+
+  await expect(
+    handle.page.evaluate(async (id) => {
+      await (
+        window as unknown as {
+          app: { browser: { mount: (conversationId: string, bounds: Record<string, number>) => Promise<void> } };
+        }
+      ).app.browser.mount(id, { x: 20, y: 100, width: 600, height: 420 });
+    }, conversationId),
+  ).resolves.toBeUndefined();
+  await expect
+    .poll(async () => (await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id))
+    .toMatchObject({ discarded: false, url: `${origin}/sso-landed` });
   await handle.page.evaluate(async (id) => {
     await (
       window as unknown as {

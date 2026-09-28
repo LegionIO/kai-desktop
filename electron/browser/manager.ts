@@ -384,6 +384,29 @@ type CdpSensitiveScanBudget = {
 const BROWSER_CONTROL_POLICY_RANK = { allow: 0, ask: 1, deny: 2 } as const;
 const BROWSER_PASSWORD_POLICY_RANK = { automatic: 0, ask: 1, 'user-only': 2 } as const;
 
+/** loadURL() rejects with ERR_ABORTED when the page itself navigates away
+ * before its first document finishes (SAML/SSO auto-submit, JS redirects).
+ * The replacement navigation is live and owns the tab, so for the caller that
+ * is a redirect, not a failed load. */
+export function isSupersededLoadAbort(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === 'object' &&
+    ((error as { code?: unknown }).code === 'ERR_ABORTED' || (error as { errno?: unknown }).errno === -3)
+  );
+}
+
+/** Await a loadURL() whose page may redirect itself mid-load. ERR_ABORTED is
+ * absorbed only if the WebContents is still alive; any other failure (or a
+ * destroyed target) still rejects. */
+export async function loadUrlAllowingRedirect(contents: WebContents, url: string): Promise<void> {
+  try {
+    await contents.loadURL(url);
+  } catch (error) {
+    if (!isSupersededLoadAbort(error) || contents.isDestroyed()) throw error;
+  }
+}
+
 function browserControlPolicyTightened(
   previous: AppConfig['browser']['structuredActions'],
   next: AppConfig['browser']['structuredActions'],
@@ -7984,7 +8007,7 @@ export class BrowserManager {
             contents,
             'Browser page load',
             ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
-            () => contents.loadURL(url).then(() => undefined),
+            () => loadUrlAllowingRedirect(contents, url),
             abortSignal,
           ),
         );
@@ -7992,7 +8015,7 @@ export class BrowserManager {
       }
       const trustedNavigationLease = this.beginTrustedUserNavigation(tab, url);
       try {
-        await contents.loadURL(url);
+        await loadUrlAllowingRedirect(contents, url);
       } finally {
         this.clearTrustedUserNavigation(tab, trustedNavigationLease);
       }
@@ -9140,7 +9163,10 @@ export class BrowserManager {
                 guardInitialLoad && requestedInitialUrl === 'about:blank' && initialUrl === 'about:blank';
               if (!initialBlankReady) {
                 expectedInitialLoadGeneration += 1;
-                await view.webContents.loadURL(requestedInitialUrl);
+                // A restored SSO/SAML page usually bounces straight on to its
+                // destination; that redirect must not fail the restore (it
+                // surfaced as "Error invoking remote method 'browser:mount'").
+                await loadUrlAllowingRedirect(view.webContents, requestedInitialUrl);
               }
               if (guardAfterInitialLoad) {
                 await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents);
