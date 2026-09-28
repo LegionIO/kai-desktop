@@ -72,12 +72,15 @@ describe('browser session helpers', () => {
     expect(setUserAgent).toHaveBeenCalledOnce();
   });
 
-  it('keeps subframe Node integration disabled and registers an isolated frame sensor once', () => {
+  it('runs the sandboxed frame preload in subframes and registers an isolated frame sensor once', () => {
     const guardToken = '11111111-1111-4111-8111-111111111111';
     const preferences = browserWebPreferences('persist:kai-browser-global');
     expect(preferences).toMatchObject({
       nodeIntegration: false,
-      nodeIntegrationInSubFrames: false,
+      // Regression: with this false, Electron skips the frame preload in
+      // iframes, so the per-frame native-UI guard verification failed on any
+      // page containing an iframe. Safe only because the renderer is sandboxed.
+      nodeIntegrationInSubFrames: true,
       nodeIntegrationInWorker: false,
       contextIsolation: true,
       sandbox: true,

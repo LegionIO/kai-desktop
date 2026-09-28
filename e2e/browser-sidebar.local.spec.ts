@@ -68,6 +68,22 @@ test.beforeAll(async () => {
       );
       return;
     }
+    if (path === '/framed-child') {
+      response.end('<!doctype html><title>Framed child</title><p id="child">child</p>');
+      return;
+    }
+    if (path === '/iframes') {
+      // Cross-origin (localhost vs 127.0.0.1 → separate OOPIF) plus same-process
+      // srcdoc child. Session frame preloads only run in these subframes when
+      // nodeIntegrationInSubFrames is on; without it every assistant operation
+      // failed its per-frame native-UI guard verification.
+      const port = (server.address() as { port: number }).port;
+      response.end(`<!doctype html><title>Framed page</title>
+        <button id="button" onclick="document.body.dataset.clicked='yes'">Click</button>
+        <iframe id="cross" src="http://localhost:${port}/framed-child"></iframe>
+        <iframe id="inline" srcdoc="<p>inline</p>"></iframe>`);
+      return;
+    }
     response.writeHead(200, { 'Set-Cookie': 'kai_session=ready; Path=/; HttpOnly; SameSite=Lax' });
     response.end(`<!doctype html>
       <title>Browser integration</title>
@@ -868,5 +884,65 @@ test('host renderer reload reclaims native page views and preserves discarded ta
       ).app.browser.commandTab(id, tabId, 'close'),
     { conversationId, tabId: tab.id },
   );
+  await expect.poll(async () => (await browserState(conversationId)).tabs).toEqual([]);
+});
+
+test('assistant control verifies its native-UI guard in every iframe of a framed page', async () => {
+  const conversationId = 'browser-framed-page';
+  await persistBrowserTestConversation(conversationId);
+  await handle.page.evaluate(async () => {
+    await (
+      window as unknown as { app: { config: { set: (path: string, value: unknown) => Promise<unknown> } } }
+    ).app.config.set('browser.aiAllowPrivateNetwork', true);
+  });
+  await expect.poll(() => callIntegrationDriver('isBrowserConfigTransitionPending', [])).toBe(false);
+
+  const runId = 'browser-framed-page-run';
+  await callIntegrationDriver('beginAssistantRun', [conversationId, runId]);
+  const tab = await callIntegrationDriver<BrowserTabResult>('createAssistantTab', [
+    conversationId,
+    `${origin}/iframes`,
+    runId,
+  ]);
+  const contentsId = await callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]);
+  if (contentsId === null) throw new Error('Framed assistant tab did not retain a live renderer.');
+  await expect
+    .poll(async () =>
+      handle.app.evaluate(
+        ({ webContents }, id) => webContents.fromId(id)?.mainFrame.framesInSubtree.length ?? 0,
+        contentsId,
+      ),
+    )
+    .toBe(3);
+
+  await expect(
+    callIntegrationDriver<Record<string, unknown>>('runAssistantInspect', [conversationId, runId, tab.id]),
+  ).resolves.toMatchObject({ tabId: tab.id, title: 'Framed page' });
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    runId,
+    { tabId: tab.id, kind: 'click', selector: '#button' },
+  ]);
+  await expect(
+    handle.app.evaluate(
+      async ({ webContents }, id) => webContents.fromId(id)?.executeJavaScript(`document.body.dataset.clicked`),
+      contentsId,
+    ),
+  ).resolves.toBe('yes');
+  // The guard is active in the subframes themselves, not only the top document.
+  await expect(
+    handle.app.evaluate(async ({ webContents }, id) => {
+      const contents = webContents.fromId(id);
+      if (!contents) throw new Error('Framed contents disappeared.');
+      return Promise.all(
+        contents.mainFrame.framesInSubtree
+          .filter((frame) => frame !== contents.mainFrame)
+          .map((frame) =>
+            frame.executeJavaScript(`(() => { try { print(); return 'printed'; } catch { return 'blocked'; } })()`),
+          ),
+      );
+    }, contentsId),
+  ).resolves.toEqual(['blocked', 'blocked']);
+  await callIntegrationDriver('endAssistantRun', [conversationId, runId]);
   await expect.poll(async () => (await browserState(conversationId)).tabs).toEqual([]);
 });

@@ -138,7 +138,12 @@ export function browserWebPreferences(
     // renderer can activate its WebRTC membrane before the first page script.
     additionalArguments,
     nodeIntegration: false,
-    nodeIntegrationInSubFrames: false,
+    // Despite the name, with `sandbox: true` this grants no Node access: it only
+    // makes Electron run the session frame preload in iframes too. Every guard
+    // (native-UI, private-network) and every per-frame ack protocol verifies
+    // all frames in the subtree, so without it any page with an iframe fails
+    // closed ("preload could not activate its native-UI guard").
+    nodeIntegrationInSubFrames: true,
     nodeIntegrationInWorker: false,
     contextIsolation: true,
     sandbox: true,
