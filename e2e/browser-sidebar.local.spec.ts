@@ -84,6 +84,28 @@ test.beforeAll(async () => {
         <iframe id="inline" srcdoc="<p>inline</p>"></iframe>`);
       return;
     }
+    if (path === '/unguardable') {
+      // A script-disabled sandboxed frame can never run a guard, so assistant
+      // control must still fail closed here.
+      response.end(`<!doctype html><title>Unguardable page</title>
+        <button id="button">Click</button><iframe sandbox="" src="/framed-child"></iframe>`);
+      return;
+    }
+    if (path === '/blank-iframes') {
+      // Chromium runs neither session preloads nor CDP new-document scripts in
+      // src-less / about:blank iframes (ServiceNow, ad slots, editors). Every
+      // assistant operation on such a page failed its native-UI guard check.
+      response.end(`<!doctype html><title>Blank framed page</title>
+        <button id="button" onclick="document.body.dataset.clicked='yes'">Click</button>
+        <iframe id="nosrc"></iframe>
+        <iframe id="explicit" src="about:blank"></iframe>
+        <script>
+          const written = document.createElement('iframe');
+          document.body.appendChild(written);
+          written.contentDocument.body.innerHTML = '<iframe id="nested"></iframe>';
+        </script>`);
+      return;
+    }
     response.writeHead(200, { 'Set-Cookie': 'kai_session=ready; Path=/; HttpOnly; SameSite=Lax' });
     response.end(`<!doctype html>
       <title>Browser integration</title>
@@ -945,4 +967,140 @@ test('assistant control verifies its native-UI guard in every iframe of a framed
   ).resolves.toEqual(['blocked', 'blocked']);
   await callIntegrationDriver('endAssistantRun', [conversationId, runId]);
   await expect.poll(async () => (await browserState(conversationId)).tabs).toEqual([]);
+});
+
+test('assistant control guards preload-less about:blank iframes and reclaims them at run end', async () => {
+  const conversationId = 'browser-blank-iframes';
+  await persistBrowserTestConversation(conversationId);
+  await handle.page.evaluate(async () => {
+    await (
+      window as unknown as { app: { config: { set: (path: string, value: unknown) => Promise<unknown> } } }
+    ).app.config.set('browser.aiAllowPrivateNetwork', true);
+  });
+  await expect.poll(() => callIntegrationDriver('isBrowserConfigTransitionPending', [])).toBe(false);
+
+  const runId = 'browser-blank-iframes-run';
+  await callIntegrationDriver('beginAssistantRun', [conversationId, runId]);
+  const tab = await callIntegrationDriver<BrowserTabResult>('createAssistantTab', [
+    conversationId,
+    `${origin}/blank-iframes`,
+    runId,
+  ]);
+  const contentsId = await callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]);
+  if (contentsId === null) throw new Error('Blank-iframe assistant tab did not retain a live renderer.');
+  await expect
+    .poll(async () =>
+      handle.app.evaluate(
+        ({ webContents }, id) => webContents.fromId(id)?.mainFrame.framesInSubtree.length ?? 0,
+        contentsId,
+      ),
+    )
+    .toBe(5);
+
+  await expect(
+    callIntegrationDriver<Record<string, unknown>>('runAssistantInspect', [conversationId, runId, tab.id]),
+  ).resolves.toMatchObject({ tabId: tab.id, title: 'Blank framed page' });
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    runId,
+    { tabId: tab.id, kind: 'click', selector: '#button' },
+  ]);
+  await expect(
+    handle.app.evaluate(
+      async ({ webContents }, id) => webContents.fromId(id)?.executeJavaScript(`document.body.dataset.clicked`),
+      contentsId,
+    ),
+  ).resolves.toBe('yes');
+  // The fallback actually blocks native UI inside every blank frame.
+  await expect(
+    handle.app.evaluate(async ({ webContents }, id) => {
+      const contents = webContents.fromId(id);
+      if (!contents) throw new Error('Blank-iframe contents disappeared.');
+      return Promise.all(
+        contents.mainFrame.framesInSubtree
+          .filter((frame) => frame !== contents.mainFrame)
+          .map((frame) =>
+            frame.executeJavaScript(`(() => { try { print(); return 'printed'; } catch { return 'blocked'; } })()`),
+          ),
+      );
+    }, contentsId),
+  ).resolves.toEqual(['blocked', 'blocked', 'blocked', 'blocked']);
+
+  // A kept tab survives the run, but the unrestorable fallback renderer must
+  // be reclaimed rather than returned to the user still guarded.
+  await callIntegrationDriver('keepAssistantTabOpen', [conversationId, tab.id, runId]);
+  await callIntegrationDriver('endAssistantRun', [conversationId, runId]);
+  await expect
+    .poll(async () => (await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id))
+    .toMatchObject({ id: tab.id, discarded: true });
+  await expect(
+    handle.app.evaluate(({ webContents }, id) => webContents.fromId(id)?.isDestroyed() ?? true, contentsId),
+  ).resolves.toBe(true);
+  await handle.page.evaluate(
+    async ({ conversationId: id, tabId }) =>
+      (
+        window as unknown as {
+          app: { browser: { commandTab: (conversationId: string, tabId: string, command: string) => Promise<void> } };
+        }
+      ).app.browser.commandTab(id, tabId, 'close'),
+    { conversationId, tabId: tab.id },
+  );
+});
+
+test('a guard failure on the visible tab reloads it instead of leaving a blank page', async () => {
+  const conversationId = 'browser-unguardable-visible';
+  await persistBrowserTestConversation(conversationId);
+  await handle.page.evaluate(async () => {
+    await (
+      window as unknown as { app: { config: { set: (path: string, value: unknown) => Promise<unknown> } } }
+    ).app.config.set('browser.aiAllowPrivateNetwork', true);
+  });
+  await expect.poll(() => callIntegrationDriver('isBrowserConfigTransitionPending', [])).toBe(false);
+  const tab = await handle.page.evaluate(
+    async ({ conversationId: id, url }) =>
+      (
+        window as unknown as {
+          app: { browser: { createTab: (request: Record<string, unknown>) => Promise<BrowserTabResult> } };
+        }
+      ).app.browser.createTab({ conversationId: id, url, owner: 'user' }),
+    { conversationId, url: `${origin}/unguardable` },
+  );
+  await handle.page.evaluate(async (id) => {
+    await (
+      window as unknown as {
+        app: { browser: { mount: (conversationId: string, bounds: Record<string, number>) => Promise<void> } };
+      }
+    ).app.browser.mount(id, { x: 20, y: 100, width: 600, height: 420 });
+  }, conversationId);
+  const originalContentsId = await callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]);
+  expect(originalContentsId).not.toBeNull();
+
+  const runId = 'browser-unguardable-visible-run';
+  await callIntegrationDriver('beginAssistantRun', [conversationId, runId]);
+  await expect(
+    callIntegrationDriver('runAssistantAction', [
+      conversationId,
+      runId,
+      { tabId: tab.id, kind: 'navigate', url: `${origin}/unguardable?again` },
+    ]),
+  ).rejects.toThrow(/native page UI safely/);
+  // The unprotectable renderer is gone, and the tab the user is looking at is
+  // restored with a fresh renderer rather than left discarded (white).
+  await expect
+    .poll(async () => callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]))
+    .not.toBeNull();
+  const restoredContentsId = await callIntegrationDriver<number | null>('getTabContentsId', [conversationId, tab.id]);
+  expect(restoredContentsId).not.toBe(originalContentsId);
+  await expect
+    .poll(async () => (await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id))
+    .toMatchObject({ discarded: false, loading: false });
+  await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({ attached: true });
+  await callIntegrationDriver('endAssistantRun', [conversationId, runId]);
+  await handle.page.evaluate(async (id) => {
+    await (
+      window as unknown as {
+        app: { browser: { mount: (conversationId: string, bounds: Record<string, number> | null) => Promise<void> } };
+      }
+    ).app.browser.mount(id, null);
+  }, conversationId);
 });

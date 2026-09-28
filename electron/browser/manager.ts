@@ -87,6 +87,7 @@ import { clearPluginBrowserPartitions } from './plugin-partitions.js';
 import { browserAutofillProbeScript, browserAutofillScript } from './credential-dom.js';
 import {
   BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE,
+  BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE,
   BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD,
   boundedBrowserEvaluationExpression,
   browserNativeUiGuardActivationProbe,
@@ -635,6 +636,10 @@ type InternalTab = {
   /** Irreversible document-start membrane that prevents a remote page from
    * opening native print UI while this renderer is assistant-controlled. */
   assistantNativeUiNewDocumentGuard?: { contentsId: number; identifier: string };
+  /** A preload-less frame (about:blank iframe) received the direct, unrestorable
+   * native-UI fallback. Run-end cleanup reclaims the renderer instead of trying
+   * (and failing) to restore it in place. */
+  assistantNativeUiFallbackInstalled?: boolean;
   /** Random per-WebContents capability used only to toggle preload-installed
    * native-UI trampolines from main. Remote pages can see the trampoline but
    * cannot activate or deactivate it without this token. */
@@ -3186,7 +3191,13 @@ export class BrowserManager {
       }
       if (tab.popupGesture?.assistantOwnerId === runId) tab.popupGesture = null;
       if (tab.assistantGesture?.assistantOwnerId === runId) tab.assistantGesture = null;
-      if (tab.aiControlOwnerId === runId && tab.assistantNativeUiNewDocumentGuard) {
+      if (
+        tab.aiControlOwnerId === runId &&
+        tab.assistantNativeUiNewDocumentGuard &&
+        !tab.assistantNativeUiFallbackInstalled
+      ) {
+        // A fallback-guarded renderer cannot be restored in place; its retained
+        // marker forces the teardown below instead.
         try {
           await this.releaseAssistantNativeUiGuard(tab);
         } catch (error) {
@@ -4410,13 +4421,7 @@ export class BrowserManager {
         // Changing the native policy or installing the document membrane can
         // race a user navigation. Reclaim the affected renderer so a later
         // user restore starts with Chromium's default WebRTC behavior.
-        if (this.tabs.get(tab.shell.id) === tab && tab.view === view && !view.webContents.isDestroyed()) {
-          tab.generation++;
-          this.destroyView(tab);
-          tab.shell.discarded = true;
-          tab.shell.sensitive = false;
-          this.emitTabs(tab.shell.conversationId);
-        }
+        this.reclaimAssistantGuardFailure(tab, view);
         throw error;
       }
     }
@@ -4430,17 +4435,27 @@ export class BrowserManager {
       // A page that cannot prove print suppression must never remain available
       // to hidden assistant work. Reclaim the exact renderer so no delayed
       // native sheet can outlive the failed operation.
-      if (this.tabs.get(tab.shell.id) === tab && tab.view === view && !view.webContents.isDestroyed()) {
-        tab.generation++;
-        this.destroyView(tab);
-        tab.shell.discarded = true;
-        tab.shell.sensitive = false;
-        this.emitTabs(tab.shell.conversationId);
-      }
+      this.reclaimAssistantGuardFailure(tab, view);
       throw error;
     }
     this.consumeBrowserApprovalRendererReset(tab, run, approvedDocument, view);
     return view;
+  }
+
+  /** Destroy the renderer an assistant guard could not protect. If that tab is
+   * the one the user is looking at, restore it immediately: leaving a
+   * discarded view in the sidebar shows only a blank white surface until the
+   * user happens to click the tab again. */
+  private reclaimAssistantGuardFailure(tab: InternalTab, view: WebContentsView): void {
+    if (this.tabs.get(tab.shell.id) !== tab || tab.view !== view || view.webContents.isDestroyed()) return;
+    tab.generation++;
+    this.destroyView(tab);
+    tab.shell.discarded = true;
+    tab.shell.sensitive = false;
+    this.emitTabs(tab.shell.conversationId);
+    if (this.activeTabs.get(tab.shell.conversationId) === tab.shell.id) {
+      this.restoreActiveViewAfterClose(tab.shell.conversationId, tab.shell.id);
+    }
   }
 
   private async withAssistantScriptPopupAttribution<T>(tab: InternalTab, operation: () => Promise<T>): Promise<T> {
@@ -4752,7 +4767,7 @@ export class BrowserManager {
       }
       let currentFrames: Map<number, string>;
       try {
-        currentFrames = this.snapshotAutomationFrames(contents).identities;
+        currentFrames = this.snapshotAutomationFrames(contents, true).identities;
       } catch {
         this.revokeAutomationGestureToken(token);
         throw new Error('The browser page changed before attributed background input could be dispatched.');
@@ -4782,7 +4797,21 @@ export class BrowserManager {
     return `${frame.processId}:${frame.routingId}:${frame.frameToken}`;
   }
 
-  private snapshotAutomationFrames(contents: WebContents): {
+  /** Chromium never runs the session frame preload in an about:blank /
+   * src-less child frame, so such a frame can neither acknowledge an input arm
+   * nor report a gesture. The main frame always has the preload. */
+  private isPreloadlessChildFrame(contents: WebContents, frame: WebFrameMain): boolean {
+    return (
+      frame.frameTreeNodeId !== contents.mainFrame.frameTreeNodeId &&
+      typeof frame.url === 'string' &&
+      /^about:blank(?:[?#]|$)/i.test(frame.url)
+    );
+  }
+
+  private snapshotAutomationFrames(
+    contents: WebContents,
+    excludePreloadlessFrames = false,
+  ): {
     frames: WebFrameMain[];
     identities: Map<number, string>;
   } {
@@ -4792,6 +4821,10 @@ export class BrowserManager {
       const identities = new Map<number, string>();
       for (const frame of contents.mainFrame.framesInSubtree) {
         if (frame.detached || frame.isDestroyed() || seen.has(frame.frameTreeNodeId)) continue;
+        // Waiting on a preload-less frame's acknowledgement would time out every
+        // click on pages with blank iframes. A blank frame that later navigates
+        // stops matching and changes the snapshot, which fails dispatch closed.
+        if (excludePreloadlessFrames && this.isPreloadlessChildFrame(contents, frame)) continue;
         const identity = this.automationFrameIdentity(frame);
         // Frame identity access can race OOPIF teardown. Exclude a frame that
         // disappeared during the read instead of publishing a partial lease.
@@ -4824,7 +4857,7 @@ export class BrowserManager {
     let frames: WebFrameMain[];
     let expectedFrames: Map<number, string>;
     try {
-      const snapshot = this.snapshotAutomationFrames(contents);
+      const snapshot = this.snapshotAutomationFrames(contents, true);
       frames = snapshot.frames;
       expectedFrames = snapshot.identities;
     } catch {
@@ -9547,6 +9580,7 @@ export class BrowserManager {
     // later clean renderer never inherits the quarantined target identity.
     tab.privateNetworkNewDocumentGuard = undefined;
     tab.assistantNativeUiNewDocumentGuard = undefined;
+    tab.assistantNativeUiFallbackInstalled = undefined;
     tab.nativeUiGuardToken = undefined;
     tab.viewLoadPromise = null;
     tab.viewLoadState = undefined;
@@ -9714,6 +9748,7 @@ export class BrowserManager {
       // script, but a later assistant operation must verify that document's own
       // non-callable marker instead of trusting the previous frame snapshot.
       tab.assistantNativeUiNewDocumentGuard = undefined;
+      tab.assistantNativeUiFallbackInstalled = undefined;
       // Rotate document-visible diagnostics without forgetting requests that
       // Chromium has already admitted. Keep the committed document snapshot
       // until this provisional navigation commits or fails; an aborted
@@ -12284,7 +12319,8 @@ export class BrowserManager {
     authInfo: Electron.AuthInfo,
     callback: (username?: string, password?: string) => void,
   ): void => {
-    const tabId = this.webContentsToTab.get(contents.id);
+    // Null for utility-process auth (plugin hosts) despite Electron's typing.
+    const tabId = contents ? this.webContentsToTab.get(contents.id) : undefined;
     const tab = tabId ? this.tabs.get(tabId) : undefined;
     if (this.validatingProxy?.isAuthenticationChallenge(authInfo)) {
       event.preventDefault();
@@ -14322,7 +14358,14 @@ export class BrowserManager {
           const verifiedFrames = new Set<number>();
           for (const frame of frames) {
             if (frame.detached || frame.isDestroyed() || verifiedFrames.has(frame.frameTreeNodeId)) continue;
-            const activated = await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE);
+            let activated = await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE);
+            if (activated !== true) {
+              // Preload-less about:blank iframe (see installAssistantNativeUiGuard).
+              // The direct constructor replacement is irreversible, which is fine:
+              // this membrane already lasts for the renderer's lifetime.
+              await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD);
+              activated = await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE);
+            }
             if (activated !== true) {
               throw new Error('The browser page preload could not install its private-network WebRTC guard.');
             }
@@ -14402,7 +14445,17 @@ export class BrowserManager {
           const verifiedFrames = new Set<number>();
           for (const frame of frames) {
             if (frame.detached || frame.isDestroyed() || verifiedFrames.has(frame.frameTreeNodeId)) continue;
-            const installed = await frame.executeJavaScript(browserNativeUiGuardActivationProbe(token, true));
+            let installed = await frame.executeJavaScript(browserNativeUiGuardActivationProbe(token, true));
+            if (installed !== true) {
+              // Chromium never runs session preloads (or CDP new-document
+              // scripts) in about:blank / src-less iframes, which are common on
+              // real sites. Install the direct fail-closed fallback into that
+              // frame and verify it; its marker makes release reject, so the
+              // renderer is reclaimed at run end instead of restored in place.
+              tab.assistantNativeUiFallbackInstalled = true;
+              await frame.executeJavaScript(browserNativeUiNewDocumentGuard(token));
+              installed = await frame.executeJavaScript(browserNativeUiGuardActivationProbe(token, true));
+            }
             if (installed !== true) {
               throw new Error('The browser page preload could not activate its native-UI guard.');
             }

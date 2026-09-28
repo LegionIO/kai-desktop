@@ -271,6 +271,26 @@ export const BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE = `(() => {
   }
 })()`;
 
+/** Verify BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD took effect in a frame the
+ * preload never reached (about:blank iframes): every present WebRTC global must
+ * now be a non-writable, non-configurable blocker that throws on construction. */
+export const BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE = `(() => {
+  try {
+    for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCIceTransport', 'RTCDataChannel']) {
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+      if (!descriptor) continue;
+      if (descriptor.configurable || descriptor.writable || typeof descriptor.value !== 'function') return false;
+      try {
+        new descriptor.value();
+        return false;
+      } catch {}
+    }
+    return true;
+  } catch {
+    return false;
+  }
+})()`;
+
 /** Installed through CDP before arbitrary page evaluation. Unlike a frame load
  * listener, this runs in every newly created document before its inline scripts,
  * closing the srcdoc/navigation window where a fresh global could recover native

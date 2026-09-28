@@ -80,7 +80,13 @@ const {
   MAX_BROWSER_TARGET_DOM_VISITS,
   popupInitiatorFrameTreeNodeId,
 } = await import('../manager.js');
-const { browserNativeUiGuardActivationProbe } = await import('../evaluation.js');
+const {
+  BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE,
+  BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE,
+  BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD,
+  browserNativeUiGuardActivationProbe,
+  browserNativeUiNewDocumentGuard,
+} = await import('../evaluation.js');
 const { MAX_BROWSER_URL_CHARS } = await import('../metadata.js');
 const { MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB, MAX_BROWSER_NETWORK_REQUESTS_PER_TAB } =
   await import('../network-diagnostics.js');
@@ -3519,6 +3525,51 @@ describe('browser manager renderer lifecycle', () => {
     invokePrivate(manager, 'revokeAutomationGestureToken', arm.token);
   });
 
+  it('does not wait for input acknowledgement from a preload-less about:blank iframe', async () => {
+    const frame = (frameTreeNodeId: number, url: string) => ({
+      detached: false,
+      frameToken: `frame-${frameTreeNodeId}`,
+      frameTreeNodeId,
+      isDestroyed: () => false,
+      processId: 7,
+      routingId: frameTreeNodeId,
+      send: vi.fn(),
+      url,
+    });
+    const topFrame = frame(101, 'https://example.com/');
+    // Chromium never runs the page preload here, so it can never acknowledge.
+    const blankFrame = frame(102, 'about:blank');
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { frameTreeNodeId: 101, framesInSubtree: [topFrame, blankFrame] },
+    };
+    const tab = { shell: { id: 'tab-1' }, aiControlOwnerId: 'run-1', view: { webContents: contents } };
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      automationGestureTokens: new Map(),
+      pendingAutomationArmAcknowledgements: new Map(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
+      kind: 'pointerdown',
+    }) as { token: string };
+    const pending = invokePrivate(manager, 'publishAutomationGestureArmAndWait', tab, contents, arm) as Promise<void>;
+    await Promise.resolve();
+
+    invokePrivate(
+      manager,
+      'acknowledgeAutomationInputArm',
+      { sender: contents, senderFrame: topFrame },
+      { token: arm.token },
+    );
+    await expect(pending).resolves.toBeUndefined();
+    expect(blankFrame.send).not.toHaveBeenCalled();
+    // A blank frame that later loads a real document must fail dispatch closed.
+    blankFrame.url = 'https://ads.example/';
+    expect(() => invokePrivate(manager, 'assertAutomationGestureReadyForDispatch', arm.token)).toThrow(/frame changed/);
+  });
+
   it('uses attributed CDP input even when the Browser page is mounted and focused', async () => {
     const sendInputEvent = vi.fn();
     const contents = { id: 42, isDestroyed: () => false, mainFrame: { framesInSubtree: [] }, sendInputEvent };
@@ -4643,6 +4694,41 @@ describe('browser manager renderer lifecycle', () => {
       expect(manager.getState('chat-1').authPrompts).toEqual([]);
       expect(callback).toHaveBeenCalledOnce();
       expect(callback).toHaveBeenCalledWith();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('ignores a utility-process auth challenge that has no webContents', () => {
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-null-login-test',
+      () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    try {
+      const listener = electronMocks.appOn.mock.calls.find(([event]) => event === 'login')?.[1] as (
+        event: { preventDefault: () => void },
+        contents: null,
+        details: { url: string; pid: number },
+        authInfo: { isProxy: boolean; scheme: string; host: string; port: number; realm: string },
+        callback: (username?: string, password?: string) => void,
+      ) => void;
+      const event = { preventDefault: vi.fn() };
+      const callback = vi.fn();
+
+      // Electron passes null here for plugin utility-process requests.
+      expect(() =>
+        listener(
+          event,
+          null,
+          { url: 'https://graph.microsoft.com/', pid: 1 },
+          { isProxy: false, scheme: 'basic', host: 'graph.microsoft.com', port: 443, realm: 'r' },
+          callback,
+        ),
+      ).not.toThrow();
+      expect(event.preventDefault).not.toHaveBeenCalled();
+      expect(callback).not.toHaveBeenCalled();
     } finally {
       manager.dispose();
     }
@@ -11103,6 +11189,228 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab).toMatchObject({
       assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'document-guard-1' },
     });
+  });
+
+  it('installs the fallback native-UI guard in a preload-less about:blank iframe', async () => {
+    const nativeUiGuardToken = '55555555-5555-4555-8555-555555555555';
+    const debuggerApi = browserDebuggerMock();
+    // Chromium never runs session preloads in about:blank iframes, so the
+    // activation probe fails there until the direct fallback is installed.
+    let fallbackInstalled = false;
+    const blankFrame = {
+      detached: false,
+      frameTreeNodeId: 102,
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async (source: string) => {
+        if (source === browserNativeUiNewDocumentGuard(nativeUiGuardToken)) {
+          fallbackInstalled = true;
+          return undefined;
+        }
+        return fallbackInstalled;
+      }),
+    };
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    mainFrame.framesInSubtree = [mainFrame, blankFrame];
+    const contents = {
+      debugger: debuggerApi,
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab: Record<string, unknown> & { shell: { id: string; conversationId: string; url: string } } = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: { webContents: contents },
+      generation: 3,
+      nativeUiGuardToken,
+      trustedUserNavigationLease: 0,
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'installAssistantNativeUiGuard', tab, contents)).resolves.toBeUndefined();
+
+    expect(blankFrame.executeJavaScript).toHaveBeenCalledWith(browserNativeUiNewDocumentGuard(nativeUiGuardToken));
+    expect(mainFrame.executeJavaScript).not.toHaveBeenCalledWith(browserNativeUiNewDocumentGuard(nativeUiGuardToken));
+    // The fallback cannot be restored in place, so run-end cleanup must know
+    // to reclaim this renderer instead.
+    expect(tab).toMatchObject({
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'document-guard-1' },
+      assistantNativeUiFallbackInstalled: true,
+    });
+  });
+
+  it('still rejects a frame where even the fallback native-UI guard cannot be verified', async () => {
+    const nativeUiGuardToken = '66666666-6666-4666-8666-666666666666';
+    const brokenFrame = {
+      detached: false,
+      frameTreeNodeId: 102,
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => false),
+    };
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    mainFrame.framesInSubtree = [mainFrame, brokenFrame];
+    const contents = {
+      debugger: browserDebuggerMock(),
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: { webContents: contents },
+      generation: 3,
+      nativeUiGuardToken,
+      trustedUserNavigationLease: 0,
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'installAssistantNativeUiGuard', tab, contents)).rejects.toThrow(
+      /could not activate its native-UI guard/,
+    );
+  });
+
+  it('installs the fallback private-network guard in a preload-less about:blank iframe', async () => {
+    const debuggerApi = browserDebuggerMock();
+    let fallbackInstalled = false;
+    const blankFrame = {
+      detached: false,
+      frameTreeNodeId: 102,
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async (source: string) => {
+        if (source === BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE) return false;
+        if (source === BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD) {
+          fallbackInstalled = true;
+          return undefined;
+        }
+        if (source === BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE) return fallbackInstalled;
+        throw new Error('unexpected script');
+      }),
+    };
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    mainFrame.framesInSubtree = [mainFrame, blankFrame];
+    const contents = {
+      debugger: debuggerApi,
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: { webContents: contents },
+      generation: 3,
+      trustedUserNavigationLease: 0,
+    };
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(manager, 'installPrivateNetworkNewDocumentGuard', tab, contents),
+    ).resolves.toBeUndefined();
+
+    expect(blankFrame.executeJavaScript).toHaveBeenCalledWith(BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD);
+    expect(blankFrame.executeJavaScript).toHaveBeenLastCalledWith(BROWSER_PRIVATE_NETWORK_GUARD_FALLBACK_PROBE);
+    expect(tab).toMatchObject({ privateNetworkNewDocumentGuard: { contentsId: 42 } });
+  });
+
+  it('restores the active tab immediately after reclaiming a renderer its guard could not protect', () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, sensitive: true },
+      view: view as typeof view | null,
+      generation: 3,
+    };
+    const restoreActiveViewAfterClose = vi.fn();
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+    });
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'tab-1']]),
+      destroyView,
+      emitTabs,
+      restoreActiveViewAfterClose,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    invokePrivate(manager, 'reclaimAssistantGuardFailure', tab, view);
+
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab).toMatchObject({ generation: 4, shell: { discarded: true, sensitive: false } });
+    // Without this the sidebar keeps showing a blank white surface.
+    expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', 'tab-1');
+  });
+
+  it('leaves a reclaimed background tab unloaded', () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-2', conversationId: 'chat-1', discarded: false, sensitive: false },
+      view: view as typeof view | null,
+      generation: 3,
+    };
+    const restoreActiveViewAfterClose = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'tab-1']]),
+      destroyView: vi.fn((target: typeof tab) => {
+        target.view = null;
+      }),
+      emitTabs: vi.fn(),
+      restoreActiveViewAfterClose,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    invokePrivate(manager, 'reclaimAssistantGuardFailure', tab, view);
+
+    expect(tab.shell.discarded).toBe(true);
+    expect(restoreActiveViewAfterClose).not.toHaveBeenCalled();
   });
 
   it('publishes the native-UI pending marker before asynchronous frame verification', async () => {

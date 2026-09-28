@@ -426,7 +426,9 @@ function registerGlobalHandlers(): void {
   });
 
   app.on('login', (event, webContents, _details, authInfo, callback) => {
-    if (!guestIds.has(webContents.id)) return;
+    // Electron types this as WebContents, but it is null for utility-process
+    // requests (plugin hosts). Throwing here crashed every such auth challenge.
+    if (!webContents || !guestIds.has(webContents.id)) return;
     event.preventDefault();
     const owner = ownerWindowOf(webContents);
     if (!owner) {
