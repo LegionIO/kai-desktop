@@ -82,6 +82,7 @@ import {
 } from '../ipc/conversation-store.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
+import { resetPluginSession } from './session-reset.js';
 import {
   assertPluginBrowserPartitionAvailable,
   beginPluginBrowserPartitionOperation,
@@ -1340,9 +1341,10 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           // Provide helpers to the caller for auto-login / webContents interaction
           if (onReady) {
             const helpers = {
-              executeJavaScript: persistentPluginCallback(async (code: string) =>
-                authWin.webContents.executeJavaScript(code),
-              ),
+              executeJavaScript: persistentPluginCallback(async (code: string) => {
+                if (settled || authWin.isDestroyed()) throw new Error('Authentication window is closed');
+                return authWin.webContents.executeJavaScript(code);
+              }),
               getURL: persistentPluginCallback(() => authWin.webContents.getURL()),
               onDidNavigate: persistentPluginCallback((cb: (url: string) => void) => {
                 authWin.webContents.on('did-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
@@ -1438,6 +1440,11 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     },
 
     session: {
+      reset: async (partition: string): Promise<void> => {
+        requirePermission('auth:window');
+        assertPluginPartitionAllowed(partition);
+        await resetPluginSession(manifest.name, partition);
+      },
       clearCookies: async (partition: string, filter?: { domain?: string }): Promise<number> => {
         requirePermission('auth:window');
         assertPluginPartitionAllowed(partition);

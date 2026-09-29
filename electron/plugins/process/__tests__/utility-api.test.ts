@@ -104,6 +104,15 @@ function setup(permissions: PluginManifest['permissions'] = allPermissions) {
 describe('utility-process plugin API compatibility proxy', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it('forwards isolated session reset and requires auth permission', async () => {
+    const { api, calls } = setup();
+    await api.session.reset('persist:kai-compat-test-servicenow');
+    expect(calls).toContainEqual({ method: 'session.reset', args: ['persist:kai-compat-test-servicenow'] });
+    const denied = setup([]);
+    expect(() => denied.api.session.reset('persist:kai-compat-test-servicenow')).toThrow();
+    expect(denied.calls).toEqual([]);
+  });
+
   it('keeps legacy synchronous getters and safe-storage calls synchronous', () => {
     const { api, transport } = setup();
     expect(api.host.apiVersion()).toBe('1.2.3');

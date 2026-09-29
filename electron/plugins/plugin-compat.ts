@@ -65,6 +65,7 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'marketplace', // marketplace service is available
   'renderer-build', // host can build frontend.js bundles
   'plugin-config-schema', // host validates configSchema via Zod
+  'session:reset', // complete reset of a plugin-owned persistent browser partition
   'tasks:sync', // origin-aware task hooks + idempotent external task upserts
 ]);
 

@@ -424,6 +424,10 @@ export function createUtilityPluginAPI(options: {
     },
 
     session: {
+      reset: (partition) => {
+        checkPermission('auth:window');
+        return asyncCall('session.reset', [partition]);
+      },
       clearCookies: (partition, filter) => {
         checkPermission('auth:window');
         return asyncCall('session.clearCookies', [partition, filter]);

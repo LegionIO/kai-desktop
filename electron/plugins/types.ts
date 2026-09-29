@@ -857,6 +857,8 @@ export type PluginAPI = {
   };
 
   session: {
+    /** Clears cookies, storage and caches in persist:kai-<pluginName>-<suffix>. */
+    reset: (partition: string) => Promise<void>;
     clearCookies: (partition: string, filter?: { domain?: string }) => Promise<number>;
   };
 
