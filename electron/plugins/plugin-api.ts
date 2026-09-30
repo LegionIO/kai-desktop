@@ -1,5 +1,6 @@
 import { app, shell, BrowserWindow, safeStorage, session, net } from 'electron';
 import { getBrandUserAgent } from '../utils/user-agent.js';
+import { loadUrlAllowingRedirect } from '../utils/load-url.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
 import { z } from 'zod';
@@ -1151,6 +1152,8 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
                 webPreferences: {
                   nodeIntegration: false,
                   contextIsolation: true,
+                  // Hidden SSO pages still need timers and scripts to progress.
+                  backgroundThrottling: false,
                   ...(ses ? { session: ses } : {}),
                 },
               });
@@ -1376,7 +1379,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           debugAuth(
             `open auth window: url=${url.split('?')[0]} callbackMatch=${callbackMatch} extractParams=[${extractParams?.join(',') ?? ''}] showOnCreate=${showOnCreate} showAfterMs=${showAfterMs ?? ''}`,
           );
-          authWin.loadURL(url).catch((err) => {
+          // A cached SSO session can replace the initial load with a form POST.
+          // Keep the auth callback, cancellation and timeout active across it.
+          loadUrlAllowingRedirect(authWin.webContents, url).catch((err) => {
             settle({ success: false, error: `Failed to load auth URL: ${err.message}` });
           });
 

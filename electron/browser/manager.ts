@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { basename, join } from 'node:path';
+import { loadUrlAllowingRedirect } from '../utils/load-url.js';
+export { isSupersededLoadAbort, loadUrlAllowingRedirect } from '../utils/load-url.js';
 import {
   app,
   BaseWindow,
@@ -383,29 +385,6 @@ type CdpSensitiveScanBudget = {
 
 const BROWSER_CONTROL_POLICY_RANK = { allow: 0, ask: 1, deny: 2 } as const;
 const BROWSER_PASSWORD_POLICY_RANK = { automatic: 0, ask: 1, 'user-only': 2 } as const;
-
-/** loadURL() rejects with ERR_ABORTED when the page itself navigates away
- * before its first document finishes (SAML/SSO auto-submit, JS redirects).
- * The replacement navigation is live and owns the tab, so for the caller that
- * is a redirect, not a failed load. */
-export function isSupersededLoadAbort(error: unknown): boolean {
-  return (
-    !!error &&
-    typeof error === 'object' &&
-    ((error as { code?: unknown }).code === 'ERR_ABORTED' || (error as { errno?: unknown }).errno === -3)
-  );
-}
-
-/** Await a loadURL() whose page may redirect itself mid-load. ERR_ABORTED is
- * absorbed only if the WebContents is still alive; any other failure (or a
- * destroyed target) still rejects. */
-export async function loadUrlAllowingRedirect(contents: WebContents, url: string): Promise<void> {
-  try {
-    await contents.loadURL(url);
-  } catch (error) {
-    if (!isSupersededLoadAbort(error) || contents.isDestroyed()) throw error;
-  }
-}
 
 function browserControlPolicyTightened(
   previous: AppConfig['browser']['structuredActions'],
