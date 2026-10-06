@@ -122,7 +122,8 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
-import { ArtifactProvider, ARTIFACT_PREVIEW_TAB_ID } from '@/providers/ArtifactProvider';
+import { ARTIFACT_PREVIEW_TAB_ID } from '@/providers/ArtifactProvider';
+import { ConversationArtifactProvider } from '@/providers/ConversationArtifactProvider';
 import { SidePanelProvider, SidePanelHost, ArtifactPanel, type SidePanelTab } from '@/components/side-panel';
 import { BrowserPanel, BrowserPanelAutoOpen } from '@/components/browser';
 import { BROWSER_PANEL_TAB_ID } from '../shared/browser';
@@ -2850,7 +2851,7 @@ function AppShell() {
             }}
           />
           <RealtimeProvider>
-            <SidePanelProvider>
+            <SidePanelProvider conversationId={activeConversationId}>
               <PluginErrorBoundary fallback={() => null}>
                 <PluginModalHost />
               </PluginErrorBoundary>
@@ -3845,7 +3846,7 @@ function AppShell() {
                       </div>
                     ) : (
                       <PlanPanelProvider onOpenPlan={handleOpenPlan}>
-                        <ArtifactProvider key={activeConversationId ?? 'no-conv'}>
+                        <ConversationArtifactProvider conversationId={activeConversationId}>
                           <div className="flex h-full min-h-0">
                             {/* Chat column */}
                             <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
@@ -3875,7 +3876,7 @@ function AppShell() {
                               />
                             )}
                           </div>
-                        </ArtifactProvider>
+                        </ConversationArtifactProvider>
                       </PlanPanelProvider>
                     )}
                   </div>

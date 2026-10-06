@@ -376,7 +376,7 @@ export const BrowserPanelAutoOpen: FC<{
       disposed = true;
       unsubscribe();
     };
-  }, [openPanel]);
+  }, []);
 
   if (!attentionConversationId) return null;
   return (
@@ -407,7 +407,7 @@ export const BrowserPanelAutoOpen: FC<{
               if (!opened) return;
               setAttentionByConversation((current) => clearPanelTabAttention(current, target));
               onRevealChat?.();
-              openPanel(BROWSER_PANEL_TAB_ID);
+              openPanel(BROWSER_PANEL_TAB_ID, target);
             })
             .catch(() => undefined);
         }}

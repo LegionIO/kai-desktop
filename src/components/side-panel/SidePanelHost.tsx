@@ -36,8 +36,8 @@ export type SidePanelState = 'minimized' | 'open';
 type SidePanelContextValue = {
   state: SidePanelState;
   activeTabId: string | null;
-  /** Open the panel. If `tabId` is provided it becomes the active tab. */
-  openPanel: (tabId?: string) => void;
+  /** Open this conversation's panel, or an explicit target after async navigation. */
+  openPanel: (tabId?: string, targetConversationId?: string | null) => void;
   closePanel: () => void;
   minimizePanel: () => void;
   setActiveTab: (tabId: string) => void;
@@ -59,22 +59,44 @@ export function useSidePanelOptional(): SidePanelContextValue | null {
 /*  Provider — owns open/minimized/closed + active tab                        */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-export const SidePanelProvider: FC<PropsWithChildren> = ({ children }) => {
-  const [state, setState] = useState<SidePanelState>('minimized');
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+type ConversationPanelState = Pick<SidePanelContextValue, 'state' | 'activeTabId'>;
+const DEFAULT_PANEL_STATE: ConversationPanelState = { state: 'minimized', activeTabId: null };
 
-  const openPanel = useCallback((tabId?: string) => {
-    if (tabId) setActiveTabId(tabId);
-    setState('open');
+export const SidePanelProvider: FC<PropsWithChildren<{ conversationId?: string | null }>> = ({
+  children,
+  conversationId = null,
+}) => {
+  const [panels, setPanels] = useState<Map<string | null, ConversationPanelState>>(() => new Map());
+  const { state, activeTabId } = panels.get(conversationId) ?? DEFAULT_PANEL_STATE;
+
+  const updatePanel = useCallback((id: string | null, patch: Partial<ConversationPanelState>) => {
+    setPanels((current) => {
+      const next = new Map(current);
+      next.set(id, { ...(current.get(id) ?? DEFAULT_PANEL_STATE), ...patch });
+      return next;
+    });
   }, []);
+
+  const openPanel = useCallback(
+    (tabId?: string, targetConversationId = conversationId) => {
+      updatePanel(targetConversationId, { state: 'open', ...(tabId ? { activeTabId: tabId } : {}) });
+    },
+    [conversationId, updatePanel],
+  );
 
   // The panel has just two visible states: `open` (full body) and `minimized`
   // (slim rail with per-tab icons + expand). We keep `closePanel` in the API for
   // existing callers, but it now collapses to the SAME minimized rail rather than
   // a separate near-hidden `closed` state — one clear collapse/expand affordance.
-  const closePanel = useCallback(() => setState('minimized'), []);
-  const minimizePanel = useCallback(() => setState('minimized'), []);
-  const setActiveTab = useCallback((tabId: string) => setActiveTabId(tabId), []);
+  const closePanel = useCallback(
+    () => updatePanel(conversationId, { state: 'minimized' }),
+    [conversationId, updatePanel],
+  );
+  const minimizePanel = closePanel;
+  const setActiveTab = useCallback(
+    (tabId: string) => updatePanel(conversationId, { activeTabId: tabId }),
+    [conversationId, updatePanel],
+  );
 
   const value = useMemo<SidePanelContextValue>(
     () => ({ state, activeTabId, openPanel, closePanel, minimizePanel, setActiveTab }),

@@ -101,7 +101,7 @@ describe('BrowserPanel', () => {
       return <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>;
     };
     render(
-      <SidePanelProvider>
+      <SidePanelProvider conversationId="chat-1">
         <BrowserPanelAutoOpen conversationId="chat-1" />
         <State />
       </SidePanelProvider>,
@@ -130,7 +130,7 @@ describe('BrowserPanel', () => {
       return <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>;
     };
     render(
-      <SidePanelProvider>
+      <SidePanelProvider conversationId="chat-1">
         <BrowserPanelAutoOpen conversationId="chat-1" />
         <State />
       </SidePanelProvider>,
@@ -245,7 +245,8 @@ describe('BrowserPanel', () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const setActiveId = vi.fn(async () => undefined);
     const onRevealChat = vi.fn();
-    const onOpenConversation = vi.fn(async () => undefined);
+    const navigation = deferred<void>();
+    const onOpenConversation = vi.fn(() => navigation.promise);
     installAppBridgeStub({
       conversations: { setActiveId },
       browser: {
@@ -259,16 +260,17 @@ describe('BrowserPanel', () => {
       const panel = useSidePanel();
       return <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>;
     };
-    render(
-      <SidePanelProvider>
+    const ui = (conversationId: string) => (
+      <SidePanelProvider conversationId={conversationId}>
         <BrowserPanelAutoOpen
-          conversationId="chat-1"
+          conversationId={conversationId}
           onOpenConversation={onOpenConversation}
           onRevealChat={onRevealChat}
         />
         <State />
-      </SidePanelProvider>,
+      </SidePanelProvider>
     );
+    const view = render(ui('chat-1'));
 
     act(() => {
       emit?.({
@@ -306,8 +308,14 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('alert')).not.toHaveClass('right-5');
     fireEvent.click(screen.getByText('Open'));
     await waitFor(() => expect(onOpenConversation).toHaveBeenCalledWith('chat-2'));
+    view.rerender(ui('chat-2'));
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+    await act(async () => navigation.resolve());
+    expect(screen.getByText('open:browser')).toBeInTheDocument();
     expect(setActiveId).not.toHaveBeenCalled();
     expect(onRevealChat).toHaveBeenCalledOnce();
+    view.rerender(ui('chat-1'));
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
   });
 
   it('retains an active prompt when the Browser panel is collapsed until the prompt is dismissed', () => {
@@ -711,6 +719,7 @@ describe('BrowserPanel', () => {
 
   it('keeps queued attention minimized until the user opens it', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
+    const onOpenConversation = vi.fn(async () => undefined);
     installAppBridgeStub({
       browser: {
         onEvent: (callback: (event: BrowserEvent) => void) => {
@@ -724,8 +733,8 @@ describe('BrowserPanel', () => {
       return <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>;
     };
     const { rerender } = render(
-      <SidePanelProvider>
-        <BrowserPanelAutoOpen conversationId="chat-1" chatViewActive={false} />
+      <SidePanelProvider conversationId="chat-1">
+        <BrowserPanelAutoOpen conversationId="chat-1" chatViewActive={false} onOpenConversation={onOpenConversation} />
         <State />
       </SidePanelProvider>,
     );
@@ -737,8 +746,8 @@ describe('BrowserPanel', () => {
     expect(screen.getByText('minimized:none')).toBeInTheDocument();
 
     rerender(
-      <SidePanelProvider>
-        <BrowserPanelAutoOpen conversationId="chat-1" chatViewActive />
+      <SidePanelProvider conversationId="chat-1">
+        <BrowserPanelAutoOpen conversationId="chat-1" chatViewActive onOpenConversation={onOpenConversation} />
         <State />
       </SidePanelProvider>,
     );
@@ -748,6 +757,14 @@ describe('BrowserPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
+    await waitFor(() => expect(onOpenConversation).toHaveBeenCalledWith('chat-2'));
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+    rerender(
+      <SidePanelProvider conversationId="chat-2">
+        <BrowserPanelAutoOpen conversationId="chat-2" chatViewActive onOpenConversation={onOpenConversation} />
+        <State />
+      </SidePanelProvider>,
+    );
     await waitFor(() => expect(screen.getByText('open:browser')).toBeInTheDocument());
   });
 
