@@ -265,6 +265,46 @@ function endpointAuthority(endpoint: ResolvedEndpoint, port: number): string {
   return `${endpoint.family === 6 ? `[${endpoint.address}]` : endpoint.address}:${port}`;
 }
 
+function isNameResolutionFailure(error: unknown): boolean {
+  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(isNameResolutionFailure);
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === 'ENOTFOUND' || code === 'EAI_NONAME' || code === 'EAI_NODATA';
+}
+
+/** Answer a failed CONNECT with an HTTP status instead of a bare socket close.
+ * Chromium maps a close before any response to ERR_EMPTY_RESPONSE, which hides
+ * the real cause; a 5xx tunnel response surfaces as a normal connection error. */
+function rejectFailedConnect(client: Socket, error: unknown): void {
+  if (client.destroyed) return;
+  if (!client.writable) {
+    client.destroy();
+    return;
+  }
+  const status = isNameResolutionFailure(error) ? '502 Bad Gateway' : '503 Service Unavailable';
+  client.end(`HTTP/1.1 ${status}\r\nProxy-Agent: Kai\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+}
+
+const MAX_RECENT_CONNECT_FAILURES = 64;
+const RECENT_CONNECT_FAILURE_TTL_MS = 30_000;
+
+/** Short, user-facing reason for a failed tunnel. Chromium only reports
+ * ERR_TUNNEL_CONNECTION_FAILED for any proxy-side failure, so Browser chrome
+ * asks the proxy why. */
+function describeConnectFailure(hostname: string, error: unknown): string {
+  if (isNameResolutionFailure(error)) {
+    return `${hostname} could not be found (DNS lookup failed). Check the address, or connect to the VPN if this is an internal site.`;
+  }
+  const leaf = error instanceof AggregateError ? error.errors.at(-1) : error;
+  const code = (leaf as { code?: unknown } | null)?.code;
+  if (code === 'ECONNREFUSED') return `${hostname} refused the connection.`;
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return `${hostname} is unreachable from this network.`;
+  if (leaf instanceof Error && /timed out/i.test(leaf.message)) return `Connecting to ${hostname} timed out.`;
+  if (leaf instanceof Error && /Private-network destination blocked/i.test(leaf.message)) {
+    return `${hostname} is a private-network address, which assistant browsing is not allowed to reach.`;
+  }
+  return `Could not connect to ${hostname}.`;
+}
+
 function proxyTargetAuthority(target: ProxyTarget, port: number): string {
   if (target.endpoint) return endpointAuthority(target.endpoint, port);
   return `${target.hostname.includes(':') ? `[${target.hostname}]` : target.hostname}:${port}`;
@@ -376,6 +416,7 @@ export class BrowserValidatingProxy {
   private readonly pendingSocketsByHost = new Map<string, Set<Socket>>();
   private readonly boundUpstreamAuthentication = new WeakMap<Socket, BoundUpstreamAuthentication>();
   private readonly clientSockets = new Set<Socket>();
+  private readonly recentConnectFailures = new Map<string, { reason: string; at: number }>();
   private readonly operationTimeoutMs: number;
   private readonly resolveHost: (hostname: string) => Promise<ResolvedEndpoint[]>;
   private readonly connectTls: (options: TlsConnectionOptions) => Socket;
@@ -529,6 +570,30 @@ export class BrowserValidatingProxy {
     if (!hostname) return;
     this.restrictedRequests.delete(key);
     this.releaseRestrictedHost(hostname);
+  }
+
+  /** Human-readable cause of the most recent failed tunnel to `hostname`, if
+   * it happened recently enough to explain a navigation error. */
+  recentConnectFailure(hostname: string): string | undefined {
+    const normalized = normalizedHostname(hostname);
+    const entry = this.recentConnectFailures.get(normalized);
+    if (!entry) return undefined;
+    if (Date.now() - entry.at > RECENT_CONNECT_FAILURE_TTL_MS) {
+      this.recentConnectFailures.delete(normalized);
+      return undefined;
+    }
+    return entry.reason;
+  }
+
+  private recordConnectFailure(hostname: string, error: unknown): void {
+    const normalized = normalizedHostname(hostname);
+    this.recentConnectFailures.delete(normalized);
+    this.recentConnectFailures.set(normalized, { reason: describeConnectFailure(normalized, error), at: Date.now() });
+    while (this.recentConnectFailures.size > MAX_RECENT_CONNECT_FAILURES) {
+      const oldest = this.recentConnectFailures.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.recentConnectFailures.delete(oldest);
+    }
   }
 
   releaseScope(scopeKey: string): void {
@@ -713,11 +778,21 @@ export class BrowserValidatingProxy {
     const token = decoded.slice(separator + 1);
     const authority = this.authorities.get(token);
     if (!authority) return null;
-    // Every credential is one connection/request authority. Consuming it keeps
-    // Chromium's proxy-auth cache from turning one trusted user navigation into
-    // ambient authority for a later assistant request in the same profile.
-    this.authorities.delete(token);
-    if (authority.expiresAt <= Date.now()) return null;
+    const currentTime = Date.now();
+    if (authority.expiresAt <= currentTime) {
+      this.authorities.delete(token);
+      return null;
+    }
+    // Chromium caches one proxy identity per (proxy, realm) and preemptively
+    // replays it on every later tunnel — subresources, new tabs, retries. It
+    // does not reliably re-run `login` when that cached identity is rejected,
+    // so a one-shot token turned every connection after the first into a 407
+    // (ERR_TUNNEL_CONNECTION_FAILED: missing images, blank tabs, error
+    // banners). Keep the credential reusable and slide its expiry while
+    // Chromium is actively using it. Assistant restriction does not depend on
+    // credential freshness: restrictAuthorityForHost() elevates any credential
+    // for a host with an active restricted request (see restrictRequest()).
+    authority.expiresAt = currentTime + PROXY_AUTHORITY_TTL_MS;
     return { authority: this.restrictAuthorityForHost(authority, hostname) };
   }
 
@@ -1500,7 +1575,14 @@ export class BrowserValidatingProxy {
         socket.once('close', () => this.clientSockets.delete(socket));
       });
       server.on('connect', (request, socket, head) => {
-        void this.handleConnect(request, socket as Socket, head).catch(() => socket.destroy());
+        void this.handleConnect(request, socket as Socket, head).catch((error: unknown) => {
+          try {
+            this.recordConnectFailure(parseConnectTarget(request.url ?? '').hostname, error);
+          } catch {
+            // An unparseable target has no host to explain.
+          }
+          rejectFailedConnect(socket as Socket, error);
+        });
       });
       server.on('upgrade', (request, socket, head) => {
         void this.handleUpgrade(request, socket as Socket, head).catch(() => socket.destroy());

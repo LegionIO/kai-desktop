@@ -8,7 +8,7 @@ function stackAt(document: Document, x: number, y: number): Element[] {
   return top ? [top] : [];
 }
 
-const OVERLAY_HINT_SELECTOR = [
+const OVERLAY_HINT_ROLE_SELECTORS = [
   '[aria-modal="true"]',
   '[data-radix-popper-content-wrapper]',
   '[data-radix-portal]',
@@ -20,6 +20,13 @@ const OVERLAY_HINT_SELECTOR = [
   '[role="listbox"]',
   '[role="menu"]',
   '[role="tooltip"]',
+];
+
+/** Semantic overlay hints are always tracked, even inside a clipped region. */
+const OVERLAY_HINT_ROLE_SELECTOR = OVERLAY_HINT_ROLE_SELECTORS.join(',');
+
+const OVERLAY_HINT_SELECTOR = [
+  ...OVERLAY_HINT_ROLE_SELECTORS,
   // Fast-path framework/inline hints. Computed discovery below is the
   // authority, so stylesheet-defined equivalents are covered too.
   '[class~="absolute"]',
@@ -83,6 +90,7 @@ const installedHtmlInjectionMethods = new WeakMap<object, Map<string, () => bool
 const opaqueDeclarativeTreeByTarget = new WeakMap<object, OpaqueDeclarativeTreeState>();
 const opaqueDeclarativeTokensByElement = new WeakMap<Element, Set<object>>();
 const pseudoSelectorCache = new WeakMap<object, { revision: number; selectors: string[] | null }>();
+const combinedPseudoSelectors = new WeakMap<string[], string>();
 let pseudoStyleRevision = 0;
 const MAX_PSEUDO_STYLE_SELECTORS = 4_096;
 
@@ -727,13 +735,60 @@ function styleCreatesOverlayContext(style: CSSStyleDeclaration): boolean {
   return /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(style.contain);
 }
 
+const PSEUDO_ELEMENT_PATTERN = /::?(?:before|after)\b/i;
+
+/** Split a selector list on top-level commas, leaving commas inside
+ * :is()/:not() arguments, attribute values, and strings intact. */
+function splitSelectorList(selectorText: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let start = 0;
+  for (let index = 0; index < selectorText.length; index++) {
+    const char = selectorText[index];
+    if (quote) {
+      if (char === '\\') index++;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === '(' || char === '[') depth++;
+    else if (char === ')' || char === ']') depth = Math.max(0, depth - 1);
+    else if (char === ',' && depth === 0) {
+      parts.push(selectorText.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(selectorText.slice(start));
+  return parts;
+}
+
+/** A ::before/::after box only exists when its computed `content` is set, and
+ * only a declaration of `content` (or the `all` shorthand) can set it. Rules
+ * that merely style pseudo-elements, such as Tailwind's universal
+ * `*, ::before, ::after { box-sizing }` reset, cannot create an overlay. */
+function ruleMayGeneratePseudoContent(rule: CSSRule & { style?: CSSStyleDeclaration }): boolean {
+  const style = rule.style;
+  if (!style || typeof style.getPropertyValue !== 'function') return true;
+  return style.getPropertyValue('content') !== '' || style.getPropertyValue('all') !== '';
+}
+
 function collectPseudoSelectorsFromRules(rules: CSSRuleList, selectors: string[]): boolean {
   for (const rule of rules) {
-    const candidate = rule as CSSRule & { selectorText?: string; cssRules?: CSSRuleList };
-    if (typeof candidate.selectorText === 'string' && /::(?:before|after)\b/i.test(candidate.selectorText)) {
-      const selector = candidate.selectorText.replace(/::(?:before|after)\b/gi, '');
-      if (selector.trim()) selectors.push(selector);
-      if (selectors.length > MAX_PSEUDO_STYLE_SELECTORS) return false;
+    const candidate = rule as CSSRule & { selectorText?: string; cssRules?: CSSRuleList; style?: CSSStyleDeclaration };
+    if (
+      typeof candidate.selectorText === 'string' &&
+      PSEUDO_ELEMENT_PATTERN.test(candidate.selectorText) &&
+      ruleMayGeneratePseudoContent(candidate)
+    ) {
+      // Keep only the list entries that target a pseudo-element, and match
+      // their originating element. A bare `::before` originates on any element.
+      for (const part of splitSelectorList(candidate.selectorText)) {
+        if (!PSEUDO_ELEMENT_PATTERN.test(part)) continue;
+        const selector = part.replace(/::?(?:before|after)\b/gi, '').trim();
+        selectors.push(selector || '*');
+        if (selectors.length > MAX_PSEUDO_STYLE_SELECTORS) return false;
+      }
     }
     if (candidate.cssRules && !collectPseudoSelectorsFromRules(candidate.cssRules, selectors)) return false;
   }
@@ -772,12 +827,34 @@ function pseudoSelectorsForRoot(root: Node): string[] | null {
   }
   const result = complete ? selectors : null;
   pseudoSelectorCache.set(root, { revision: pseudoStyleRevision, selectors: result });
+  if (result && result.length > 0) {
+    // One matches() call over the whole list is far cheaper than one per rule.
+    // Only use it when every entry parses; otherwise match individually.
+    const combined = result.join(',');
+    let valid = true;
+    try {
+      (root.nodeType === 9 ? (root as Document) : root.ownerDocument)?.createElement('div').matches(combined);
+    } catch {
+      valid = false;
+    }
+    if (valid) combinedPseudoSelectors.set(result, combined);
+  }
   return result;
 }
 
 function elementMayHavePseudoStyle(element: Element): boolean {
   const selectors = pseudoSelectorsForRoot(element.getRootNode());
   if (selectors === null) return true;
+  if (selectors.length === 0) return false;
+  const combined = combinedPseudoSelectors.get(selectors);
+  if (combined !== undefined) {
+    try {
+      return element.matches(combined);
+    } catch {
+      // Fall through to per-selector matching so one unsupported selector
+      // cannot hide a valid match in the rest of the list.
+    }
+  }
   return selectors.some((selector) => {
     try {
       return element.matches(selector);
@@ -967,10 +1044,147 @@ function candidatePaintsAboveSurface(
   return false;
 }
 
+type ClipMode = 'flow' | 'absolute' | 'fixed';
+
+/** Per-pass cache for deciding whether an element's paint is confined to an
+ * overflow container that lies entirely outside the native surface. Styles and
+ * rects are only valid for one synchronous pass, so a fresh analysis is made
+ * for each candidate discovery pass and dropped afterwards. */
+type ClipAnalysis = {
+  candidates: RendererOverlayCandidates;
+  surfaceRect: DOMRect;
+  styles: Map<Element, CSSStyleDeclaration | null>;
+  clippedFrom: Map<Element, Partial<Record<ClipMode, boolean>>>;
+};
+
+let activeClipAnalysis: ClipAnalysis | null = null;
+const clipRootsByCandidateSet = new WeakMap<RendererOverlayCandidates, Set<Element>>();
+
+function clipStyle(analysis: ClipAnalysis, element: Element): CSSStyleDeclaration | null {
+  if (analysis.styles.has(element)) return analysis.styles.get(element) ?? null;
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element) ?? null;
+  analysis.styles.set(element, style);
+  return style;
+}
+
+function establishesFixedContainingBlock(style: CSSStyleDeclaration): boolean {
+  return (
+    activeComputedProperty(style, 'transform', ['none']) ||
+    activeComputedProperty(style, 'translate', ['none']) ||
+    activeComputedProperty(style, 'rotate', ['none']) ||
+    activeComputedProperty(style, 'scale', ['none']) ||
+    activeComputedProperty(style, 'filter', ['none']) ||
+    activeComputedProperty(style, 'backdrop-filter', ['none']) ||
+    activeComputedProperty(style, 'perspective', ['none']) ||
+    /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(style.contain) ||
+    /\b(?:transform|translate|rotate|scale|filter|perspective)\b/.test(style.getPropertyValue('will-change'))
+  );
+}
+
+function establishesAbsoluteContainingBlock(style: CSSStyleDeclaration): boolean {
+  return style.position !== 'static' || establishesFixedContainingBlock(style);
+}
+
+function clipsBothAxes(style: CSSStyleDeclaration): boolean {
+  const clips = (value: string) => value === 'hidden' || value === 'auto' || value === 'scroll';
+  // Some engines report only the shorthand; a single shorthand value applies
+  // to both axes.
+  const [shorthandX, shorthandY = shorthandX] = (style.overflow || '').trim().split(/\s+/);
+  return clips(style.overflowX || shorthandX || '') && clips(style.overflowY || shorthandY || '');
+}
+
+/** Top-layer UI (open dialogs, popovers) escapes every ancestor clip. */
+function mayEnterTopLayer(element: Element): boolean {
+  return (element.localName === 'dialog' && element.hasAttribute('open')) || element.hasAttribute('popover');
+}
+
+/** Whether content positioned with `mode`, whose nearest ancestor is
+ * `ancestor`, is clipped by an overflow box disjoint from the surface. */
+function clippedAwayFrom(analysis: ClipAnalysis, ancestor: Element | null, mode: ClipMode): boolean {
+  // Slot assignment and shadow boundaries change the flat-tree ancestor chain
+  // that clipping actually follows. Stop there rather than guess.
+  if (!ancestor || ancestor.assignedSlot) return false;
+  const memo = analysis.clippedFrom.get(ancestor);
+  const cached = memo?.[mode];
+  if (cached !== undefined) return cached;
+  const style = clipStyle(analysis, ancestor);
+  let result = false;
+  if (style && !mayEnterTopLayer(ancestor)) {
+    let next = mode;
+    if (next === 'absolute' && establishesAbsoluteContainingBlock(style)) next = 'flow';
+    else if (next === 'fixed' && establishesFixedContainingBlock(style)) next = 'flow';
+    // Prefer the outermost qualifying clip: a chat thread then needs only its
+    // scroll container re-checked on geometry changes, not every message box.
+    result = clippedAwayFrom(analysis, ancestor.parentElement, next);
+    if (
+      !result &&
+      next === 'flow' &&
+      clipsBothAxes(style) &&
+      !intersects(analysis.surfaceRect, ancestor.getBoundingClientRect())
+    ) {
+      let roots = clipRootsByCandidateSet.get(analysis.candidates);
+      if (!roots) clipRootsByCandidateSet.set(analysis.candidates, (roots = new Set()));
+      roots.add(ancestor);
+      result = true;
+    }
+  }
+  analysis.clippedFrom.set(ancestor, { ...memo, [mode]: result });
+  return result;
+}
+
+function isClippedAwayFromSurface(analysis: ClipAnalysis, element: Element): boolean {
+  if (mayEnterTopLayer(element) || element.assignedSlot) return false;
+  const style = clipStyle(analysis, element);
+  if (!style) return false;
+  const mode: ClipMode = style.position === 'fixed' ? 'fixed' : style.position === 'absolute' ? 'absolute' : 'flow';
+  return clippedAwayFrom(analysis, element.parentElement, mode);
+}
+
+/** A ::before/::after is clipped like a child of its host. Assume the most
+ * escaping positioning (fixed) since its own computed style is not read. */
+function pseudoContentClippedAwayFromSurface(analysis: ClipAnalysis, element: Element): boolean {
+  return clippedAwayFrom(analysis, element, 'fixed');
+}
+
+function withClipAnalysis<T>(candidates: RendererOverlayCandidates, run: () => T): T {
+  if (activeClipAnalysis?.candidates === candidates) return run();
+  const surface = overlayCandidateContexts.get(candidates)?.surface;
+  const surfaceRect = surface?.isConnected ? surface.getBoundingClientRect() : null;
+  if (!surfaceRect || surfaceRect.width <= 0 || surfaceRect.height <= 0) return run();
+  const previous = activeClipAnalysis;
+  activeClipAnalysis = { candidates, surfaceRect, styles: new Map(), clippedFrom: new Map() };
+  try {
+    return run();
+  } finally {
+    activeClipAnalysis = previous;
+  }
+}
+
+/** Overflow containers that currently exclude content from candidacy. If one
+ * moves or resizes into the native surface, the panel must rebuild. */
+export function rendererOverlayClipRoots(candidates: RendererOverlayCandidates): Element[] {
+  return [...(clipRootsByCandidateSet.get(candidates) ?? [])].filter((root) => root.isConnected);
+}
+
 function considerOverlayCandidate(candidates: RendererOverlayCandidates, element: Element): void {
   if (shadowIncludingClosest(element, OVERLAY_IGNORE_SELECTOR)) return;
   const document = element.ownerDocument;
   const style = document.defaultView?.getComputedStyle(element);
+  const clipAnalysis = activeClipAnalysis?.candidates === candidates ? activeClipAnalysis : null;
+  // Content clipped by a scroll/overflow container that lies entirely outside
+  // the native surface cannot paint over it, whatever its z-index. Skipping it
+  // keeps a long chat thread from flooding the bounded candidate set. A
+  // ::before/::after may escape that clip (e.g. position: fixed), so a host
+  // with possible pseudo content is still inspected unless that is clipped too.
+  if (
+    clipAnalysis &&
+    style &&
+    !element.matches(OVERLAY_HINT_ROLE_SELECTOR) &&
+    isClippedAwayFromSurface(clipAnalysis, element) &&
+    (!elementMayHavePseudoStyle(element) || pseudoContentClippedAwayFromSurface(clipAnalysis, element))
+  ) {
+    return;
+  }
   if (isComputedOverlayCandidate(element, style)) {
     addOverlayCandidate(candidates, element);
     return;
@@ -985,6 +1199,10 @@ function considerOverlayCandidate(candidates: RendererOverlayCandidates, element
 }
 
 function addOverlayCandidates(candidates: RendererOverlayCandidates, node: Node): void {
+  withClipAnalysis(candidates, () => addOverlayCandidatesInPass(candidates, node));
+}
+
+function addOverlayCandidatesInPass(candidates: RendererOverlayCandidates, node: Node): void {
   if (!(node instanceof Element) && !(node instanceof DocumentFragment)) return;
   const roots = shadowRootsByCandidateSet.get(candidates) ?? new Set<ShadowRoot>();
   shadowRootsByCandidateSet.set(candidates, roots);
@@ -1031,6 +1249,7 @@ function rebuildOverlayCandidates(candidates: RendererOverlayCandidates, root: P
   candidates.clear();
   overflowedOverlayCandidateSets.delete(candidates);
   shadowRootsByCandidateSet.set(candidates, new Set());
+  clipRootsByCandidateSet.delete(candidates);
   if (root instanceof Node) addOverlayCandidates(candidates, root);
 }
 
@@ -1183,18 +1402,91 @@ export function updateRendererOverlayCandidates(
     if (document?.body) rebuildOverlayCandidates(candidates, document.body);
     return mayHaveChanged;
   }
+  const restyleScopes = new Set<Element>();
   for (const record of records) {
     if (record.type === 'attributes' && record.target instanceof Element) {
-      // A class/custom-property change can restyle descendants (or, via :has,
-      // an otherwise unrelated overlay), so recompute from the bounded root.
-      refreshRendererOverlayCandidates(candidates);
-      return mayHaveChanged;
+      // A class/custom-property change restyles the element, its descendants,
+      // and (via sibling combinators) its siblings. Re-discover only that
+      // subtree; streaming chat flips attributes many times per second and a
+      // whole-document rebuild per flip starves the renderer.
+      const scope = attributeRestyleScope(record.target, candidates);
+      if (!scope) {
+        refreshRendererOverlayCandidates(candidates);
+        return mayHaveChanged;
+      }
+      restyleScopes.add(scope);
+      continue;
     }
     if (record.type !== 'childList') continue;
     for (const node of record.removedNodes) removeOverlayCandidates(candidates, node);
     for (const node of record.addedNodes) addOverlayCandidates(candidates, node);
   }
+  for (const scope of restyleScopes) {
+    // A scope nested in another scope is rediscovered with its ancestor.
+    let nested = false;
+    for (const other of restyleScopes) {
+      if (other !== scope && shadowIncludingContains(other, scope)) nested = true;
+    }
+    if (nested || !scope.isConnected) continue;
+    removeOverlayCandidates(candidates, scope);
+    addOverlayCandidates(candidates, scope);
+  }
   return mayHaveChanged;
+}
+
+/** The subtree an attribute change on `target` can restyle, or null when it
+ * may affect arbitrary elements and the whole root must be rediscovered.
+ *
+ * Scoping is limited to changes inside an overflow container already known to
+ * lie outside the native surface. Restyling there can only move content within
+ * that clip; if the container itself grows into the surface, the clip-root
+ * check in hasIntersectingRendererOverlay() forces a full rediscovery. */
+function attributeRestyleScope(target: Element, candidates: RendererOverlayCandidates): Element | null {
+  const document = target.ownerDocument;
+  // :has() lets a descendant or later sibling restyle an ancestor anywhere.
+  if (documentMayUseRelationalSelectors(document)) return null;
+  // Slotted content is styled from the host's shadow tree; rescan everything.
+  if (target.assignedSlot || target.getRootNode() !== document) return null;
+  // Siblings can be restyled through `+`/`~`, so the parent bounds the change.
+  const parent = target.parentElement;
+  if (!parent) return null;
+  const clipRoots = clipRootsByCandidateSet.get(candidates);
+  if (!clipRoots) return null;
+  for (const root of clipRoots) {
+    // The clip root itself qualifies: its own box is not what changed.
+    if (root.isConnected && root.contains(parent)) return parent;
+  }
+  return null;
+}
+
+const relationalSelectorCache = new WeakMap<Document, { revision: number; relational: boolean }>();
+
+function rulesUseRelationalSelectors(rules: CSSRuleList): boolean {
+  for (const rule of rules) {
+    const candidate = rule as CSSRule & { selectorText?: string; cssRules?: CSSRuleList };
+    if (typeof candidate.selectorText === 'string' && /:has\(/i.test(candidate.selectorText)) return true;
+    if (candidate.cssRules && rulesUseRelationalSelectors(candidate.cssRules)) return true;
+  }
+  return false;
+}
+
+function documentMayUseRelationalSelectors(document: Document): boolean {
+  const cached = relationalSelectorCache.get(document);
+  if (cached?.revision === pseudoStyleRevision) return cached.relational;
+  let relational = false;
+  try {
+    for (const sheet of [...document.styleSheets, ...(document.adoptedStyleSheets ?? [])]) {
+      if (rulesUseRelationalSelectors(sheet.cssRules)) {
+        relational = true;
+        break;
+      }
+    }
+  } catch {
+    // An unreadable sheet may use :has(); fall back to full rediscovery.
+    relational = true;
+  }
+  relationalSelectorCache.set(document, { revision: pseudoStyleRevision, relational });
+  return relational;
 }
 
 /** CSS motion events are tracked when the animated element is an overlay or
@@ -1281,6 +1573,19 @@ export function hasIntersectingRendererOverlay(
   const document = surface.ownerDocument;
   const surfaceRect = surface.getBoundingClientRect();
   if (surfaceRect.width <= 0 || surfaceRect.height <= 0) return false;
+  // Content was excluded only because these overflow boxes sat outside the
+  // native surface. If one has since moved or grown into it, that exclusion
+  // no longer holds: rediscover before trusting the candidate set.
+  const clipRoots = clipRootsByCandidateSet.get(candidates);
+  if (clipRoots) {
+    let clipMoved = false;
+    for (const root of clipRoots) {
+      // Removed containers took their excluded content with them.
+      if (!root.isConnected) clipRoots.delete(root);
+      else if (intersects(surfaceRect, root.getBoundingClientRect())) clipMoved = true;
+    }
+    if (clipMoved) refreshRendererOverlayCandidates(candidates);
+  }
   if (overflowedOverlayCandidateSets.has(candidates)) return true;
 
   for (const candidate of candidates) {

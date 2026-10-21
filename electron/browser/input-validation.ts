@@ -15,73 +15,123 @@ const tabId = z.string().uuid().optional();
 const boundedCoordinate = z.number().finite().min(-MAX_BROWSER_INPUT_COORDINATE).max(MAX_BROWSER_INPUT_COORDINATE);
 const boundedViewportCoordinate = boundedCoordinate.min(0);
 
-export const browserActionRequestSchema = z
-  .object({
-    tabId,
-    kind: z.enum([
-      'navigate',
-      'back',
-      'forward',
-      'reload',
-      'stop',
-      'click',
-      'doubleClick',
-      'hover',
-      'focus',
-      'type',
-      'press',
-      'scroll',
-      'drag',
-      'wait',
-      'bookmark',
-      'unbookmark',
-    ]),
-    url: z.string().max(MAX_BROWSER_URL_CHARS).optional(),
-    selector: z.string().max(MAX_BROWSER_SELECTOR_CHARS).optional(),
-    role: z.string().max(MAX_BROWSER_ROLE_CHARS).optional(),
-    name: z.string().max(MAX_BROWSER_SEMANTIC_TARGET_CHARS).optional(),
-    // `text` is normally a semantic target. Navigate and legacy type/press
-    // forms also use it as their value, so the kind-specific cap below is wider.
-    text: z.string().max(MAX_BROWSER_TYPED_VALUE_CHARS).optional(),
-    value: z.string().max(MAX_BROWSER_TYPED_VALUE_CHARS).optional(),
-    keys: z.array(z.string().min(1).max(MAX_BROWSER_KEY_CHARS)).max(MAX_BROWSER_KEYS).optional(),
-    x: boundedViewportCoordinate.optional(),
-    y: boundedViewportCoordinate.optional(),
-    endX: boundedCoordinate.optional(),
-    endY: boundedCoordinate.optional(),
-    deltaX: boundedCoordinate.optional(),
-    deltaY: boundedCoordinate.optional(),
-    waitMs: z.number().int().min(0).max(30_000).optional(),
-  })
-  .superRefine((request, context) => {
-    if (request.kind === 'press' && request.keys && request.keys.length > 1) {
-      const invalidModifierIndex = request.keys
-        .slice(0, -1)
-        .findIndex((key) => !BROWSER_MODIFIER_KEYS.has(key.toLowerCase()));
-      if (invalidModifierIndex >= 0) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['keys', invalidModifierIndex],
-          message: 'Browser press keys must contain only modifiers before the final key.',
-        });
-      }
-    }
-    if (request.text === undefined) return;
-    const maximum =
-      request.kind === 'navigate'
-        ? MAX_BROWSER_URL_CHARS
-        : request.kind === 'type'
-          ? MAX_BROWSER_TYPED_VALUE_CHARS
-          : request.kind === 'press'
-            ? MAX_BROWSER_KEY_CHARS
-            : MAX_BROWSER_SEMANTIC_TARGET_CHARS;
-    if (request.text.length > maximum) {
+const browserActionKindSchema = z.enum([
+  'navigate',
+  'back',
+  'forward',
+  'reload',
+  'stop',
+  'click',
+  'doubleClick',
+  'hover',
+  'focus',
+  'type',
+  'press',
+  'scroll',
+  'drag',
+  'wait',
+  'bookmark',
+  'unbookmark',
+]);
+
+const browserActionFields = {
+  url: z.string().max(MAX_BROWSER_URL_CHARS).optional(),
+  selector: z.string().max(MAX_BROWSER_SELECTOR_CHARS).optional(),
+  role: z.string().max(MAX_BROWSER_ROLE_CHARS).optional(),
+  name: z.string().max(MAX_BROWSER_SEMANTIC_TARGET_CHARS).optional(),
+  // `text` is normally a semantic target. Navigate and legacy type/press
+  // forms also use it as their value, so the kind-specific cap below is wider.
+  text: z.string().max(MAX_BROWSER_TYPED_VALUE_CHARS).optional(),
+  value: z.string().max(MAX_BROWSER_TYPED_VALUE_CHARS).optional(),
+  keys: z.array(z.string().min(1).max(MAX_BROWSER_KEY_CHARS)).max(MAX_BROWSER_KEYS).optional(),
+  x: boundedViewportCoordinate.optional(),
+  y: boundedViewportCoordinate.optional(),
+  endX: boundedCoordinate.optional(),
+  endY: boundedCoordinate.optional(),
+  deltaX: boundedCoordinate.optional(),
+  deltaY: boundedCoordinate.optional(),
+  waitMs: z.number().int().min(0).max(30_000).optional(),
+};
+
+function refineBrowserAction(
+  request: { kind: z.infer<typeof browserActionKindSchema>; text?: string; keys?: string[] },
+  context: z.RefinementCtx,
+): void {
+  if (request.kind === 'press' && request.keys && request.keys.length > 1) {
+    const invalidModifierIndex = request.keys
+      .slice(0, -1)
+      .findIndex((key) => !BROWSER_MODIFIER_KEYS.has(key.toLowerCase()));
+    if (invalidModifierIndex >= 0) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['text'],
-        message: `Browser ${request.kind} text is limited to ${maximum} characters.`,
+        path: ['keys', invalidModifierIndex],
+        message: 'Browser press keys must contain only modifiers before the final key.',
       });
     }
+  }
+  if (request.text === undefined) return;
+  const maximum =
+    request.kind === 'navigate'
+      ? MAX_BROWSER_URL_CHARS
+      : request.kind === 'type'
+        ? MAX_BROWSER_TYPED_VALUE_CHARS
+        : request.kind === 'press'
+          ? MAX_BROWSER_KEY_CHARS
+          : MAX_BROWSER_SEMANTIC_TARGET_CHARS;
+  if (request.text.length > maximum) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['text'],
+      message: `Browser ${request.kind} text is limited to ${maximum} characters.`,
+    });
+  }
+}
+
+export const browserActionRequestSchema = z
+  .object({ tabId, kind: browserActionKindSchema, ...browserActionFields })
+  .superRefine(refineBrowserAction);
+
+export const MAX_BROWSER_ACTION_STEPS = 20;
+
+/** One step of a batched browser_action call. Steps always target the call's
+ * tab, so a batch cannot fan out across tabs under a single approval. */
+export const browserActionStepSchema = z
+  .object({ kind: browserActionKindSchema, ...browserActionFields })
+  .superRefine(refineBrowserAction);
+
+/** browser_action tool input: either one action (`kind` + fields) or an
+ * ordered `steps` batch run sequentially, stopping at the first failure. */
+export const browserActionToolInputSchema = z
+  .object({
+    tabId,
+    kind: browserActionKindSchema.optional(),
+    ...browserActionFields,
+    steps: z
+      .array(browserActionStepSchema)
+      .min(1)
+      .max(MAX_BROWSER_ACTION_STEPS)
+      .optional()
+      .describe(
+        `Run up to ${MAX_BROWSER_ACTION_STEPS} actions in order in one call (e.g. focus a field, type, then click submit). Omit top-level kind when using steps. Stops at the first failing step.`,
+      ),
+  })
+  .superRefine((input, context) => {
+    if (input.steps) {
+      const stray = Object.keys(browserActionFields).filter((key) => input[key as keyof typeof input] !== undefined);
+      if (input.kind !== undefined || stray.length > 0) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['steps'],
+          message: 'Use either steps or a single top-level action, not both.',
+        });
+      }
+      return;
+    }
+    if (input.kind === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['kind'], message: 'kind or steps is required.' });
+      return;
+    }
+    refineBrowserAction({ ...input, kind: input.kind }, context);
   });
 
 export const browserScreenshotRequestSchema = z.object({

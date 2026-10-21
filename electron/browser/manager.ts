@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { basename, join } from 'node:path';
 import { loadUrlAllowingRedirect } from '../utils/load-url.js';
+import { BrowserCursorOverlay } from './cursor-overlay.js';
 export { isSupersededLoadAbort, loadUrlAllowingRedirect } from '../utils/load-url.js';
 import {
   app,
@@ -235,7 +236,6 @@ const INSPECT_TIMEOUT_MS = 15_000;
 const TARGET_LOCATION_TIMEOUT_MS = 15_000;
 export const MAX_BROWSER_TARGET_DOM_VISITS = 10_000;
 const BROWSER_INPUT_TIMEOUT_MS = 15_000;
-const AUTOMATION_OVERLAY_TIMEOUT_MS = 5_000;
 const ASSISTANT_DIALOG_CDP_TIMEOUT_MS = 5_000;
 const ELEMENT_PICKER_TIMEOUT_MS = 60_000;
 const ASSISTANT_PAGE_LOAD_TIMEOUT_MS = 30_000;
@@ -245,6 +245,8 @@ const MENU_PREVIEW_CDP_SENSITIVITY_TIMEOUT_MS = 5_000;
 const MENU_PREVIEW_MAX_WIDTH = 1_024;
 const MENU_PREVIEW_MAX_HEIGHT = 768;
 const MAX_SUPERSEDED_NETWORK_NAVIGATIONS = 32;
+/** net::ERR_TUNNEL_CONNECTION_FAILED */
+const BROWSER_NET_ERR_TUNNEL_CONNECTION_FAILED = -111;
 const PRELOAD_PRIVATE_NETWORK_GUARD_PENDING_IDENTIFIER = 'preload-pending';
 const PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER = 'preload-pending';
 const UNSAFE_ORIGIN_STORAGE_TYPES: NonNullable<Electron.ClearStorageDataOptions['storages']> = [
@@ -531,8 +533,6 @@ function browserClipboardFocusFingerprintScript(stateKey: string, token: string,
 
 type BrowserAutomationOverlay = {
   contents: WebContents;
-  cancelDebugger: () => void;
-  releaseDebugger: () => void;
   x: number;
   y: number;
 };
@@ -1581,6 +1581,7 @@ export class BrowserManager {
   private mountGeneration = 0;
   private mountedConversationId: string | null = null;
   private mountedBounds: BrowserBounds | null = null;
+  private cursorOverlay: BrowserCursorOverlay | null = null;
   private disposed = false;
   private shuttingDown = false;
   private dataScope: AppConfig['browser']['dataScope'];
@@ -5858,7 +5859,10 @@ export class BrowserManager {
       this.attachActiveView(tab.shell.conversationId);
       return;
     }
-    if (this.attachedView === view) this.attachedView = null;
+    if (this.attachedView === view) {
+      this.attachedView = null;
+      this.hideAutomationCursor();
+    }
     try {
       view.setVisible(false);
       view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
@@ -8634,7 +8638,10 @@ export class BrowserManager {
       ) {
         // Keep the exact input surface alive but hidden until dispatch finishes.
         // The lease release remounts it at the latest sidebar bounds.
-        if (this.attachedView === tab.view) this.attachedView = null;
+        if (this.attachedView === tab.view) {
+          this.attachedView = null;
+          this.hideAutomationCursor();
+        }
         tab.view.setVisible(false);
         return;
       }
@@ -8654,6 +8661,9 @@ export class BrowserManager {
 
   private detachAttachedView(): void {
     if (!this.attachedView) return;
+    // The cursor is positioned over the attached page; it must never linger
+    // over Browser chrome or another tab once that page is no longer shown.
+    this.hideAutomationCursor();
     try {
       // Keep the renderer hosted but hidden so background loading, automation,
       // and capture continue without painting over React Browser chrome.
@@ -8758,7 +8768,10 @@ export class BrowserManager {
     this.backgroundCaptureHost = captureHost;
     this.captureHostedView = view;
     this.captureHostedViewLease = captureLease;
-    if (this.attachedView === view) this.attachedView = null;
+    if (this.attachedView === view) {
+      this.attachedView = null;
+      this.hideAutomationCursor();
+    }
     let removedFromMainHost = false;
     try {
       view.setVisible(false);
@@ -9604,7 +9617,7 @@ export class BrowserManager {
     tab.aiNetworkReleaseRequested = false;
     this.resetUnrestrictedDocumentNetworkState(tab);
     tab.overlayGeneration++;
-    tab.automationOverlay?.releaseDebugger();
+    if (tab.automationOverlay) this.hideAutomationCursor();
     tab.automationOverlay = null;
     this.dropPendingForTab(tab.shell.id);
     tab.popupGesture = null;
@@ -9885,7 +9898,7 @@ export class BrowserManager {
       this.advanceCommittedDocumentEpoch(tab);
       this.commitBrowserNetworkNavigation(tab);
       tab.shell.loading = false;
-      tab.shell.error = `${errorDescription} (${errorCode})`;
+      tab.shell.error = this.describeMainFrameLoadFailure(errorCode, errorDescription, validatedURL);
       tab.shell.url = validatedURL || tab.shell.url;
       tab.shell.security = 'unknown';
       this.emitTabs(tab.shell.conversationId);
@@ -10706,6 +10719,22 @@ export class BrowserManager {
         aborted: /(?:^|::)ERR_ABORTED$/i.test(details.error),
       },
     ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS);
+  }
+
+  /** Chromium reports every proxy-side failure as ERR_TUNNEL_CONNECTION_FAILED.
+   * The validating proxy knows the real cause (DNS miss, refusal, timeout), so
+   * prefer its explanation for the tab's error banner. */
+  private describeMainFrameLoadFailure(errorCode: number, errorDescription: string, url: string): string {
+    const generic = `${errorDescription} (${errorCode})`;
+    if (errorCode !== BROWSER_NET_ERR_TUNNEL_CONNECTION_FAILED) return generic;
+    let hostname: string;
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      return generic;
+    }
+    const reason = this.validatingProxy?.recentConnectFailure(hostname);
+    return reason ? `${reason} (${errorDescription})` : generic;
   }
 
   private consumeSupersededBrowserNetworkNavigationFailure(tab: InternalTab, url: string, errorCode: number): boolean {
@@ -12497,7 +12526,7 @@ export class BrowserManager {
     tab: InternalTab,
     action: BrowserActionEvent | null,
     abortSignal?: AbortSignal,
-    documentLease?: AssistantDocumentLease,
+    _documentLease?: AssistantDocumentLease,
   ): Promise<void> {
     if (tab.overlayTimer) {
       clearTimeout(tab.overlayTimer);
@@ -12507,97 +12536,25 @@ export class BrowserManager {
     const contents = tab.view?.webContents;
     const previousOverlay = tab.automationOverlay;
     tab.automationOverlay = null;
-    try {
-      if (previousOverlay) {
-        try {
-          if (
-            !previousOverlay.contents.isDestroyed() &&
-            previousOverlay.contents.debugger.isAttached() &&
-            tab.view?.webContents === previousOverlay.contents
-          ) {
-            await this.runRendererOperationWithDeadline(
-              tab,
-              previousOverlay.contents,
-              'Browser automation overlay',
-              AUTOMATION_OVERLAY_TIMEOUT_MS,
-              () => previousOverlay.contents.debugger.sendCommand('Overlay.hideHighlight'),
-              abortSignal,
-              documentLease,
-              false,
-            );
-          }
-        } finally {
-          previousOverlay.releaseDebugger();
-        }
+    if (previousOverlay) this.hideAutomationCursor();
+    if (abortSignal?.aborted) return;
+    if (!contents || contents.isDestroyed()) return;
+    const renderCursor =
+      !!action &&
+      this.attachedView === tab.view &&
+      this.isHostWindowShown() &&
+      Number.isFinite(action.x) &&
+      Number.isFinite(action.y);
+    if (renderCursor) {
+      const overlay: BrowserAutomationOverlay = { contents, x: action.x!, y: action.y! };
+      try {
+        // The cursor is a sibling native view, not page DOM or a DevTools
+        // highlight, so it is presentation-only and cannot stall the page.
+        this.showAutomationCursor(tab, overlay, action.kind === 'click' || action.kind === 'doubleClick');
+        tab.automationOverlay = overlay;
+      } catch {
+        // Presentation only: never fail automation over the cursor.
       }
-      if (!contents || contents.isDestroyed()) return;
-      const renderCursor =
-        !!action &&
-        this.attachedView === tab.view &&
-        this.isHostWindowShown() &&
-        Number.isFinite(action.x) &&
-        Number.isFinite(action.y);
-      if (renderCursor) {
-        const debuggerLease = this.acquireBrowserDebuggerLease(contents);
-        const overlay: BrowserAutomationOverlay = {
-          contents,
-          cancelDebugger: debuggerLease.cancel,
-          releaseDebugger: debuggerLease.release,
-          x: action.x!,
-          y: action.y!,
-        };
-        let retained = false;
-        try {
-          await this.runRendererOperationWithDeadline(
-            tab,
-            contents,
-            'Browser automation overlay',
-            AUTOMATION_OVERLAY_TIMEOUT_MS,
-            async () => {
-              await contents.debugger.sendCommand('DOM.enable');
-              await contents.debugger.sendCommand('Overlay.enable');
-              await this.showAutomationCursor(overlay);
-            },
-            abortSignal,
-            documentLease,
-            false,
-          );
-          if (
-            tab.overlayGeneration !== overlayGeneration ||
-            this.tabs.get(tab.shell.id) !== tab ||
-            tab.view?.webContents !== contents
-          ) {
-            if (!contents.isDestroyed() && contents.debugger.isAttached()) {
-              try {
-                await this.runRendererOperationWithDeadline(
-                  tab,
-                  contents,
-                  'Browser automation overlay cleanup',
-                  AUTOMATION_OVERLAY_TIMEOUT_MS,
-                  () => contents.debugger.sendCommand('Overlay.hideHighlight'),
-                  undefined,
-                  undefined,
-                  false,
-                );
-              } catch {
-                // Detach only the exact manager-owned overlay lease. The stale
-                // cleanup is presentation-only and must not withhold an action
-                // result or reclaim an otherwise healthy authenticated page.
-                overlay.cancelDebugger();
-              }
-            }
-            return;
-          }
-          tab.automationOverlay = overlay;
-          retained = true;
-        } finally {
-          if (!retained) overlay.releaseDebugger();
-        }
-      }
-    } catch {
-      // The compositor cursor is presentation only. A stalled or unavailable
-      // DevTools overlay must never fail automation or reclaim its healthy page;
-      // the Browser toolbar still carries the live action status.
     }
     if (action && action.status !== 'running' && this.tabs.get(tab.shell.id) === tab) {
       tab.overlayTimer = setTimeout(() => {
@@ -12609,15 +12566,20 @@ export class BrowserManager {
     }
   }
 
-  private showAutomationCursor(overlay: BrowserAutomationOverlay): Promise<unknown> {
-    return overlay.contents.debugger.sendCommand('Overlay.highlightRect', {
-      x: Math.round(overlay.x - 9),
-      y: Math.round(overlay.y - 9),
-      width: 18,
-      height: 18,
-      color: { r: 139, g: 92, b: 246, a: 0.18 },
-      outlineColor: { r: 139, g: 92, b: 246, a: 1 },
-    });
+  private showAutomationCursor(tab: InternalTab, overlay: BrowserAutomationOverlay, clicked = false): void {
+    const win = this.getWindow();
+    if (!win || win.isDestroyed() || !tab.view || tab.view.webContents !== overlay.contents) return;
+    (this.cursorOverlay ??= new BrowserCursorOverlay(__BRAND_THEME_HUE || '292')).show(
+      win,
+      tab.view.getBounds(),
+      // Action coordinates are page CSS pixels; native bounds are window DIPs.
+      scaleBrowserPointForZoom({ x: overlay.x, y: overlay.y }, overlay.contents.getZoomFactor()),
+      clicked ? 'click' : 'move',
+    );
+  }
+
+  private hideAutomationCursor(): void {
+    this.cursorOverlay?.hide();
   }
 
   private serializeVisibleAssistantOperation<T>(
@@ -14608,36 +14570,17 @@ export class BrowserManager {
   private async hideAutomationOverlay(
     tab: InternalTab,
     contents: WebContents,
-    abortSignal?: AbortSignal,
-    documentLease?: AssistantDocumentLease,
+    _abortSignal?: AbortSignal,
+    _documentLease?: AssistantDocumentLease,
   ): Promise<{ overlay: BrowserAutomationOverlay; generation: number } | null> {
     const overlay = tab.automationOverlay;
     if (!overlay || overlay.contents !== contents) return null;
     const generation = tab.overlayGeneration;
     tab.automationOverlay = null;
-    try {
-      await this.runRendererOperationWithDeadline(
-        tab,
-        contents,
-        'Browser automation overlay',
-        AUTOMATION_OVERLAY_TIMEOUT_MS,
-        () => contents.debugger.sendCommand('Overlay.hideHighlight'),
-        abortSignal,
-        documentLease,
-      );
-    } catch (error) {
-      if (
-        tab.overlayGeneration === generation &&
-        tab.view?.webContents === contents &&
-        !contents.isDestroyed() &&
-        !tab.automationOverlay
-      ) {
-        tab.automationOverlay = overlay;
-      } else {
-        overlay.releaseDebugger();
-      }
-      throw error;
-    }
+    // The cursor is a separate native view above the page. Hiding it before a
+    // capture keeps it out of screenshots even when the capture path composites
+    // the visible window instead of the page alone.
+    this.hideAutomationCursor();
     return { overlay, generation };
   }
 
@@ -14645,54 +14588,24 @@ export class BrowserManager {
     tab: InternalTab,
     contents: WebContents,
     hidden: { overlay: BrowserAutomationOverlay; generation: number } | null,
-    abortSignal?: AbortSignal,
-    documentLease?: AssistantDocumentLease,
+    _abortSignal?: AbortSignal,
+    _documentLease?: AssistantDocumentLease,
   ): Promise<void> {
     if (!hidden) return;
     if (
       contents.isDestroyed() ||
       tab.overlayGeneration !== hidden.generation ||
       tab.view?.webContents !== contents ||
-      tab.automationOverlay
+      tab.automationOverlay ||
+      this.attachedView !== tab.view
     ) {
-      hidden.overlay.releaseDebugger();
       return;
     }
-    let retained = false;
     try {
-      await this.runRendererOperationWithDeadline(
-        tab,
-        contents,
-        'Browser automation overlay',
-        AUTOMATION_OVERLAY_TIMEOUT_MS,
-        () => this.showAutomationCursor(hidden.overlay),
-        abortSignal,
-        documentLease,
-      );
-      if (tab.overlayGeneration === hidden.generation && tab.view?.webContents === contents && !tab.automationOverlay) {
-        tab.automationOverlay = hidden.overlay;
-        retained = true;
-      } else if (!contents.isDestroyed() && contents.debugger.isAttached()) {
-        try {
-          await this.runRendererOperationWithDeadline(
-            tab,
-            contents,
-            'Browser automation overlay cleanup',
-            AUTOMATION_OVERLAY_TIMEOUT_MS,
-            () => contents.debugger.sendCommand('Overlay.hideHighlight'),
-            undefined,
-            undefined,
-            false,
-          );
-        } catch {
-          // Screenshot restoration raced a newer overlay/document. Cancel only
-          // this hidden overlay's lease so cleanup cannot retain the screenshot
-          // queue or the stale compositor command indefinitely.
-          hidden.overlay.cancelDebugger();
-        }
-      }
-    } finally {
-      if (!retained) hidden.overlay.releaseDebugger();
+      this.showAutomationCursor(tab, hidden.overlay);
+      tab.automationOverlay = hidden.overlay;
+    } catch {
+      // Presentation only.
     }
   }
 
@@ -17693,6 +17606,8 @@ export class BrowserManager {
     if (this.disposed) return false;
     this.shuttingDown = true;
     this.disposed = true;
+    this.cursorOverlay?.dispose();
+    this.cursorOverlay = null;
     clearInterval(this.idleTimer);
     this.cancelAllScopeRuntimeReleaseRetries();
     for (const vault of this.vaults.values()) vault.dispose();

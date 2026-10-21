@@ -16911,98 +16911,26 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('bounds and cancels a stale compositor cursor cleanup without withholding the action result', async () => {
-    vi.useFakeTimers();
-    try {
-      let debuggerAttached = false;
-      let tab!: {
-        shell: { id: string; conversationId: string; discarded: boolean };
-        view: { webContents: typeof contents };
-        overlayGeneration: number;
-        overlayTimer: ReturnType<typeof setTimeout> | null;
-        automationOverlay: unknown;
-      };
-      const stalledHide = new Promise<never>(() => undefined);
-      const sendCommand = vi.fn((method: string) => {
-        if (method === 'Overlay.highlightRect') {
-          tab.overlayGeneration += 1;
-          return Promise.resolve({});
-        }
-        if (method === 'Overlay.hideHighlight') return stalledHide;
-        return Promise.resolve({});
-      });
-      const contents = {
-        debugger: {
-          isAttached: () => debuggerAttached,
-          attach: vi.fn(() => {
-            debuggerAttached = true;
-          }),
-          detach: vi.fn(() => {
-            debuggerAttached = false;
-          }),
-          sendCommand,
-        },
-        isDestroyed: () => false,
-      };
-      tab = {
-        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
-        view: { webContents: contents },
-        overlayGeneration: 0,
-        overlayTimer: null,
-        automationOverlay: null,
-      };
-      const manager = managerWithoutConstructor({
-        attachedView: tab.view,
-        isHostWindowShown: () => true,
-        tabs: new Map([['tab-1', tab]]),
-      });
-
-      const update = invokePrivate(manager, 'setAutomationOverlay', tab, {
-        id: 'action-1',
-        tabId: 'tab-1',
-        kind: 'click',
-        status: 'running',
-        startedAt: new Date().toISOString(),
-        x: 40,
-        y: 60,
-      }) as Promise<void>;
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sendCommand).toHaveBeenCalledWith('Overlay.hideHighlight');
-      await vi.advanceTimersByTimeAsync(5_000);
-
-      await expect(update).resolves.toBeUndefined();
-      expect(contents.debugger.detach).toHaveBeenCalledOnce();
-      expect(tab.automationOverlay).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('renders the automation cursor through Chromium outside the page DOM', async () => {
-    let debuggerAttached = false;
+  it('renders the automation cursor as a native view above the page, never through page DOM or DevTools', async () => {
     const sendCommand = vi.fn(async () => ({}));
     const contents = {
-      debugger: {
-        isAttached: () => debuggerAttached,
-        attach: vi.fn(() => {
-          debuggerAttached = true;
-        }),
-        detach: vi.fn(() => {
-          debuggerAttached = false;
-        }),
-        sendCommand,
-      },
+      debugger: { isAttached: () => false, attach: vi.fn(), detach: vi.fn(), sendCommand },
+      getZoomFactor: () => 2,
       isDestroyed: () => false,
     };
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
-      view: { webContents: contents },
+      view: { webContents: contents, getBounds: () => ({ x: 300, y: 80, width: 800, height: 600 }) },
       overlayGeneration: 0,
       overlayTimer: null,
       automationOverlay: null,
     };
+    const win = { isDestroyed: () => false };
+    const cursorOverlay = { show: vi.fn(), hide: vi.fn() };
     const manager = managerWithoutConstructor({
       attachedView: tab.view,
+      cursorOverlay,
+      getWindow: () => win,
       isHostWindowShown: () => true,
       tabs: new Map([['tab-1', tab]]),
     });
@@ -17018,97 +16946,138 @@ describe('browser manager renderer lifecycle', () => {
       y: 60,
     });
 
-    expect(sendCommand).toHaveBeenCalledWith('DOM.enable');
-    expect(sendCommand).toHaveBeenCalledWith('Overlay.enable');
-    expect(sendCommand).toHaveBeenCalledWith('Overlay.highlightRect', {
-      x: 31,
-      y: 51,
-      width: 18,
-      height: 18,
-      color: { r: 139, g: 92, b: 246, a: 0.18 },
-      outlineColor: { r: 139, g: 92, b: 246, a: 1 },
-    });
+    // Page CSS pixels are scaled by zoom into the page view's window DIPs.
+    expect(cursorOverlay.show).toHaveBeenCalledWith(
+      win,
+      { x: 300, y: 80, width: 800, height: 600 },
+      { x: 80, y: 120 },
+      'click',
+    );
+    expect(sendCommand).not.toHaveBeenCalled();
+    expect(contents.debugger.attach).not.toHaveBeenCalled();
     expect(tab.automationOverlay).toMatchObject({ contents, x: 40, y: 60 });
   });
 
-  it('bounds and cancels stale screenshot overlay restoration cleanup', async () => {
-    vi.useFakeTimers();
-    try {
-      let debuggerAttached = false;
-      let tab!: {
-        shell: { id: string; conversationId: string };
-        view: { webContents: typeof contents };
-        overlayGeneration: number;
-        automationOverlay: unknown;
-      };
-      const stalledHide = new Promise<never>(() => undefined);
-      const sendCommand = vi.fn((method: string) => {
-        if (method === 'Overlay.highlightRect') {
-          tab.overlayGeneration += 1;
-          return Promise.resolve({});
-        }
-        if (method === 'Overlay.hideHighlight') return stalledHide;
-        return Promise.resolve({});
-      });
-      const contents = {
-        debugger: {
-          isAttached: () => debuggerAttached,
-          attach: vi.fn(() => {
-            debuggerAttached = true;
-          }),
-          detach: vi.fn(() => {
-            debuggerAttached = false;
-          }),
-          sendCommand,
-        },
-        isDestroyed: () => false,
-      };
-      tab = {
-        shell: { id: 'tab-1', conversationId: 'chat-1' },
-        view: { webContents: contents },
-        overlayGeneration: 7,
-        automationOverlay: null,
-      };
-      const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
-      const debuggerLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
-        cancel: () => void;
-        release: () => void;
-      };
-      const cancelDebugger = vi.fn(debuggerLease.cancel);
-      const releaseDebugger = vi.fn(debuggerLease.release);
-      const restore = invokePrivate(manager, 'restoreAutomationOverlay', tab, contents, {
-        generation: tab.overlayGeneration,
-        overlay: { contents, cancelDebugger, releaseDebugger, x: 10, y: 20 },
-      }) as Promise<void>;
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sendCommand).toHaveBeenCalledWith('Overlay.hideHighlight');
-      await vi.advanceTimersByTimeAsync(5_000);
+  it('moves the native cursor without a click ripple for non-click actions and hides the prior one first', async () => {
+    const contents = { getZoomFactor: () => 1, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+      view: { webContents: contents, getBounds: () => ({ x: 0, y: 0, width: 500, height: 400 }) },
+      overlayGeneration: 0,
+      overlayTimer: null,
+      automationOverlay: { contents, x: 1, y: 2 },
+    };
+    const calls: string[] = [];
+    const cursorOverlay = {
+      show: vi.fn((..._args: unknown[]) => calls.push('show')),
+      hide: vi.fn(() => calls.push('hide')),
+    };
+    const manager = managerWithoutConstructor({
+      attachedView: tab.view,
+      cursorOverlay,
+      getWindow: () => ({ isDestroyed: () => false }),
+      isHostWindowShown: () => true,
+      tabs: new Map([['tab-1', tab]]),
+    });
 
-      await expect(restore).resolves.toBeUndefined();
-      expect(cancelDebugger).toHaveBeenCalledOnce();
-      expect(releaseDebugger).toHaveBeenCalledOnce();
-      expect(contents.debugger.detach).toHaveBeenCalledOnce();
-      expect(tab.automationOverlay).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
+    await invokePrivate(manager, 'setAutomationOverlay', tab, {
+      id: 'action-2',
+      tabId: 'tab-1',
+      kind: 'hover',
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      x: 10,
+      y: 20,
+    });
+
+    expect(calls).toEqual(['hide', 'show']);
+    expect(cursorOverlay.show.mock.calls[0]?.[3]).toBe('move');
+    expect(tab.automationOverlay).toMatchObject({ x: 10, y: 20 });
   });
 
-  it('releases the prior compositor cursor when cancellation prevents its cleanup command', async () => {
-    const releaseDebugger = vi.fn();
-    const sendCommand = vi.fn(async () => ({}));
-    const contents = {
-      debugger: { isAttached: () => true, sendCommand },
-      isDestroyed: () => false,
+  it('does not render the native cursor while the page view is detached from the Browser panel', async () => {
+    const contents = { getZoomFactor: () => 1, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+      view: { webContents: contents, getBounds: () => ({ x: 0, y: 0, width: 500, height: 400 }) },
+      overlayGeneration: 0,
+      overlayTimer: null,
+      automationOverlay: null,
     };
+    const cursorOverlay = { show: vi.fn(), hide: vi.fn() };
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      cursorOverlay,
+      getWindow: () => ({ isDestroyed: () => false }),
+      isHostWindowShown: () => true,
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    await invokePrivate(manager, 'setAutomationOverlay', tab, {
+      id: 'action-1',
+      tabId: 'tab-1',
+      kind: 'click',
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      x: 10,
+      y: 20,
+    });
+
+    expect(cursorOverlay.show).not.toHaveBeenCalled();
+    expect(tab.automationOverlay).toBeNull();
+  });
+
+  it('hides the native cursor for screenshots and restores it only for the same current page', async () => {
+    const contents = { getZoomFactor: () => 1, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: contents, getBounds: () => ({ x: 0, y: 0, width: 500, height: 400 }) },
+      overlayGeneration: 7,
+      automationOverlay: { contents, x: 10, y: 20 } as unknown,
+    };
+    const cursorOverlay = { show: vi.fn(), hide: vi.fn() };
+    const manager = managerWithoutConstructor({
+      attachedView: tab.view,
+      cursorOverlay,
+      getWindow: () => ({ isDestroyed: () => false }),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const hidden = (await invokePrivate(manager, 'hideAutomationOverlay', tab, contents)) as {
+      overlay: unknown;
+      generation: number;
+    };
+    expect(cursorOverlay.hide).toHaveBeenCalledOnce();
+    expect(tab.automationOverlay).toBeNull();
+    expect(hidden).toMatchObject({ generation: 7 });
+
+    await invokePrivate(manager, 'restoreAutomationOverlay', tab, contents, hidden);
+    expect(cursorOverlay.show).toHaveBeenCalledOnce();
+    expect(tab.automationOverlay).toBe(hidden.overlay);
+
+    // A newer overlay generation supersedes the screenshot's hidden cursor.
+    tab.automationOverlay = null;
+    tab.overlayGeneration = 8;
+    await invokePrivate(manager, 'restoreAutomationOverlay', tab, contents, hidden);
+    expect(cursorOverlay.show).toHaveBeenCalledOnce();
+    expect(tab.automationOverlay).toBeNull();
+  });
+
+  it('hides the prior native cursor when cancellation stops a new cursor update', async () => {
+    const contents = { getZoomFactor: () => 1, isDestroyed: () => false };
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
       view: { webContents: contents },
       overlayGeneration: 4,
       overlayTimer: null,
-      automationOverlay: { contents, releaseDebugger, x: 10, y: 20 },
+      automationOverlay: { contents, x: 10, y: 20 },
     };
+    const cursorOverlay = { show: vi.fn(), hide: vi.fn() };
     const manager = managerWithoutConstructor({
+      attachedView: tab.view,
+      cursorOverlay,
+      getWindow: () => ({ isDestroyed: () => false }),
+      isHostWindowShown: () => true,
       tabs: new Map([['tab-1', tab]]),
     });
     const controller = new AbortController();
@@ -17125,13 +17094,15 @@ describe('browser manager renderer lifecycle', () => {
           kind: 'click',
           status: 'running',
           startedAt: new Date().toISOString(),
+          x: 5,
+          y: 5,
         },
         controller.signal,
       ),
     ).resolves.toBeUndefined();
 
-    expect(sendCommand).not.toHaveBeenCalled();
-    expect(releaseDebugger).toHaveBeenCalledOnce();
+    expect(cursorOverlay.hide).toHaveBeenCalledOnce();
+    expect(cursorOverlay.show).not.toHaveBeenCalled();
     expect(tab.automationOverlay).toBeNull();
   });
 

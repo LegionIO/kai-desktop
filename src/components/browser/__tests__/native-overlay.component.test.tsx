@@ -6,6 +6,7 @@ import {
   installRendererShadowRootCapture,
   isRendererOverlayMotionTarget,
   refreshRendererOverlayCandidates,
+  rendererOverlayClipRoots,
   rendererOverlayObservationRoots,
   shouldInstallNativeBrowserRendererGuards,
   subscribeRendererDeclarativeShadowChanges,
@@ -705,5 +706,139 @@ describe('native browser overlay detection', () => {
     expect(onChange).toHaveBeenCalledTimes(2);
     expect(hasIntersectingRendererOverlay(surface, candidates)).toBe(false);
     unsubscribe();
+  });
+
+  describe('content clipped by an overflow container outside the native surface', () => {
+    function chatThreadBesideSurface(messageCount: number) {
+      const surface = document.createElement('div');
+      const thread = document.createElement('div');
+      thread.style.overflow = 'auto';
+      const messages: HTMLElement[] = [];
+      for (let index = 0; index < messageCount; index++) {
+        const message = document.createElement('div');
+        message.style.position = 'relative';
+        const badge = document.createElement('span');
+        badge.className = 'absolute';
+        badge.style.opacity = '0.5';
+        message.append(badge);
+        thread.append(message);
+        messages.push(message);
+      }
+      document.body.append(thread, surface);
+      vi.spyOn(surface, 'getBoundingClientRect').mockReturnValue(rect(500, 0, 400, 300));
+      const threadRect = vi.spyOn(thread, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 480, 300));
+      Object.defineProperty(document, 'elementsFromPoint', {
+        configurable: true,
+        value: vi.fn(() => [surface]),
+      });
+      return { surface, thread, threadRect, messages };
+    }
+
+    it('does not flood or overflow the candidate set with an ordinary chat thread', () => {
+      const { surface } = chatThreadBesideSurface(600);
+
+      const candidates = collectRendererOverlayCandidates(document.body, surface);
+
+      expect(candidates.size).toBe(0);
+      expect(rendererOverlayClipRoots(candidates)).toHaveLength(1);
+      expect(hasIntersectingRendererOverlay(surface, candidates)).toBe(false);
+    });
+
+    it('still tracks a fixed overlay that escapes the clipped thread', () => {
+      const { surface, thread } = chatThreadBesideSurface(3);
+      const scrim = document.createElement('div');
+      scrim.style.position = 'fixed';
+      thread.append(scrim);
+      vi.spyOn(scrim, 'getBoundingClientRect').mockReturnValue(rect(520, 20, 100, 60));
+      Object.defineProperty(document, 'elementsFromPoint', {
+        configurable: true,
+        value: vi.fn(() => [scrim, surface]),
+      });
+
+      const candidates = collectRendererOverlayCandidates(document.body, surface);
+
+      expect(candidates.has(scrim)).toBe(true);
+      expect(hasIntersectingRendererOverlay(surface, candidates)).toBe(true);
+    });
+
+    it('still tracks a semantic dialog rendered inside the clipped thread', () => {
+      const { surface, messages } = chatThreadBesideSurface(2);
+      const dialog = document.createElement('div');
+      dialog.setAttribute('role', 'dialog');
+      messages[0]!.append(dialog);
+
+      expect(collectRendererOverlayCandidates(document.body, surface).has(dialog)).toBe(true);
+    });
+
+    it('rediscovers clipped content once its container grows into the native surface', () => {
+      const { surface, thread, threadRect, messages } = chatThreadBesideSurface(2);
+      const badge = messages[0]!.firstElementChild!;
+      const candidates = collectRendererOverlayCandidates(document.body, surface);
+      expect(candidates.has(badge)).toBe(false);
+
+      threadRect.mockReturnValue(rect(0, 0, 700, 300));
+      vi.spyOn(badge, 'getBoundingClientRect').mockReturnValue(rect(520, 0, 40, 20));
+      Object.defineProperty(document, 'elementsFromPoint', {
+        configurable: true,
+        value: vi.fn(() => [badge, surface]),
+      });
+
+      expect(hasIntersectingRendererOverlay(surface, candidates)).toBe(true);
+      expect(candidates.has(badge)).toBe(true);
+      expect(rendererOverlayClipRoots(candidates)).not.toContain(thread);
+    });
+
+    it('rediscovers only the restyled subtree for attribute churn inside the clipped thread', async () => {
+      const { surface, messages } = chatThreadBesideSurface(2);
+      const candidates = collectRendererOverlayCandidates(document.body, surface);
+      const unrelated = document.createElement('div');
+      unrelated.className = 'fixed';
+      document.body.append(unrelated);
+      const batches: MutationRecord[][] = [];
+      const observer = new MutationObserver((records) => batches.push(records));
+      observer.observe(document.body, { subtree: true, attributes: true });
+
+      // A full rebuild would discover `unrelated`; a scoped one must not.
+      messages[1]!.setAttribute('data-state', 'running');
+      await Promise.resolve();
+      updateRendererOverlayCandidates(candidates, batches.shift() ?? []);
+      expect(candidates.has(unrelated)).toBe(false);
+
+      // Outside a known clip the attribute change still rebuilds everything.
+      document.body.firstElementChild!.setAttribute('data-state', 'running');
+      await Promise.resolve();
+      updateRendererOverlayCandidates(candidates, batches.shift() ?? []);
+      expect(candidates.has(unrelated)).toBe(true);
+      observer.disconnect();
+    });
+  });
+
+  it('ignores pseudo-element rules that cannot generate content', () => {
+    const style = document.createElement('style');
+    style.setAttribute('data-native-overlay-test-style', '');
+    style.textContent = '*, ::before, ::after { box-sizing: border-box; } .real-scrim::after { content: ""; }';
+    document.head.append(style);
+    const plain = document.createElement('div');
+    const scrim = document.createElement('div');
+    scrim.className = 'real-scrim';
+    document.body.append(plain, scrim);
+    const pseudoQueries: Element[] = [];
+    const nativeGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudo) => {
+      if (pseudo) pseudoQueries.push(element);
+      return nativeGetComputedStyle(element);
+    });
+    const cssDescriptor = Object.getOwnPropertyDescriptor(window, 'CSS');
+    Object.defineProperty(window, 'CSS', { configurable: true, value: { supports: () => true } });
+
+    try {
+      collectRendererOverlayCandidates(document.body);
+    } finally {
+      if (cssDescriptor) Object.defineProperty(window, 'CSS', cssDescriptor);
+      else Reflect.deleteProperty(window, 'CSS');
+    }
+
+    expect(pseudoQueries).not.toContain(plain);
+    expect(pseudoQueries).toContain(scrim);
   });
 });

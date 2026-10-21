@@ -420,7 +420,114 @@ describe('browser tools', () => {
       (tool) => tool.name === 'browser_action',
     )!;
     await expect(action.execute({ kind: 'click', x: 1, y: 1 }, context)).rejects.toThrow(/disabled/);
+    await expect(action.execute({ steps: [{ kind: 'click', x: 1, y: 1 }] }, context)).rejects.toThrow(/disabled/);
     expect(manager.action).not.toHaveBeenCalled();
+  });
+
+  describe('batched browser_action steps', () => {
+    const tabId = '00000000-0000-0000-0000-000000000001';
+    const steps = [
+      { kind: 'focus', selector: '#email' },
+      { kind: 'type', value: 'person@example.com' },
+      { kind: 'click', role: 'button', name: 'Submit' },
+    ];
+
+    function browserAction(overrides: Partial<AppConfig['browser']> = {}) {
+      return createBrowserTools(() => config(overrides)).find((tool) => tool.name === 'browser_action')!;
+    }
+
+    it('runs every step in order on one tab and returns a receipt per step', async () => {
+      manager.action.mockResolvedValue({ ok: true, tab: { id: tabId } });
+
+      await expect(browserAction().execute({ steps }, context)).resolves.toEqual({
+        ok: true,
+        tabId,
+        completed: [
+          { step: 0, action: 'focus' },
+          { step: 1, action: 'type' },
+          { step: 2, action: 'click' },
+        ],
+      });
+      expect(manager.action.mock.calls.map((call) => call[1])).toEqual(steps.map((step) => ({ ...step, tabId })));
+    });
+
+    it('asks for approval once for the whole batch under the ask policy', async () => {
+      manager.action.mockResolvedValue({ ok: true, tab: { id: tabId } });
+
+      await browserAction({ structuredActions: 'ask' }).execute({ steps }, context);
+
+      expect(registerPendingApproval).toHaveBeenCalledTimes(1);
+      expect(manager.action).toHaveBeenCalledTimes(3);
+      // Every step stays bound to the approved document.
+      for (const call of manager.action.mock.calls) expect(call[3]).toMatchObject({ tabId, tabGeneration: 7 });
+    });
+
+    it('stops at the first failing step and reports what ran', async () => {
+      manager.action
+        .mockResolvedValueOnce({ ok: true, tab: { id: tabId } })
+        .mockRejectedValueOnce(new Error('No element matched the target.'));
+
+      await expect(browserAction().execute({ steps }, context)).resolves.toMatchObject({
+        ok: false,
+        tabId,
+        completed: [{ step: 0, action: 'focus' }],
+        failed: { step: 1, action: 'type', error: expect.stringMatching(/No element matched/) },
+        skipped: 1,
+      });
+      expect(manager.action).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops a batch when Browser Settings deny actions partway through', async () => {
+      let current = config();
+      const action = createBrowserTools(() => current).find((tool) => tool.name === 'browser_action')!;
+      manager.action.mockImplementation(async () => {
+        current = config({ structuredActions: 'deny' });
+        return { ok: true, tab: { id: tabId } };
+      });
+
+      await expect(action.execute({ steps }, context)).rejects.toThrow(/disabled/);
+      expect(manager.action).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects cancellation as an error instead of a partial receipt', async () => {
+      const controller = new AbortController();
+      manager.action.mockImplementation(async () => {
+        controller.abort();
+        throw new Error('Browser action was cancelled.');
+      });
+
+      await expect(browserAction().execute({ steps }, { ...context, abortSignal: controller.signal })).rejects.toThrow(
+        /cancelled/,
+      );
+    });
+
+    it('validates steps and refuses ambiguous or per-step tab inputs', () => {
+      const schema = browserAction().inputSchema;
+      expect(schema.safeParse({ steps }).success).toBe(true);
+      expect(schema.safeParse({ kind: 'click', x: 1, y: 1 }).success).toBe(true);
+      expect(schema.safeParse({}).success).toBe(false);
+      expect(schema.safeParse({ steps: [] }).success).toBe(false);
+      expect(schema.safeParse({ kind: 'click', steps }).success).toBe(false);
+      expect(schema.safeParse({ selector: '#a', steps }).success).toBe(false);
+      expect(schema.safeParse({ steps: [{ kind: 'press', keys: ['a', 'b'] }] }).success).toBe(false);
+      expect(schema.safeParse({ steps: Array.from({ length: 21 }, () => ({ kind: 'wait' })) }).success).toBe(false);
+      const parsed = schema.parse({ steps: [{ kind: 'click', tabId, x: 1, y: 1 }] }) as { steps: object[] };
+      expect(parsed.steps[0]).not.toHaveProperty('tabId');
+    });
+
+    it('redacts typed text and targets in every step of approval arguments', () => {
+      const args = browserApprovalArgs('browser_action', { steps }, 'Interact with the current web page');
+      expect(args.steps).toEqual([
+        { kind: 'focus', selector: '[redacted browser selector: 6 characters]' },
+        { kind: 'type', value: '[redacted typed text: 18 characters]' },
+        {
+          kind: 'click',
+          role: '[redacted browser target role: 6 characters]',
+          name: '[redacted browser target name: 6 characters]',
+        },
+      ]);
+      expect(JSON.stringify(args)).not.toContain('person@example.com');
+    });
   });
 
   it('enforces the independent read policy for tab listing, inspection, network diagnostics, and screenshots', async () => {

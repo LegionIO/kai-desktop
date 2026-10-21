@@ -364,6 +364,25 @@ export function redactBrowserToolArgsForExposure(toolName: string | undefined, a
     return output;
   }
 
+  if (Array.isArray(record.steps)) {
+    // A batched browser_action carries the same secrets per step (typed text,
+    // selectors, key input). Redact every step with the single-action rules.
+    const output: Record<string, unknown> = {};
+    if (!includeUuid(output, 'tabId') || record.kind !== undefined) return invalidBrowserToolArguments();
+    const steps: unknown[] = [];
+    for (const step of record.steps) {
+      if (!step || typeof step !== 'object' || Array.isArray(step) || 'tabId' in step || 'steps' in step) {
+        return invalidBrowserToolArguments();
+      }
+      const redactedStep = redactBrowserToolArgsForExposure('browser_action', step);
+      if (redactedStep && typeof redactedStep === 'object' && 'redacted' in redactedStep) {
+        return invalidBrowserToolArguments();
+      }
+      steps.push(redactedStep);
+    }
+    output.steps = steps;
+    return output;
+  }
   if (typeof record.kind !== 'string' || !BROWSER_ACTION_KIND_NAMES.has(record.kind as BrowserActionKind)) {
     return invalidBrowserToolArguments();
   }

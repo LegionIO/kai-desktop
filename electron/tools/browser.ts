@@ -7,7 +7,7 @@ import type {
   BrowserTabsApproval,
   BrowserTabsReadApproval,
 } from '../browser/manager.js';
-import { browserActionRequestSchema, browserScreenshotToolInputSchema } from '../browser/input-validation.js';
+import { browserActionToolInputSchema, browserScreenshotToolInputSchema } from '../browser/input-validation.js';
 import { MAX_BROWSER_URL_CHARS } from '../browser/metadata.js';
 import { fitBrowserScreenshotForModel } from '../browser/screenshots.js';
 import { sanitizeBrowserNetworkError } from '../browser/network-diagnostics.js';
@@ -22,6 +22,9 @@ import { redactBrowserToolArgsForExposure, redactBrowserToolErrorForExposure } f
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 
 const MAX_APPROVAL_ARGUMENT_CHARS = 12_000;
+
+type BrowserActionStep = Omit<BrowserActionRequest, 'tabId'>;
+type BrowserActionToolInput = Partial<BrowserActionStep> & { tabId?: string; steps?: BrowserActionStep[] };
 
 type BrowserApprovalTarget = Pick<BrowserDocumentApproval, 'tabId' | 'origin'> & { destinationOrigin?: string };
 
@@ -431,11 +434,11 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
   const browserAction: ToolDefinition = {
     name: 'browser_action',
     description:
-      'Interact with the in-app Chromium browser using real mouse/keyboard input or semantic element targeting. No mounted, visible, or focused Browser sidebar is required; when the sidebar is already open it mirrors actions live.',
-    inputSchema: browserActionRequestSchema,
+      'Interact with the in-app Chromium browser using real mouse/keyboard input or semantic element targeting. No mounted, visible, or focused Browser sidebar is required; when the sidebar is already open it mirrors actions live. Pass `steps` to run several actions on one tab in a single call, in order (for example focus a field, type into it, then click submit); the batch stops at the first failing step and reports which steps completed. Add a `wait` step after an action that navigates before acting on the new page.',
+    inputSchema: browserActionToolInputSchema,
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
-      const payload = input as BrowserActionRequest;
+      const payload = input as BrowserActionToolInput;
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
@@ -450,15 +453,49 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         () => manager.captureDocumentApproval(cid, resolveTarget(), run),
       );
       assertBrowserToolAvailable(getConfig, context);
-      const targetTabId = resolveTarget(true);
-      const request = { ...payload, tabId: approvedDocument?.tabId ?? targetTabId };
-      const result = approvedDocument
-        ? await manager.action(cid, request, run, approvedDocument)
-        : await manager.action(cid, request, run);
-      // Structured-action authority does not grant read authority. Return only
-      // a receipt; callers must use browser_tabs under readAccess to inspect the
-      // resulting page or tab metadata.
-      return { ok: result.ok, action: payload.kind, tabId: result.tab.id };
+      const targetTabId = approvedDocument?.tabId ?? resolveTarget(true);
+      const runStep = (step: BrowserActionStep) => {
+        const request: BrowserActionRequest = { ...step, tabId: targetTabId };
+        return approvedDocument
+          ? manager.action(cid, request, run, approvedDocument)
+          : manager.action(cid, request, run);
+      };
+      if (!payload.steps) {
+        const { steps: _steps, tabId: _tabId, ...single } = payload;
+        const result = await runStep(single as BrowserActionStep);
+        // Structured-action authority does not grant read authority. Return
+        // only a receipt; callers must use browser_tabs under readAccess to
+        // inspect the resulting page or tab metadata.
+        return { ok: result.ok, action: payload.kind, tabId: result.tab.id };
+      }
+      const completed: Array<{ step: number; action: BrowserActionStep['kind'] }> = [];
+      for (const [index, step] of payload.steps.entries()) {
+        // Each step re-checks the live run and Browser policy: Settings or a
+        // cancellation can change between steps of a long batch.
+        if (context.abortSignal?.aborted) throw new Error('Browser action was cancelled.');
+        assertBrowserToolAvailable(getConfig, context);
+        if (getConfig().browser.structuredActions === 'deny') {
+          throw new Error('browser_action is disabled in Browser Settings.');
+        }
+        try {
+          await runStep(step);
+        } catch (error) {
+          if (context.abortSignal?.aborted) throw error;
+          return {
+            ok: false,
+            tabId: targetTabId,
+            completed,
+            failed: {
+              step: index,
+              action: step.kind,
+              error: redactBrowserToolErrorForExposure('browser_action', error),
+            },
+            skipped: payload.steps.length - index - 1,
+          };
+        }
+        completed.push({ step: index, action: step.kind });
+      }
+      return { ok: true, tabId: targetTabId, completed };
     },
   };
 

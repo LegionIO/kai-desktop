@@ -501,6 +501,61 @@ describe('Browser validating proxy', () => {
     proxy.releaseRequest('global', 43);
   });
 
+  it('accepts the same cached credential on every later tunnel so subresources and new tabs load', async () => {
+    // Chromium answers one `login` challenge per (proxy, realm) and then
+    // preemptively replays that identity on every subsequent tunnel. A
+    // one-shot credential turned all of those into 407 -> net::ERR_TUNNEL_CONNECTION_FAILED.
+    const target = createNetServer((socket) => sockets.push(socket));
+    netServers.push(target);
+    const targetPort = await listen(target);
+    const resolveHost = vi.fn(async () => [{ address: '127.0.0.1', family: 4 as const }]);
+    const proxy = new BrowserValidatingProxy(undefined, { resolveHost });
+    proxies.push(proxy);
+    const proxyPort = await configureProxy(proxy);
+    const cachedAuthorization = authorization(proxy);
+
+    for (const host of ['www.example.com', 'images.example.com', 'images.example.com']) {
+      const client = await connectSocket(proxyPort);
+      sockets.push(client);
+      client.write(
+        `CONNECT ${host}:${targetPort} HTTP/1.1\r\nHost: ${host}:${targetPort}\r\nProxy-Authorization: ${cachedAuthorization}\r\n\r\n`,
+      );
+      await expect(readHeaderBlock(client)).resolves.toMatch(/^HTTP\/1\.1 200 Connection Established/);
+    }
+  });
+
+  it('still rejects a credential Kai never issued', async () => {
+    const proxy = new BrowserValidatingProxy();
+    proxies.push(proxy);
+    const proxyPort = await configureProxy(proxy);
+    const client = await connectSocket(proxyPort);
+    sockets.push(client);
+    const forged = `Basic ${Buffer.from(`${proxy.credentials().username}:not-a-real-token`).toString('base64')}`;
+    client.write(
+      `CONNECT www.example.com:443 HTTP/1.1\r\nHost: www.example.com:443\r\nProxy-Authorization: ${forged}\r\n\r\n`,
+    );
+    await expect(readHeaderBlock(client)).resolves.toMatch(/^HTTP\/1\.1 407 /);
+  });
+
+  it('answers a failed tunnel with a gateway status and remembers why it failed', async () => {
+    const resolveHost = vi.fn(async () => {
+      throw Object.assign(new Error('getaddrinfo ENOTFOUND missing.example'), { code: 'ENOTFOUND' });
+    });
+    const proxy = new BrowserValidatingProxy(undefined, { resolveHost });
+    proxies.push(proxy);
+    const proxyPort = await configureProxy(proxy);
+    const client = await connectSocket(proxyPort);
+    sockets.push(client);
+    client.write(
+      `CONNECT missing.example:443 HTTP/1.1\r\nHost: missing.example:443\r\nProxy-Authorization: ${authorization(proxy)}\r\n\r\n`,
+    );
+
+    // A bare socket close surfaces in Chromium as the misleading ERR_EMPTY_RESPONSE.
+    await expect(readHeaderBlock(client)).resolves.toMatch(/^HTTP\/1\.1 502 /);
+    expect(proxy.recentConnectFailure('MISSING.example')).toMatch(/could not be found \(DNS lookup failed\)/);
+    expect(proxy.recentConnectFailure('other.example')).toBeUndefined();
+  });
+
   it('blocks localhost subdomains even when DNS resolves them to a reachable endpoint', async () => {
     const resolveHost = vi.fn(async (hostname: string) => {
       expect(hostname).toBe('api.localhost');
@@ -760,7 +815,8 @@ describe('Browser validating proxy', () => {
     client.write(
       `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: ${authorization(proxy)}\r\n\r\n`,
     );
-    await expect(readHeaderBlock(client)).rejects.toThrow(/closed/i);
+    await expect(readHeaderBlock(client)).resolves.toMatch(/^HTTP\/1\.1 503 /);
+    expect(proxy.recentConnectFailure('127.0.0.1')).toMatch(/timed out/i);
     await vi.waitFor(() => expect(Reflect.get(proxy, 'pendingSocketsByHost').size).toBe(0));
   });
 
