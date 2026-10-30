@@ -1,9 +1,19 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FC, type PointerEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FC,
+  type KeyboardEvent,
+  type PointerEvent,
+} from 'react';
 import {
   AlertCircleIcon,
+  BellIcon,
   CheckCircle2Icon,
-  GripHorizontalIcon,
   InfoIcon,
+  MinusIcon,
   RotateCcwIcon,
   TriangleAlertIcon,
 } from 'lucide-react';
@@ -11,7 +21,9 @@ import { usePlugins, type PluginNavigationTarget } from '@/providers/PluginProvi
 
 const POSITION_KEY = 'kai.plugin-toast-position';
 const EDGE_GAP = 16;
+const DRAG_THRESHOLD = 4;
 const DEFAULT_POSITION = { right: EDGE_GAP, bottom: EDGE_GAP };
+const MOVE_HINT = 'Drag to move notifications. Use arrow keys to move, or Home to reset.';
 type Position = typeof DEFAULT_POSITION;
 
 function readPosition(): Position {
@@ -44,9 +56,19 @@ export const PluginToastHost: FC = () => {
   const { uiState, injectNavigationRequest } = usePlugins();
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [position, setPosition] = useState(readPosition);
+  const [minimized, setMinimized] = useState(false);
   const [dragging, setDragging] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ pointerId: number; x: number; y: number; position: Position } | null>(null);
+  const primaryControlRef = useRef<HTMLButtonElement>(null);
+  const focusAfterToggleRef = useRef(false);
+  const suppressClickRef = useRef(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    element: HTMLButtonElement;
+    x: number;
+    y: number;
+    position: Position;
+  } | null>(null);
 
   const notifications =
     uiState?.notifications?.filter((n) => {
@@ -82,7 +104,23 @@ export const PluginToastHost: FC = () => {
       observer.disconnect();
       window.removeEventListener('resize', keepInView);
     };
-  }, [hasNotifications, clampPosition]);
+  }, [hasNotifications, minimized, clampPosition]);
+
+  useLayoutEffect(() => {
+    if (!focusAfterToggleRef.current) return;
+    primaryControlRef.current?.focus({ preventScroll: true });
+    focusAfterToggleRef.current = false;
+  }, [minimized]);
+
+  useLayoutEffect(() => {
+    // A toast can expire or leave the visible four while its pointer is captured.
+    // React cannot deliver capture-loss events from an already removed button.
+    if (dragRef.current && !dragRef.current.element.isConnected) {
+      dragRef.current = null;
+      suppressClickRef.current = false;
+      setDragging(false);
+    }
+  });
 
   useEffect(() => {
     if (dragging) return;
@@ -96,9 +134,38 @@ export const PluginToastHost: FC = () => {
   useEffect(() => {
     if (!hasNotifications) {
       dragRef.current = null;
+      suppressClickRef.current = false;
       setDragging(false);
+      setMinimized(false);
     }
   }, [hasNotifications]);
+
+  const startDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0 || !event.isPrimary || dragRef.current) return;
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    event.currentTarget.setPointerCapture(event.pointerId);
+    suppressClickRef.current = false;
+    dragRef.current = {
+      pointerId: event.pointerId,
+      element: event.currentTarget,
+      x: event.clientX,
+      y: event.clientY,
+      position,
+    };
+  };
+
+  const moveDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    // Preserve normal toast clicks (and bubble expansion) when the pointer only jitters.
+    if (!suppressClickRef.current && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+    suppressClickRef.current = true;
+    setDragging(true);
+    setPosition(clampPosition({ right: drag.position.right - dx, bottom: drag.position.bottom - dy }));
+  };
 
   const endDrag = (event: PointerEvent<HTMLButtonElement>) => {
     if (dragRef.current?.pointerId !== event.pointerId) return;
@@ -107,6 +174,40 @@ export const PluginToastHost: FC = () => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+  };
+
+  const moveWithKeyboard = (event: KeyboardEvent<HTMLButtonElement>) => {
+    const step = event.shiftKey ? 40 : 10;
+    const movement: Record<string, Position> = {
+      ArrowLeft: { right: step, bottom: 0 },
+      ArrowRight: { right: -step, bottom: 0 },
+      ArrowUp: { right: 0, bottom: step },
+      ArrowDown: { right: 0, bottom: -step },
+    };
+    if (event.key === 'Home') {
+      event.preventDefault();
+      setPosition(DEFAULT_POSITION);
+    } else if (movement[event.key]) {
+      event.preventDefault();
+      const delta = movement[event.key];
+      setPosition((current) =>
+        clampPosition({ right: current.right + delta.right, bottom: current.bottom + delta.bottom }),
+      );
+    }
+  };
+
+  const dragHandlers = {
+    onPointerDown: startDrag,
+    onPointerMove: moveDrag,
+    onPointerUp: endDrag,
+    onPointerCancel: endDrag,
+    onLostPointerCapture: endDrag,
+    onKeyDown: moveWithKeyboard,
+  };
+
+  const toggleMinimized = () => {
+    focusAfterToggleRef.current = true;
+    setMinimized((current) => !current);
   };
 
   if (notifications.length === 0) return null;
@@ -127,97 +228,104 @@ export const PluginToastHost: FC = () => {
       ref={hostRef}
       role="region"
       aria-label="Plugin notifications"
-      className="pointer-events-none fixed z-50 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-sm flex-col gap-2"
+      className={`pointer-events-none titlebar-no-drag fixed z-50 flex max-h-[calc(100dvh-2rem)] flex-col ${minimized ? 'w-11' : 'w-[calc(100vw-2rem)] max-w-sm'}`}
       style={position}
+      onPointerDownCapture={() => {
+        if (!dragRef.current) suppressClickRef.current = false;
+      }}
+      onClickCapture={(event) => {
+        // Pointer capture still generates a click after a drag. Consume it without
+        // navigating, dismissing a one-shot notification, or expanding the bubble.
+        // Keyboard activation (detail === 0) must remain available after capture loss.
+        const suppress = suppressClickRef.current && event.detail > 0;
+        suppressClickRef.current = false;
+        if (suppress) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}
     >
-      <div className="flex shrink-0 justify-end">
-        <div className="pointer-events-auto titlebar-no-drag flex items-center rounded-lg border border-border/60 bg-popover/95 p-0.5 text-muted-foreground shadow-sm">
-          <button
-            type="button"
-            aria-label="Move notifications"
-            title="Drag to move notifications. Use arrow keys to move, or Home to reset."
-            className={`flex touch-none select-none items-center gap-1.5 rounded-md px-2 py-1 text-[11px] hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring ${dragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-            onPointerDown={(event) => {
-              if (event.button !== 0 || !event.isPrimary || dragRef.current) return;
-              event.preventDefault();
-              event.currentTarget.focus();
-              event.currentTarget.setPointerCapture(event.pointerId);
-              dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, position };
-              setDragging(true);
-            }}
-            onPointerMove={(event) => {
-              const drag = dragRef.current;
-              if (!drag || drag.pointerId !== event.pointerId) return;
-              setPosition(
-                clampPosition({
-                  right: drag.position.right - (event.clientX - drag.x),
-                  bottom: drag.position.bottom - (event.clientY - drag.y),
-                }),
-              );
-            }}
-            onPointerUp={endDrag}
-            onPointerCancel={endDrag}
-            onLostPointerCapture={endDrag}
-            onKeyDown={(event) => {
-              const step = event.shiftKey ? 40 : 10;
-              const movement: Record<string, Position> = {
-                ArrowLeft: { right: step, bottom: 0 },
-                ArrowRight: { right: -step, bottom: 0 },
-                ArrowUp: { right: 0, bottom: step },
-                ArrowDown: { right: 0, bottom: -step },
-              };
-              if (event.key === 'Home') {
-                event.preventDefault();
-                setPosition(DEFAULT_POSITION);
-              } else if (movement[event.key]) {
-                event.preventDefault();
-                const delta = movement[event.key];
-                setPosition((current) =>
-                  clampPosition({ right: current.right + delta.right, bottom: current.bottom + delta.bottom }),
-                );
-              }
-            }}
+      {minimized ? (
+        <button
+          ref={primaryControlRef}
+          type="button"
+          aria-label={`Expand notifications (${notifications.length})`}
+          aria-expanded={false}
+          aria-description={MOVE_HINT}
+          title={`Show ${notifications.length} notification${notifications.length === 1 ? '' : 's'}. ${MOVE_HINT}`}
+          className={`pointer-events-auto relative flex h-11 w-11 shrink-0 touch-none select-none items-center justify-center rounded-full border border-border/70 bg-popover/95 text-foreground shadow-xl backdrop-blur-xl transition-colors hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring ${dragging ? 'cursor-grabbing' : 'cursor-grab active:cursor-grabbing'}`}
+          {...dragHandlers}
+          onClick={toggleMinimized}
+        >
+          <BellIcon className="h-5 w-5" aria-hidden="true" />
+          <span
+            aria-hidden="true"
+            className="absolute -right-1 -top-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold tabular-nums text-primary-foreground ring-2 ring-popover"
           >
-            <GripHorizontalIcon className="h-3.5 w-3.5" aria-hidden="true" />
-            Move
-          </button>
-          <button
-            type="button"
-            aria-label="Reset notification position"
-            title="Reset notification position"
-            className="rounded-md p-1.5 hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
-            onClick={() => setPosition(DEFAULT_POSITION)}
-          >
-            <RotateCcwIcon className="h-3 w-3" aria-hidden="true" />
-          </button>
-        </div>
-      </div>
-      <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
-        {notifications
-          .slice(-4)
-          .reverse()
-          .map((notification) => {
-            const level = notification.level ?? 'info';
-            const Icon = levelIcons[level];
-            const hasTarget = Boolean(notification.target);
-            return (
-              <div
-                key={`${notification.pluginName}-${notification.id}`}
-                className={`pointer-events-auto shrink-0 rounded-2xl border px-4 py-3 shadow-2xl backdrop-blur ${levelClasses[level]} ${hasTarget ? 'cursor-pointer hover:brightness-95 transition-all' : ''}`}
-                onClick={hasTarget ? () => handleClick(notification) : undefined}
-              >
-                <div className="flex items-start gap-3">
-                  <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-semibold">{notification.title}</div>
-                    {notification.body && <p className="mt-1 break-words text-xs opacity-90">{notification.body}</p>}
-                    <p className="mt-1 text-[11px] opacity-70">{notification.pluginName}</p>
+            {notifications.length > 99 ? '99+' : notifications.length}
+          </span>
+        </button>
+      ) : (
+        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
+          {notifications
+            .slice(-4)
+            .reverse()
+            .map((notification, index) => {
+              const level = notification.level ?? 'info';
+              const Icon = levelIcons[level];
+              const hasTarget = Boolean(notification.target);
+              return (
+                <div
+                  key={`${notification.pluginName}-${notification.id}`}
+                  role="group"
+                  aria-label={notification.title}
+                  className={`pointer-events-auto flex shrink-0 items-start gap-2 rounded-2xl border px-4 py-3 shadow-2xl backdrop-blur ${levelClasses[level]}`}
+                >
+                  <button
+                    ref={index === 0 ? primaryControlRef : undefined}
+                    type="button"
+                    aria-label={`${hasTarget ? 'Open' : 'Move'} notification: ${notification.title}`}
+                    aria-description={MOVE_HINT}
+                    title={MOVE_HINT}
+                    className={`flex min-w-0 flex-1 touch-none select-none items-start gap-3 rounded-md text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring ${dragging ? 'cursor-grabbing' : 'cursor-grab active:cursor-grabbing'}`}
+                    {...dragHandlers}
+                    onClick={hasTarget ? () => handleClick(notification) : undefined}
+                  >
+                    <Icon className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-semibold">{notification.title}</span>
+                      {notification.body && (
+                        <span className="mt-1 block break-words text-xs opacity-90">{notification.body}</span>
+                      )}
+                      <span className="mt-1 block text-[11px] opacity-70">{notification.pluginName}</span>
+                    </span>
+                  </button>
+                  <div className="-mr-1 -mt-1 flex shrink-0 items-center gap-0.5">
+                    <button
+                      type="button"
+                      aria-label="Reset notification position"
+                      title="Reset notification position"
+                      className="rounded-md p-1.5 opacity-70 transition-colors hover:bg-current/10 hover:opacity-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
+                      onClick={() => setPosition(DEFAULT_POSITION)}
+                    >
+                      <RotateCcwIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Minimize notifications"
+                      title="Minimize notifications"
+                      aria-expanded={true}
+                      className="rounded-md p-1.5 opacity-70 transition-colors hover:bg-current/10 hover:opacity-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
+                      onClick={toggleMinimized}
+                    >
+                      <MinusIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
                   </div>
                 </div>
-              </div>
-            );
-          })}
-      </div>
+              );
+            })}
+        </div>
+      )}
     </div>
   );
 };

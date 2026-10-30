@@ -41,6 +41,9 @@ const fwdBtn = $<HTMLButtonElement>('#fwd-btn');
 const reloadBtn = $<HTMLButtonElement>('#reload-btn');
 const copyUrlBtn = $('#copy-url-btn');
 const externalBtn = $('#external-btn');
+const originName = $('#origin-name');
+originName.textContent = params.get('origin') || __BRAND_PRODUCT_NAME;
+originName.title = originName.textContent;
 
 const findBar = $('#find-bar');
 const findInput = $<HTMLInputElement>('#find-input');

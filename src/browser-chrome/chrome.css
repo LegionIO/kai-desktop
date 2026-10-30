@@ -9,12 +9,41 @@ body {
   overflow: hidden;
   background: #1a1a2e;
   color: #e0e0e0;
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
 }
 #chrome {
   display: flex;
   flex-direction: column;
   height: 100%;
+}
+
+/* Host-owned attribution stays outside every guest page, including login tabs. */
+#origin-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 12px;
+  border-bottom: 1px solid #343453;
+  background: #22223d;
+  font-size: 12px;
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+}
+.origin-label {
+  color: #aaaac4;
+  flex-shrink: 0;
+}
+#origin-name {
+  color: #f0f0fa;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
 }
 
 /* Tab strip */

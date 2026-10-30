@@ -23,6 +23,11 @@ import {
 import { getBrandUserAgent } from '../../utils/user-agent.js';
 import { PB, type AuthSubmitPayload, type DownloadPayload, type ShortcutAction } from './ipc.js';
 import { hardenRemoteWebPreferences, isInAppBrowserPartition } from '../../browser/session.js';
+import {
+  browserWindowOriginLabel,
+  showBrowserWindowOrigin,
+  type BrowserWindowOrigin,
+} from '../../browser/window-origin.js';
 
 let codePaths: CodePaths | null = null;
 let globalsRegistered = false;
@@ -75,7 +80,7 @@ export function initPluginBrowser(paths: CodePaths, appHome: string): void {
   registerGlobalHandlers();
 }
 
-export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): void {
+export function openPluginBrowserWindow(options: PluginBrowserWindowOptions, origin: BrowserWindowOrigin): void {
   if (!codePaths) {
     throw new Error('plugin browser not initialized (initPluginBrowser was not called)');
   }
@@ -118,6 +123,7 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
           preload: join(codePaths.preload, 'plugin-browser.mjs'),
         },
       });
+      showBrowserWindowOrigin(win, origin, title);
       const stopTrackingWindow = trackPluginBrowserWindow(win, effectivePartition);
       return { ses, win, stopTrackingWindow };
     } finally {
@@ -182,6 +188,7 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
     home: 'about:blank',
     partition: effectivePartition,
     ua: ua ?? '',
+    origin: browserWindowOriginLabel(origin),
   };
 
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;

@@ -83,6 +83,7 @@ import {
 } from '../ipc/conversation-store.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
+import { showBrowserWindowOrigin } from '../browser/window-origin.js';
 import { resetPluginSession } from './session-reset.js';
 import {
   assertPluginBrowserPartitionAvailable,
@@ -1157,6 +1158,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
                   ...(ses ? { session: ses } : {}),
                 },
               });
+              showBrowserWindowOrigin(authWin, manifest, title);
               trackPartitionedPluginAuthWindow(authWin, partition);
               return { ses, authWin };
             } finally {
@@ -1440,7 +1442,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             releasePartitionOperation();
           }
         }
-        openPluginBrowserWindow(options);
+        openPluginBrowserWindow(options, { name: manifest.name, displayName: manifest.displayName });
       },
     },
 

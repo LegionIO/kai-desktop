@@ -11,6 +11,7 @@ import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActi
 import { applyBrandUserAgent } from '../../utils/user-agent.js';
 import { isUrlAllowed, urlResolvesToPrivate } from '../../utils/ssrf-guard.js';
 import { configureBrowserWebContents } from '../../browser/session.js';
+import { showBrowserWindowOrigin } from '../../browser/window-origin.js';
 import { isIP } from 'net';
 import type { AppConfig } from '../../config/schema.js';
 
@@ -213,6 +214,7 @@ function ensureWindow(sessionId: string): BrowserWindow {
       partition: `kai-cu-${sessionId}`,
     },
   });
+  showBrowserWindowOrigin(win, { name: `${__BRAND_PRODUCT_NAME} Computer Use` }, `Browser · ${sessionId}`);
   applyBrandUserAgent(win.webContents);
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   // WebRTC ICE/STUN/TURN traffic bypasses webRequest entirely, so an untrusted page could otherwise open
