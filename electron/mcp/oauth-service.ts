@@ -134,9 +134,9 @@ export class McpOAuthService {
     this.states.set(name, state);
     this.options.onChanged?.();
   }
-  private server(name: string): McpServerConfig & { url: string } {
+  private server(name: string, requireEnabled = true): McpServerConfig & { url: string } {
     const server = this.servers.get(name);
-    if (!server?.url || server.enabled === false)
+    if (!server?.url || (requireEnabled && server.enabled === false))
       throw new McpOAuthError('Save and enable this URL server before signing in.');
     secureUrl(server.url);
     return server as McpServerConfig & { url: string };
@@ -651,7 +651,7 @@ export class McpOAuthService {
     this.requireLogin(name, 'sign-in');
   }
   async logout(name: string): Promise<McpLogout> {
-    const cfg = this.server(name),
+    const cfg = this.server(name, false),
       key = mcpCredentialKey(cfg),
       record: McpCredentials = this.store.get(key);
     this.cancelLogin(name);

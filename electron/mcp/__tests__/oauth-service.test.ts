@@ -428,3 +428,10 @@ it('accepts a real loopback HTTP callback and closes the local listener', async 
   expect(service.status('fixture').state).toBe('authorized');
   await expect(fetch(callback)).rejects.toThrow();
 });
+
+it('allows local sign-out while a saved server is disabled', async () => {
+  await signIn();
+  service.configure([{ ...oauthServer, enabled: false }]);
+  expect((await service.logout('fixture')).localCleared).toBe(true);
+  expect(store.get(mcpCredentialKey(oauthServer)).tokens).toBeUndefined();
+});

@@ -1,3 +1,4 @@
+import { getAppHome } from '../local-bridge/paths.js';
 import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
@@ -81,7 +82,7 @@ const PRE_READ_TIMEOUT_MS = 10_000;
 
 /* ── File-backed session store ─────────────────────────────────────── */
 
-const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
+const SESSIONS_DIR = join(getAppHome(), 'data');
 const SESSIONS_PATH = join(SESSIONS_DIR, 'web-sessions.json');
 
 /** token -> expiry epoch ms. Map (not plain object) so prototype keys like '__proto__' can't poison lookups. */

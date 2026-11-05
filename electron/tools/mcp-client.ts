@@ -376,6 +376,8 @@ function serverFingerprint(s: McpServerConfig): string {
 let rebuildChain: Promise<ToolDefinition[]> = Promise.resolve([]);
 
 export function rebuildMcpTools(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
+  // Invalidate auth immediately; queued older reconciles must not restore stale config.
+  oauthService?.configure(servers);
   const run = rebuildChain.catch(() => []).then(() => rebuildMcpToolsInner(servers));
   // Keep the chain alive even if this run rejects, so a failure doesn't wedge
   // all future rebuilds.
@@ -384,7 +386,6 @@ export function rebuildMcpTools(servers: McpServerConfig[]): Promise<ToolDefinit
 }
 
 async function rebuildMcpToolsInner(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
-  oauthService?.configure(servers);
   const desired = new Map<string, McpServerConfig>();
   for (const s of servers) {
     if (s.enabled !== false) desired.set(s.name, s);
