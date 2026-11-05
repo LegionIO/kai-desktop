@@ -492,7 +492,15 @@ export function getBridgeScript(): string {
       testEmbedding: function() { return invoke('memory:test-embedding'); }
     },
     mcp: {
-      testConnection: function(server) { return invoke('mcp:test-connection', server); }
+      testConnection: function(server) { return invoke('mcp:test-connection', server); },
+      getStatus: function() { return invoke('mcp:status'); },
+      onStatusChanged: function(cb) { return on('mcp:status-changed', cb); },
+      login: function(name) { return invoke('mcp:login', name); },
+      completeLogin: function(id, url) { return invoke('mcp:complete-login', id, url); },
+      cancelLogin: function(name) { return invoke('mcp:cancel-login', name); },
+      reconnect: function(name) { return invoke('mcp:reconnect', name); },
+      logout: function(name) { return invoke('mcp:logout', name); },
+      setClientSecret: function(name, secret) { return invoke('mcp:set-client-secret', name, secret); }
     },
     cliTools: {
       checkBinaries: function(names) { return invoke('cli-tools:check-binaries', names); }

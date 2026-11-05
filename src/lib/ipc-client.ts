@@ -1,3 +1,4 @@
+import type { McpApi } from '../../shared/mcp';
 import type {
   ComputerUseEvent,
   ComputerUsePermissions,
@@ -273,15 +274,7 @@ type AppAPI = {
     }) => Promise<{ success?: boolean; cleared?: string[]; error?: string }>;
     testEmbedding: () => Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>;
   };
-  mcp: {
-    testConnection: (server: {
-      name: string;
-      url?: string;
-      command?: string;
-      args?: string[];
-      env?: Record<string, string>;
-    }) => Promise<{ status: string; toolCount: number; error?: string }>;
-  };
+  mcp: McpApi;
   cliTools: {
     checkBinaries: (binaryNames: string[]) => Promise<Record<string, boolean>>;
   };
@@ -448,7 +441,9 @@ type AppAPI = {
   };
   modelCatalog: () => Promise<unknown>;
   /** Ask a configured provider which models it serves (Models › Catalog “Discover”). */
-  discoverProviderModels: (providerName: string) => Promise<
+  discoverProviderModels: (
+    providerName: string,
+  ) => Promise<
     | { ok: true; models: Array<{ id: string; displayName?: string; maxInputTokens?: number }> }
     | { ok: false; error: string }
   >;

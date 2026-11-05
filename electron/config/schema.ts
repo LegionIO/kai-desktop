@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { mcpServerSchema } from '../../shared/mcp.js';
 
 export const executionModeSchema = z.enum(['auto', 'plan-first']);
 export type ExecutionMode = z.infer<typeof executionModeSchema>;
@@ -257,15 +258,6 @@ const processStreamingSchema = z.object({
     maxMessagesPerTool: z.number().positive(),
     maxTotalLaunchedTools: z.number().positive(),
   }),
-});
-
-const mcpServerSchema = z.object({
-  name: z.string(),
-  command: z.string().optional(),
-  args: z.array(z.string()).optional(),
-  url: z.string().optional(),
-  env: z.record(z.string(), z.string()).optional(),
-  enabled: z.boolean().optional(),
 });
 
 const subAgentConfigSchema = z.object({

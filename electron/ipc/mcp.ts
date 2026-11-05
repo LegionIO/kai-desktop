@@ -1,56 +1,82 @@
-import type { IpcMain } from 'electron';
-import { connectMcpServer, disconnectMcpServer } from '../tools/mcp-client.js';
+import { safeStorage, shell, type IpcMain } from 'electron';
+import { z } from 'zod';
+import { mcpServerSchema, type McpStatus } from '../../shared/mcp.js';
+import { connectMcpServer, disconnectMcpServer, getMcpStatus, setMcpOAuthService } from '../tools/mcp-client.js';
+import { McpOAuthService, mcpCredentialKey } from '../mcp/oauth-service.js';
+import { McpCredentialStore } from '../mcp/credential-store.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
+import type { AppConfig } from '../config/schema.js';
 
-interface McpServerInput {
-  name: string;
-  url?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-}
-
-/**
- * Validate the shape of an inline MCP server config from the renderer.
- *
- * Per the project's trust model, the web-bridge / renderer is a fully
- * trusted surface (an authenticated client may configure and test any
- * MCP server, same as the desktop UI). We therefore accept inline server
- * objects rather than forcing a save-then-lookup flow — but we strictly
- * type-check every field so a malformed payload cannot smuggle unexpected
- * values into StdioClientTransport.
- */
-function validateServerInput(raw: unknown): McpServerInput | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const s = raw as Record<string, unknown>;
-  if (typeof s.name !== 'string' || !s.name) return null;
-  const out: McpServerInput = { name: s.name };
-  if (s.url !== undefined) {
-    if (typeof s.url !== 'string') return null;
-    out.url = s.url;
-  }
-  if (s.command !== undefined) {
-    if (typeof s.command !== 'string') return null;
-    out.command = s.command;
-  }
-  if (s.args !== undefined) {
-    if (!Array.isArray(s.args) || !s.args.every((a) => typeof a === 'string')) return null;
-    out.args = s.args as string[];
-  }
-  if (s.env !== undefined) {
-    if (!s.env || typeof s.env !== 'object' || Array.isArray(s.env)) return null;
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(s.env)) {
-      if (typeof k !== 'string' || typeof v !== 'string') return null;
-      env[k] = v;
-    }
-    out.env = env;
-  }
-  return out;
-}
-
-export function registerMcpHandlers(ipcMain: IpcMain): void {
+export function registerMcpHandlers(
+  ipcMain: IpcMain,
+  appHome: string,
+  getConfig: () => AppConfig,
+  reconnect: (name: string) => Promise<void>,
+): McpOAuthService {
+  const status = (): McpStatus[] => {
+    const connected = new Map(getMcpStatus().map((entry) => [entry.name, entry]));
+    return getConfig().mcpServers.map((cfg) => {
+      const connection = connected.get(cfg.name);
+      return {
+        ...service.status(cfg.name),
+        enabled: cfg.enabled !== false,
+        status: (connection?.status ?? 'disconnected') as McpStatus['status'],
+        toolCount: connection?.toolCount ?? 0,
+        error: connection?.error,
+      };
+    });
+  };
+  const notify = () => broadcastToAllWindows('mcp:status-changed', status());
+  const service = new McpOAuthService(new McpCredentialStore(appHome, safeStorage), {
+    onChanged: notify,
+    onAuthorized: reconnect,
+  });
+  service.configure(getConfig().mcpServers);
+  setMcpOAuthService(service, notify);
+  const name = z.string().min(1).max(256);
+  ipcMain.handle('mcp:status', () => status());
+  ipcMain.handle('mcp:login', (_event, value: unknown) => service.login(name.parse(value)));
+  ipcMain.handle('mcp:open-login', (_event, value: unknown) =>
+    shell.openExternal(
+      service.authorizationUrl(
+        z
+          .string()
+          .regex(/^[a-f0-9]{48}$/)
+          .parse(value),
+      ),
+    ),
+  );
+  ipcMain.handle('mcp:complete-login', (_event, id: unknown, url: unknown) =>
+    service.completeLogin(
+      z
+        .string()
+        .regex(/^[a-f0-9]{48}$/)
+        .parse(id),
+      z.string().max(16384).parse(url),
+    ),
+  );
+  ipcMain.handle('mcp:cancel-login', (_event, value: unknown) => service.cancelLogin(name.parse(value)));
+  ipcMain.handle('mcp:reconnect', async (_event, value: unknown) => {
+    const serverName = name.parse(value);
+    if (!getConfig().mcpServers.some((cfg) => cfg.name === serverName && cfg.enabled !== false))
+      throw new Error('Save and enable this MCP server first.');
+    await reconnect(serverName);
+    notify();
+  });
+  ipcMain.handle('mcp:logout', async (_event, value: unknown) => {
+    const serverName = name.parse(value);
+    const result = await service.logout(serverName);
+    await disconnectMcpServer(serverName);
+    return result;
+  });
+  ipcMain.handle('mcp:set-client-secret', async (_event, value: unknown, secret: unknown) => {
+    const serverName = name.parse(value);
+    service.setClientSecret(serverName, z.string().min(1).max(16384).nullable().parse(secret));
+    await disconnectMcpServer(serverName);
+  });
   ipcMain.handle('mcp:test-connection', async (_event, raw: unknown) => {
-    const server = validateServerInput(raw);
+    const parsed = mcpServerSchema.safeParse(raw);
+    const server = parsed.success ? parsed.data : null;
     if (!server) {
       return { status: 'error' as const, toolCount: 0, error: 'Invalid server payload' };
     }
@@ -67,7 +93,7 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
     // timeout the connect keeps running and later does connections.set(testName, …) — AFTER the
     // finally's disconnect already ran — leaking a live __test__ connection (rebuilds skip __test__
     // names, so it survives until exit). Disconnect again after the connect settles to reap it.
-    const connectPromise = connectMcpServer({ ...server, name: testName });
+    const connectPromise = connectMcpServer({ ...server, name: testName }, server);
     let settledBeforeCleanup = false;
     try {
       const conn = await Promise.race([
@@ -87,6 +113,9 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
         status: conn.status,
         toolCount: conn.tools.length,
         error: conn.error,
+        auth: getConfig().mcpServers.some((cfg) => mcpCredentialKey(cfg) === mcpCredentialKey(server))
+          ? service.status(server.name)
+          : undefined,
       };
     } catch (error) {
       return {
@@ -114,4 +143,5 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
       }
     }
   });
+  return service;
 }

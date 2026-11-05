@@ -1,3 +1,6 @@
+import { startMcpLogin } from './mcp-auth.js';
+import { McpLoginPanel } from './components/McpLoginPanel.js';
+import type { McpLogin, McpStatus, McpLogout } from '../../shared/mcp.js';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useApp, useStdout, useInput } from 'ink';
 import Spinner from 'ink-spinner';
@@ -158,6 +161,28 @@ export function App({
   // under the composer; a second within the window actually quits. Ink's built-in
   // exitOnCtrlC is disabled (so startRepl's graceful shutdown handshake runs) and
   // in raw mode Ctrl-C arrives as input (not SIGINT), so we debounce it here.
+  const [mcpLogin, setMcpLogin] = useState<(McpLogin & { name: string }) | null>(null);
+  const [mcpStatuses, setMcpStatuses] = useState<McpStatus[]>([]);
+  useEffect(() => {
+    let receivedEvent = false;
+    const update = (items: McpStatus[]) => {
+      setMcpStatuses(items);
+      setMcpLogin((flow) =>
+        flow && items.find((item) => item.name === flow.name)?.state === 'authenticating' ? flow : null,
+      );
+    };
+    const off = client.on('mcp:status-changed', (items) => {
+      receivedEvent = true;
+      update(items as McpStatus[]);
+    });
+    void client
+      .invoke<McpStatus[]>('mcp:status')
+      .then((items) => {
+        if (!receivedEvent) update(items);
+      })
+      .catch(() => undefined);
+    return off;
+  }, [client]);
   const [quitHint, setQuitHint] = useState(false);
   const quitArmedRef = useRef(false);
   const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -870,7 +895,7 @@ export function App({
             kind: 'note',
             text:
               '/new  /resume [search]  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
-              '/usage  /export [json|md] [path]  /mcp [add|remove|toggle|test <name>]  /tools  /skills  /agents\n' +
+              '/usage  /export [json|md] [path]  /mcp [add|remove|toggle|test|login|logout|reconnect <name>]  /tools  /skills  /agents\n' +
               '/shot [caption]  /subagents  /subagent-stop [id]  /quit\n' +
               'attach an image inline with @path.png · keys: Esc cancel · Esc Esc rewind · Ctrl-O tools · Ctrl-C quit',
           });
@@ -1304,6 +1329,32 @@ export function App({
           // `/mcp test <name>`         → test-connect a configured server
           const parts = arg.trim().split(/\s+/).filter(Boolean);
           const sub = parts[0]?.toLowerCase();
+          if (['login', 'logout', 'reconnect'].includes(sub ?? '')) {
+            const name = parts[1];
+            if (!name) {
+              pushTurn({ kind: 'note', text: 'Usage: /mcp login|logout|reconnect <name> [--no-browser]' });
+              break;
+            }
+            if (sub === 'logout') {
+              const result = await client.invoke<McpLogout>('mcp:logout', name);
+              pushTurn({ kind: 'note', text: `Signed out locally. Server revocation: ${result.revocation}.` });
+            } else {
+              if (sub === 'reconnect') {
+                await client.invoke('mcp:reconnect', name);
+                const state = (await client.invoke<McpStatus[]>('mcp:status')).find((item) => item.name === name);
+                if (state?.state !== 'required') {
+                  pushTurn({
+                    kind: 'note',
+                    text: state?.status === 'connected' ? 'Reconnected.' : (state?.error ?? 'Connection failed.'),
+                  });
+                  break;
+                }
+              }
+              const flow = await startMcpLogin(client, name, parts.includes('--no-browser'));
+              setMcpLogin({ ...flow, name });
+            }
+            break;
+          }
           const readServers = async (): Promise<Array<Record<string, unknown>>> => {
             const cfg = await client.invoke<{ mcpServers?: Array<Record<string, unknown>> }>('config:get');
             return Array.isArray(cfg?.mcpServers) ? cfg.mcpServers : [];
@@ -1420,7 +1471,7 @@ export function App({
 
           pushTurn({
             kind: 'note',
-            text: `unknown /mcp subcommand "${stripControl(sub)}". Use: list | add | remove | toggle | test`,
+            text: `unknown /mcp subcommand "${stripControl(sub)}". Use: list | add | remove | toggle | test | login | logout | reconnect`,
           });
           break;
         }
@@ -1874,7 +1925,7 @@ export function App({
   useInput(
     (_input, key) => {
       if (!key.escape) return;
-      if (picker) return; // Picker handles its own ESC
+      if (picker || mcpLogin) return; // Picker handles its own ESC
       const now = Date.now();
       if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
         lastEscRef.current = 0; // a cancel is not part of a double-ESC sequence
@@ -2003,8 +2054,21 @@ export function App({
         ) : null}
       </Box>
 
-      {/* Picker (approvals, model/profile, resume) overlays the input */}
-      {picker ? (
+      {mcpStatuses
+        .filter((item) => item.enabled && item.state === 'required')
+        .map((item) => (
+          <Text key={item.name} color="yellow">
+            MCP {stripControl(item.name)}: {stripControl(item.message ?? 'Sign-in required')}. Use /mcp login{' '}
+            {stripControl(item.name)}
+          </Text>
+        ))}
+      {/* Authentication input is transient and never submitted to chat. */}
+      {mcpStatuses.some((item) => item.enabled && item.storage === 'session' && item.state !== 'none') && (
+        <Text dimColor>MCP credentials last for this backend session only; OS secure storage is unavailable.</Text>
+      )}
+      {mcpLogin ? (
+        <McpLoginPanel flow={mcpLogin} client={client} onClose={() => setMcpLogin(null)} />
+      ) : picker ? (
         <Picker
           title={picker.title}
           items={picker.items}

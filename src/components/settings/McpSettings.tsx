@@ -1,3 +1,6 @@
+import { mcpServerSchema, type McpServerConfig, type McpStatus } from '../../../shared/mcp';
+import { McpAuthControls, useMcpStatus } from '@/components/mcp/McpAuthControls';
+import * as Collapsible from '@radix-ui/react-collapsible';
 import { useState, type FC } from 'react';
 import {
   PlusIcon,
@@ -15,14 +18,7 @@ import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
 import { Toggle, type SettingsProps } from './shared';
 
-type McpServer = {
-  name: string;
-  url?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  enabled?: boolean;
-};
+type McpServer = McpServerConfig;
 
 type Transport = 'url' | 'command';
 
@@ -40,20 +36,21 @@ const emptyServer = (): McpServer => ({
 
 export const McpSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const servers = ((config as { mcpServers?: McpServer[] }).mcpServers ?? []) as McpServer[];
+  const statuses = useMcpStatus();
   const [showAdd, setShowAdd] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
 
   const updateServers = (newServers: McpServer[]) => updateConfig('mcpServers', newServers);
 
-  const addServer = (server: McpServer) => {
-    updateServers([...servers, server]);
+  const addServer = async (server: McpServer) => {
+    await updateServers([...servers, server]);
     setShowAdd(false);
   };
 
-  const updateServer = (index: number, server: McpServer) => {
+  const updateServer = async (index: number, server: McpServer) => {
     const next = [...servers];
     next[index] = server;
-    updateServers(next);
+    await updateServers(next);
     setEditIndex(null);
   };
 
@@ -88,6 +85,7 @@ export const McpSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ confi
             <ServerCard
               key={server.name}
               server={server}
+              status={statuses.find((entry) => entry.name === server.name)}
               onEdit={() => setEditIndex(i)}
               onDelete={() => deleteServer(i)}
               onToggle={() => toggleServer(i)}
@@ -121,10 +119,11 @@ export const McpSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ confi
 
 const ServerCard: FC<{
   server: McpServer;
+  status?: McpStatus;
   onEdit: () => void;
   onDelete: () => void;
   onToggle: () => void;
-}> = ({ server, onEdit, onDelete, onToggle }) => {
+}> = ({ server, status, onEdit, onDelete, onToggle }) => {
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const isEnabled = server.enabled !== false;
   const transport = server.url ? 'url' : 'command';
@@ -150,7 +149,9 @@ const ServerCard: FC<{
   return (
     <div className={`rounded-lg border p-3 space-y-2 ${!isEnabled ? 'opacity-50' : ''}`}>
       <div className="flex items-center gap-2">
-        <div className={`h-2 w-2 rounded-full shrink-0 ${isEnabled ? 'bg-green-500' : 'bg-muted-foreground/30'}`} />
+        <div
+          className={`h-2 w-2 rounded-full shrink-0 ${status?.status === 'connected' ? 'bg-green-500' : 'bg-muted-foreground/30'}`}
+        />
         <span className="text-xs font-mono font-semibold truncate">{server.name}</span>
 
         {transport === 'url' ? (
@@ -201,6 +202,16 @@ const ServerCard: FC<{
         <div className="text-[10px] text-muted-foreground">Env: {Object.keys(server.env).join(', ')}</div>
       )}
 
+      <p className="text-xs text-muted-foreground">
+        {!isEnabled
+          ? 'Disabled'
+          : status?.status === 'connected'
+            ? `Connected · ${status.toolCount} tools`
+            : status?.state === 'required'
+              ? 'Sign-in required'
+              : (status?.status ?? 'Disconnected')}
+      </p>
+      {transport === 'url' && <McpAuthControls name={server.name} status={status} clientId={server.oauth?.clientId} />}
       {testResult && <TestResultBadge result={testResult} />}
     </div>
   );
@@ -237,7 +248,7 @@ const TestResultBadge: FC<{ result: TestResult }> = ({ result }) => {
 
 const ServerForm: FC<{
   initial: McpServer;
-  onSave: (server: McpServer) => void;
+  onSave: (server: McpServer) => Promise<void>;
   onCancel: () => void;
   submitLabel: string;
 }> = ({ initial, onSave, onCancel, submitLabel }) => {
@@ -248,6 +259,11 @@ const ServerForm: FC<{
   const [args, setArgs] = useState((initial.args ?? []).join(' '));
   const [env, setEnv] = useState<Array<[string, string]>>(Object.entries(initial.env ?? {}));
   const [enabled, setEnabled] = useState(initial.enabled !== false);
+  const [clientId, setClientId] = useState(initial.oauth?.clientId ?? '');
+  const [metadataUrl, setMetadataUrl] = useState(initial.oauth?.clientMetadataUrl ?? '');
+  const [scopes, setScopes] = useState(initial.oauth?.scopes?.join(' ') ?? '');
+  const [callbackHost, setCallbackHost] = useState(initial.oauth?.callbackHost ?? '127.0.0.1');
+  const [callbackPort, setCallbackPort] = useState(initial.oauth?.callbackPort?.toString() ?? '');
   const [testResult, setTestResult] = useState<TestResult | null>(null);
 
   const canSave = name.trim() && (transport === 'url' ? url.trim() : command.trim());
@@ -260,6 +276,14 @@ const ServerForm: FC<{
     };
     if (transport === 'url') {
       server.url = url.trim();
+      if (clientId || metadataUrl || scopes || callbackPort || callbackHost !== '127.0.0.1')
+        server.oauth = {
+          ...(clientId.trim() ? { clientId: clientId.trim() } : {}),
+          ...(metadataUrl.trim() ? { clientMetadataUrl: metadataUrl.trim() } : {}),
+          ...(scopes.trim() ? { scopes: scopes.trim().split(/\s+/) } : {}),
+          callbackHost,
+          ...(callbackPort ? { callbackPort: Number(callbackPort) } : {}),
+        };
     } else {
       server.command = command.trim();
       const parsedArgs = args.trim().split(/\s+/).filter(Boolean);
@@ -282,6 +306,7 @@ const ServerForm: FC<{
         command: server.command,
         args: server.args,
         env: server.env,
+        oauth: server.oauth,
       });
       setTestResult({
         status: result.status === 'connected' ? 'connected' : 'error',
@@ -293,9 +318,21 @@ const ServerForm: FC<{
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!canSave) return;
-    onSave(buildServer());
+    const parsed = mcpServerSchema.safeParse(buildServer());
+    if (!parsed.success) {
+      setTestResult({
+        status: 'error',
+        error: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; '),
+      });
+      return;
+    }
+    try {
+      await onSave(parsed.data);
+    } catch {
+      setTestResult({ status: 'error', error: 'Could not save this MCP server. Check its settings and try again.' });
+    }
   };
 
   return (
@@ -368,6 +405,44 @@ const ServerForm: FC<{
             />
           </div>
         </>
+      )}
+
+      {transport === 'url' && (
+        <Collapsible.Root>
+          <Collapsible.Trigger className="text-xs font-medium underline underline-offset-4">
+            OAuth settings (optional)
+          </Collapsible.Trigger>
+          <Collapsible.Content className="mt-3 space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Most servers discover their sign-in settings automatically. Save the server, then select Sign in.
+            </p>
+            {(
+              [
+                ['Client ID', clientId, setClientId],
+                ['Client metadata URL', metadataUrl, setMetadataUrl],
+                ['Requested scopes (space-separated)', scopes, setScopes],
+                ['Fixed callback port', callbackPort, setCallbackPort],
+              ] as const
+            ).map(([label, value, setValue]) => (
+              <label key={label} className="block text-xs">
+                {label}
+                <input
+                  value={value}
+                  onChange={(event) => setValue(event.target.value)}
+                  className="mt-1 w-full rounded border bg-background px-2 py-1.5 text-sm"
+                />
+              </label>
+            ))}
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={callbackHost === 'localhost'}
+                onChange={(event) => setCallbackHost(event.target.checked ? 'localhost' : '127.0.0.1')}
+              />{' '}
+              Use localhost instead of 127.0.0.1 for registered callbacks
+            </label>
+          </Collapsible.Content>
+        </Collapsible.Root>
       )}
 
       {/* Env vars */}

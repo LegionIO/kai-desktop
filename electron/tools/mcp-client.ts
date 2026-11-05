@@ -1,13 +1,14 @@
 import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { z as Z } from 'zod';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { buildScopedToolName } from './naming.js';
 import type { AppConfig } from '../config/schema.js';
+import { McpOAuthError, type McpOAuthService } from '../mcp/oauth-service.js';
 
 type McpServerConfig = AppConfig['mcpServers'][number];
 
@@ -53,6 +54,14 @@ type McpConnection = {
 };
 
 const connections = new Map<string, McpConnection>();
+const connectionEpochs = new Map<string, number>();
+const pendingConnections = new Map<string, { fingerprint: string; promise: Promise<McpConnection> }>();
+let oauthService: McpOAuthService | undefined;
+let statusChanged: (() => void) | undefined;
+export function setMcpOAuthService(service: McpOAuthService, onChanged: () => void): void {
+  oauthService = service;
+  statusChanged = onChanged;
+}
 
 /** Convert a JSON Schema object to a Zod schema. Covers common MCP tool patterns. */
 function jsonSchemaToZod(schema: Record<string, unknown>): Z.ZodTypeAny {
@@ -121,8 +130,9 @@ async function createTransport(server: McpServerConfig): Promise<Transport> {
  *  (R169): the failure surfaces in client.connect (protocol negotiation), not at transport
  *  construction, so a valid SSE-only endpoint must get a real SSE connect attempt. Each attempt is
  *  time-boxed. Returns the transport that actually connected. */
-async function connectUrlWithFallback(client: Client, url: string): Promise<Transport> {
-  const httpTransport: Transport = new StreamableHTTPClientTransport(new URL(url));
+async function connectUrlWithFallback(client: Client, server: McpServerConfig): Promise<Transport> {
+  const options = oauthService ? { fetch: oauthService.authenticatedFetch(server) } : undefined;
+  const httpTransport: Transport = new StreamableHTTPClientTransport(new URL(server.url!), options);
   try {
     await withTimeout(client.connect(httpTransport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect (http)');
     return httpTransport;
@@ -132,7 +142,8 @@ async function connectUrlWithFallback(client: Client, url: string): Promise<Tran
     } catch {
       /* ignore */
     }
-    const sseTransport: Transport = new SSEClientTransport(new URL(url));
+    if (!(httpErr instanceof StreamableHTTPError) || ![404, 405].includes(httpErr.code ?? 0)) throw httpErr;
+    const sseTransport: Transport = new SSEClientTransport(new URL(server.url!), options);
     try {
       await withTimeout(client.connect(sseTransport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect (sse)');
       return sseTransport;
@@ -142,6 +153,7 @@ async function connectUrlWithFallback(client: Client, url: string): Promise<Tran
       } catch {
         /* ignore */
       }
+      if (sseErr instanceof McpOAuthError) throw sseErr;
       // Surface the SSE error (the last attempt), noting the HTTP attempt also failed.
       throw new Error(
         `MCP connect failed (http: ${httpErr instanceof Error ? httpErr.message : String(httpErr)}; ` +
@@ -151,7 +163,24 @@ async function connectUrlWithFallback(client: Client, url: string): Promise<Tran
   }
 }
 
-export async function connectMcpServer(server: McpServerConfig): Promise<McpConnection> {
+export function connectMcpServer(server: McpServerConfig, credentialServer = server): Promise<McpConnection> {
+  const pending = pendingConnections.get(server.name);
+  const fingerprint = serverFingerprint(server);
+  if (pending?.fingerprint === fingerprint) return pending.promise;
+  const epoch = (connectionEpochs.get(server.name) ?? 0) + 1;
+  connectionEpochs.set(server.name, epoch);
+  const promise = connectMcpServerInner(server, credentialServer, epoch).finally(() => {
+    if (pendingConnections.get(server.name)?.promise === promise) pendingConnections.delete(server.name);
+  });
+  pendingConnections.set(server.name, { fingerprint, promise });
+  return promise;
+}
+
+async function connectMcpServerInner(
+  server: McpServerConfig,
+  credentialServer: McpServerConfig,
+  epoch: number,
+): Promise<McpConnection> {
   const existing = connections.get(server.name);
   if (existing && existing.status === 'connected') return existing;
 
@@ -166,7 +195,7 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
 
     if (server.url && !server.command) {
       // URL server: connect with a Streamable-HTTP→SSE fallback, each attempt time-boxed.
-      transport = await connectUrlWithFallback(client, server.url);
+      transport = await connectUrlWithFallback(client, credentialServer);
     } else {
       transport = await createTransport(server);
       await withTimeout(client.connect(transport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect');
@@ -186,7 +215,15 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       execute: async (input: unknown, context?: ToolExecutionContext) => {
         // Propagate chat/user cancellation and cap the call so a hung MCP server
         // can't keep the tool promise (and the agent turn) alive forever.
-        const result = await client!.callTool(
+        const current = connections.get(server.name);
+        if (!current?.client || current.status !== 'connected') {
+          const auth = oauthService?.status(credentialServer.name);
+          throw new McpOAuthError(
+            auth?.message ?? 'MCP server disconnected. Reconnect it before trying again.',
+            auth?.reason,
+          );
+        }
+        const result = await current.client.callTool(
           { name: t.name, arguments: input as Record<string, unknown> },
           undefined,
           {
@@ -221,16 +258,26 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       const current = connections.get(server.name);
       if (current === connection && current.status === 'connected') {
         current.status = 'disconnected';
+        statusChanged?.();
       }
     };
-    transport.onclose = markDisconnected;
+    const priorOnClose = transport.onclose?.bind(transport);
+    transport.onclose = () => {
+      priorOnClose?.();
+      markDisconnected();
+    };
     const priorOnError = transport.onerror?.bind(transport);
     transport.onerror = (err: Error) => {
       priorOnError?.(err);
       markDisconnected();
     };
 
+    if (connectionEpochs.get(server.name) !== epoch) {
+      await client.close();
+      throw new McpOAuthError('MCP connection was cancelled. Reconnect to try again.');
+    }
     connections.set(server.name, connection);
+    statusChanged?.();
     return connection;
   } catch (error) {
     // Tear down a half-open client/transport before recording the error.
@@ -250,15 +297,24 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       transport: null as unknown as Transport,
       tools: [],
       status: 'error',
-      error: error instanceof Error ? error.message : String(error),
+      error:
+        error instanceof McpOAuthError
+          ? error.message
+          : server.url
+            ? 'MCP connection failed. Check the endpoint and try reconnecting.'
+            : error instanceof Error
+              ? error.message
+              : String(error),
       fingerprint: serverFingerprint(server),
     };
-    connections.set(server.name, conn);
+    if (connectionEpochs.get(server.name) === epoch) connections.set(server.name, conn);
+    statusChanged?.();
     return conn;
   }
 }
 
 export async function connectAllMcpServers(config: AppConfig): Promise<ToolDefinition[]> {
+  oauthService?.configure(config.mcpServers);
   const allTools: ToolDefinition[] = [];
 
   for (const server of config.mcpServers) {
@@ -271,6 +327,8 @@ export async function connectAllMcpServers(config: AppConfig): Promise<ToolDefin
 }
 
 export async function disconnectMcpServer(name: string): Promise<void> {
+  connectionEpochs.set(name, (connectionEpochs.get(name) ?? 0) + 1);
+  pendingConnections.delete(name);
   const conn = connections.get(name);
   if (conn?.client) {
     try {
@@ -279,13 +337,15 @@ export async function disconnectMcpServer(name: string): Promise<void> {
       /* ignore */
     }
   }
-  connections.delete(name);
+  if (connections.get(name) === conn) connections.delete(name);
+  statusChanged?.();
 }
 
 /** Close every MCP connection in the pool. Called from app-quit teardown so
  *  stdio child processes + network handles don't survive as orphans (a child is
  *  NOT killed automatically when its parent Electron process exits). */
 export async function disconnectAllMcpServers(): Promise<void> {
+  oauthService?.dispose();
   const names = Array.from(connections.keys());
   await Promise.allSettled(names.map((name) => disconnectMcpServer(name)));
 }
@@ -298,6 +358,7 @@ function serverFingerprint(s: McpServerConfig): string {
     args: s.args,
     env: s.env,
     enabled: s.enabled,
+    oauth: s.oauth,
   });
 }
 
@@ -323,6 +384,7 @@ export function rebuildMcpTools(servers: McpServerConfig[]): Promise<ToolDefinit
 }
 
 async function rebuildMcpToolsInner(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
+  oauthService?.configure(servers);
   const desired = new Map<string, McpServerConfig>();
   for (const s of servers) {
     if (s.enabled !== false) desired.set(s.name, s);

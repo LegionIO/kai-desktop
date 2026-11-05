@@ -51,6 +51,8 @@ export const branding = {
   mediaProtocol: '{{appSlug}}-media',
   /** MCP client name sent during MCP handshake. */
   mcpClientName: '{{appSlug}}',
+  /** Public OAuth client identity document; override when distributing a different brand. */
+  mcpClientMetadataUrl: 'https://legionio.github.io/kai-desktop/oauth/client-metadata.json',
   /**
    * HTTP User-Agent template.
    * Supported variables include:

@@ -145,13 +145,7 @@ function getDefaultConfig() {
         enabled: true,
       },
     },
-    mcpServers: [] as Array<{
-      name: string;
-      command?: string;
-      args?: string[];
-      url?: string;
-      env?: Record<string, string>;
-    }>,
+    mcpServers: [] as AppConfig['mcpServers'],
     skills: {
       // Absolute (resolved from the real home), NOT a literal '~/…': `~` is not
       // expanded by fs/path, so a stored tilde makes skills silently not load —
