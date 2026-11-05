@@ -1,0 +1,10 @@
+{
+  "client_id": "https://legionio.github.io/kai-desktop/oauth/client-metadata.json",
+  "client_name": "Kai",
+  "client_uri": "https://github.com/LegionIO/kai-desktop",
+  "application_type": "native",
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "redirect_uris": ["http://127.0.0.1/callback", "http://localhost/callback"]
+}
