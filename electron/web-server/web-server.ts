@@ -497,6 +497,7 @@ export function getBridgeScript(): string {
       getStatus: function() { return invoke('mcp:status'); },
       onStatusChanged: function(cb) { return on('mcp:status-changed', cb); },
       login: function(name) { return invoke('mcp:login', name); },
+      openLogin: function(id, browser) { return invoke('mcp:open-login', id, browser); },
       completeLogin: function(id, url) { return invoke('mcp:complete-login', id, url); },
       cancelLogin: function(name) { return invoke('mcp:cancel-login', name); },
       reconnect: function(name) { return invoke('mcp:reconnect', name); },

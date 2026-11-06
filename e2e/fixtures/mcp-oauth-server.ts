@@ -30,6 +30,17 @@ export async function startMcpOAuthFixture() {
       res.writeHead(200).end();
       return;
     }
+    if (url.pathname === '/authorize') {
+      const callback = new URL(url.searchParams.get('redirect_uri')!);
+      callback.searchParams.set('state', url.searchParams.get('state')!);
+      callback.searchParams.set('code', 'controlled-code');
+      callback.searchParams.set('iss', origin);
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(
+        `<title>Controlled OAuth sign-in</title><h1>Controlled sign-in</h1><a href="${callback.href.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}">Authorize fixture</a>`,
+      );
+      return;
+    }
     if (url.pathname === '/token') {
       let body = '';
       for await (const chunk of req) body += chunk;

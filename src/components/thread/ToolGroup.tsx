@@ -300,18 +300,12 @@ export const ToolCallDisplay: FC<{
   const summary = getToolSummary(part);
   const subtitle = getToolSubtitle(part);
   const miniPreview = getMiniCodePreview(part);
-  // Use result shape to drive rendering — works regardless of tool name
-  // isEdit takes priority: a plain-string result from edit tools would otherwise
-  // match the sh shape detector (detectShResult accepts any non-empty string).
-  const isBash =
-    !isEditTool &&
-    !isReadTool &&
-    !isGrepToolName &&
-    !isGlobToolName &&
-    !isRuntimeSwitch &&
-    (smartResult?.type === 'sh' || isBashTool);
+  // Specialized cards assume tool-specific inputs. Result shape may format the
+  // output, but must not replace an arbitrary tool's input with a shell command
+  // or file path (MCP tools commonly return plain text).
+  const isBash = isBashTool;
   const isEdit = isEditTool;
-  const isFileRead = isReadTool || smartResult?.type === 'file_read';
+  const isFileRead = isReadTool;
   const isGrepTool = isGrepToolName;
   const isGlobTool = isGlobToolName;
 
@@ -564,7 +558,7 @@ export const ToolCallDisplay: FC<{
                 inputs; this generic fallback previously showed only the Result,
                 so tools like updateWorkingMemory hid their (meaningful) inputs.
                 Shown only when there are non-empty args. */}
-            {hasDisplayableArgs(part.args) && (
+            {(hasDisplayableArgs(part.args) || Boolean(part.argsText?.trim())) && (
               <ToolSection title="Input">
                 <CodeBlock code={part.argsText ?? formatResult(part.args)} language="json" />
               </ToolSection>

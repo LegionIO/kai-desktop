@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { launchElectronForSmoke, type ElectronHandle } from './electron-launcher';
 import { startMcpOAuthFixture } from './fixtures/mcp-oauth-server';
 import type { McpApi, McpLogin } from '../shared/mcp';
+import { mcpToolCallFixture } from '../test-utils/mcp-ui';
 
 type ApiWindow = Window & { app: { mcp: McpApi; config: { set(path: string, value: unknown): Promise<void> } } };
 let handle: ElectronHandle;
@@ -144,4 +145,106 @@ test('desktop, authenticated browser and terminal share login, refresh and recon
   } finally {
     terminal.kill();
   }
+});
+
+test('dedicated desktop sign-in windows complete and cancel without exposing the app bridge', async () => {
+  await handle.page.evaluate(async (url) => {
+    await (window as unknown as ApiWindow).app.config.set('mcpServers', [
+      { name: 'window-fixture', url, enabled: true },
+    ]);
+  }, `${fixture.origin}/mcp`);
+  await expect
+    .poll(() =>
+      handle.page.evaluate(
+        async () =>
+          (await (window as unknown as ApiWindow).app.mcp.getStatus()).find(
+            (status) => status.name === 'window-fixture',
+          )?.state,
+      ),
+    )
+    .toBe('required');
+  const flow = await handle.page.evaluate(() => (window as unknown as ApiWindow).app.mcp.login('window-fixture'));
+  const nextWindow = handle.app.waitForEvent('window');
+  await handle.page.evaluate((id) => (window as unknown as ApiWindow).app.mcp.openLogin(id, 'in-app'), flow.loginId);
+  const signIn = await nextWindow;
+  await expect(signIn.getByRole('heading', { name: 'Controlled sign-in' })).toBeVisible();
+  expect(await signIn.evaluate(() => typeof (window as unknown as ApiWindow).app)).toBe('undefined');
+  await handle.page.evaluate((id) => (window as unknown as ApiWindow).app.mcp.openLogin(id, 'in-app'), flow.loginId);
+  expect(handle.app.windows()).toHaveLength(2);
+  await signIn.getByRole('link', { name: 'Authorize fixture' }).click();
+  await expect.poll(() => signIn.isClosed()).toBe(true);
+  await expect
+    .poll(() =>
+      handle.page.evaluate(async () => (await (window as unknown as ApiWindow).app.mcp.getStatus())[0]?.state),
+    )
+    .toBe('authorized');
+
+  const second = await handle.page.evaluate(() => (window as unknown as ApiWindow).app.mcp.login('window-fixture'));
+  const cancelledWindow = handle.app.waitForEvent('window');
+  await handle.page.evaluate((id) => (window as unknown as ApiWindow).app.mcp.openLogin(id, 'in-app'), second.loginId);
+  const cancelled = await cancelledWindow;
+  await cancelled.close();
+  await expect
+    .poll(() =>
+      handle.page.evaluate(async () => (await (window as unknown as ApiWindow).app.mcp.getStatus())[0]?.state),
+    )
+    .toBe('required');
+  await expect(
+    handle.page.evaluate((id) => (window as unknown as ApiWindow).app.mcp.openLogin(id, 'in-app'), second.loginId),
+  ).rejects.toThrow('expired');
+});
+
+test('expanded MCP calls display inputs and output in the real desktop renderer', async () => {
+  await handle.page.evaluate(async (part) => {
+    const timestamp = new Date().toISOString();
+    const messageTree = [
+      {
+        id: 'mcp-input-user',
+        parentId: null,
+        role: 'user',
+        content: [{ type: 'text', text: 'Verify this MCP request.' }],
+        createdAt: timestamp,
+      },
+      {
+        id: 'mcp-input-assistant',
+        parentId: 'mcp-input-user',
+        role: 'assistant',
+        content: [part],
+        createdAt: timestamp,
+      },
+    ];
+    const conversations = (
+      window as unknown as {
+        app: {
+          conversations: {
+            put(value: Record<string, unknown>): Promise<void>;
+            setActiveId(id: string): Promise<void>;
+          };
+        };
+      }
+    ).app.conversations;
+    await conversations.put({
+      id: 'mcp-input-visual',
+      title: 'MCP inputs fixture',
+      fallbackTitle: 'MCP inputs fixture',
+      messages: messageTree,
+      messageTree,
+      headId: 'mcp-input-assistant',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastMessageAt: timestamp,
+      messageCount: 2,
+      userMessageCount: 1,
+      titleStatus: 'idle',
+      runStatus: 'idle',
+      hasUnread: false,
+    });
+    await conversations.setActiveId('mcp-input-visual');
+  }, mcpToolCallFixture());
+  await handle.page.getByRole('complementary').getByText('MCP inputs fixture', { exact: true }).click();
+  await handle.page.getByRole('button', { name: /Mcp Secplat/ }).click();
+  await expect(handle.page.getByText('Input', { exact: true })).toBeVisible();
+  await expect(handle.page.getByText('"Verify the MCP request"', { exact: false })).toBeVisible();
+  await expect(handle.page.getByText('MCP repeat test verified', { exact: true })).toBeVisible();
+  await handle.page.screenshot({ path: test.info().outputPath('mcp-inputs.png') });
 });

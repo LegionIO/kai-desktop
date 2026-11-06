@@ -20,6 +20,7 @@ import { McpOAuthService, mcpCredentialKey } from '../oauth-service.js';
 let home: string, store: McpCredentialStore, service: McpOAuthService;
 let encryption: ReturnType<typeof fixtureEncryption>;
 const authorized = vi.fn(async () => {});
+const loginEnded = vi.fn();
 beforeAll(() => httpMock.server.listen({ onUnhandledRequest: 'error' }));
 afterAll(() => httpMock.server.close());
 beforeEach(() => {
@@ -27,9 +28,14 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'kai-oauth-test-'));
   encryption = fixtureEncryption();
   store = new McpCredentialStore(home, encryption);
-  service = new McpOAuthService(store, { onAuthorized: authorized, metadataUrl: 'https://kai.test/oauth/client.json' });
+  service = new McpOAuthService(store, {
+    onAuthorized: authorized,
+    onLoginEnded: loginEnded,
+    metadataUrl: 'https://kai.test/oauth/client.json',
+  });
   service.configure([oauthServer]);
   authorized.mockClear();
+  loginEnded.mockClear();
   httpMock.use(...oauthHandlers());
 });
 afterEach(() => {
@@ -48,6 +54,22 @@ function expire() {
 }
 
 describe('registration, discovery and local callback', () => {
+  it.each(['success', 'cancel', 'configure', 'dispose'])(
+    'closes the matching sign-in window when the attempt ends through %s',
+    async (reason) => {
+      const flow = await service.login('fixture');
+      expect(service.loginWindowInfo(flow.loginId)).toEqual({
+        name: 'fixture',
+        authorizationUrl: flow.authorizationUrl,
+      });
+      if (reason === 'success') await service.completeLogin(flow.loginId, oauthCallback(flow));
+      if (reason === 'cancel') service.cancelLogin('fixture');
+      if (reason === 'configure') service.configure([]);
+      if (reason === 'dispose') service.dispose();
+      expect(loginEnded).toHaveBeenCalledExactlyOnceWith(flow.loginId);
+      expect(() => service.loginWindowInfo(flow.loginId)).toThrow('expired');
+    },
+  );
   it('uses CIMD, PKCE S256 and resource indicators, and sends a matching verifier', async () => {
     let posted = new URLSearchParams();
     httpMock.use(

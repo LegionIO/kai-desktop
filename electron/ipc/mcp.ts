@@ -4,6 +4,7 @@ import { mcpServerSchema, type McpStatus } from '../../shared/mcp.js';
 import { connectMcpServer, disconnectMcpServer, getMcpStatus, setMcpOAuthService } from '../tools/mcp-client.js';
 import { McpOAuthService, mcpCredentialKey } from '../mcp/oauth-service.js';
 import { McpCredentialStore } from '../mcp/credential-store.js';
+import { McpLoginWindows } from '../mcp/login-window.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import type { AppConfig } from '../config/schema.js';
 
@@ -27,25 +28,28 @@ export function registerMcpHandlers(
     });
   };
   const notify = () => broadcastToAllWindows('mcp:status-changed', status());
+  let loginWindows: McpLoginWindows;
   const service = new McpOAuthService(new McpCredentialStore(appHome, safeStorage), {
     onChanged: notify,
     onAuthorized: reconnect,
+    onLoginEnded: (loginId) => loginWindows.close(loginId),
   });
+  loginWindows = new McpLoginWindows(service);
   service.configure(getConfig().mcpServers);
   setMcpOAuthService(service, notify);
   const name = z.string().min(1).max(256);
   ipcMain.handle('mcp:status', () => status());
   ipcMain.handle('mcp:login', (_event, value: unknown) => service.login(name.parse(value)));
-  ipcMain.handle('mcp:open-login', (_event, value: unknown) =>
-    shell.openExternal(
-      service.authorizationUrl(
-        z
-          .string()
-          .regex(/^[a-f0-9]{48}$/)
-          .parse(value),
-      ),
-    ),
-  );
+  ipcMain.handle('mcp:open-login', (_event, value: unknown, browser: unknown) => {
+    const id = z
+      .string()
+      .regex(/^[a-f0-9]{48}$/)
+      .parse(value);
+    const target = z.enum(['in-app', 'system']).default('system').parse(browser);
+    const url = service.authorizationUrl(id);
+    if (target === 'in-app') return loginWindows.open(id);
+    return shell.openExternal(url).then(() => loginWindows.close(id));
+  });
   ipcMain.handle('mcp:complete-login', (_event, id: unknown, url: unknown) =>
     service.completeLogin(
       z

@@ -1,4 +1,13 @@
 import type { McpApi, McpStatus } from '../shared/mcp';
+export function mcpToolCallFixture(result: unknown = 'MCP repeat test verified') {
+  return {
+    type: 'tool-call' as const,
+    toolCallId: 'mcp-fixture-call',
+    toolName: 'mcp_secplat-skynet_chat',
+    args: { message: 'Verify the MCP request', context: { environment: 'nonprod' } },
+    result,
+  };
+}
 export const mcpStatusFixture: McpStatus = {
   name: 'fixture',
   state: 'required',
@@ -22,6 +31,7 @@ export function mcpApiFixture(overrides: Partial<McpApi> = {}): McpApi {
       expiresAt: Date.now() + 300_000,
     }),
     completeLogin: async () => {},
+    openLogin: async () => {},
     cancelLogin: async () => {},
     reconnect: async () => {},
     logout: async () => ({ localCleared: true, revocation: 'unsupported' }),

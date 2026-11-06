@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { XIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { isWebBridgeRuntime } from '@/lib/media-url';
 import type { McpLogin, McpStatus } from '../../../shared/mcp';
 
 export function useMcpStatus(): McpStatus[] {
@@ -32,6 +33,7 @@ const buttonClass =
   'rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50';
 
 export function McpAuthControls({ name, status, clientId }: { name: string; status?: McpStatus; clientId?: string }) {
+  const isWeb = isWebBridgeRuntime();
   const [login, setLogin] = useState<McpLogin | null>(null);
   const [open, setOpen] = useState(false);
   const [callback, setCallback] = useState('');
@@ -46,6 +48,7 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
       setCallback('');
     }
     if (status?.state === 'required') {
+      setOpen(false);
       setLogin(null);
       setCallback('');
     }
@@ -67,7 +70,8 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
       const flow = await app.mcp.login(name);
       setLogin(flow);
       setOpen(true);
-      window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer');
+      if (isWeb) window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer');
+      else await app.mcp.openLogin(flow.loginId, 'in-app');
     });
   const close = () => {
     setOpen(false);
@@ -173,12 +177,14 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
           <Dialog.Content className="fixed left-1/2 top-1/2 z-[101] w-[calc(100%-2rem)] max-h-[calc(100%-2rem)] overflow-y-auto max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-xl border bg-background p-6">
             <Dialog.Title className="pr-8 text-lg font-semibold break-words">Sign in to {name}</Dialog.Title>
             <Dialog.Description className="mt-2 text-sm text-muted-foreground">
-              Finish signing in in your browser. Kai will reconnect when you return.
+              {isWeb
+                ? 'Finish signing in in your browser. Kai will reconnect when you return.'
+                : 'Finish signing in in the Kai sign-in window. If your provider requires an external browser, use Open in system browser.'}
             </Dialog.Description>
             <Dialog.Close className="absolute right-4 top-4 rounded p-1 hover:bg-muted" aria-label="Cancel sign-in">
               <XIcon className="h-4 w-4" />
             </Dialog.Close>
-            {login && (
+            {login && isWeb && (
               <a
                 href={login.authorizationUrl}
                 target="_blank"
@@ -187,6 +193,31 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
               >
                 Open sign-in page
               </a>
+            )}
+            {login && !isWeb && (
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  className={buttonClass}
+                  disabled={busy}
+                  onClick={() => void run(() => app.mcp.openLogin(login.loginId, 'in-app'))}
+                >
+                  Show sign-in window
+                </button>
+                <button
+                  type="button"
+                  className={buttonClass}
+                  disabled={busy}
+                  onClick={() => void run(() => app.mcp.openLogin(login.loginId, 'system'))}
+                >
+                  Open in system browser
+                </button>
+              </div>
+            )}
+            {message && (
+              <p role="status" className="mt-3 break-words text-sm">
+                {message}
+              </p>
             )}
             <form
               className="mt-5 space-y-3"

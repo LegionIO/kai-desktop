@@ -96,6 +96,7 @@ export class McpOAuthService {
       metadataUrl?: string;
       onChanged?: () => void;
       onAuthorized?: (name: string) => Promise<void>;
+      onLoginEnded?: (loginId: string) => void;
     } = {},
   ) {
     this.fetchFn = options.fetch ?? globalThis.fetch;
@@ -278,9 +279,13 @@ export class McpOAuthService {
     return promise;
   }
   authorizationUrl(loginId: string): string {
+    return this.loginWindowInfo(loginId).authorizationUrl;
+  }
+  /** Backend-only details for the dedicated sign-in window. */
+  loginWindowInfo(loginId: string): { name: string; authorizationUrl: string } {
     const attempt = this.attempts.get(loginId);
     if (!attempt || Date.now() >= attempt.expiresAt) throw new McpOAuthError('This login has expired.');
-    return attempt.authorizationUrl;
+    return { name: attempt.name, authorizationUrl: attempt.authorizationUrl };
   }
   private async startLogin(name: string): Promise<McpLogin> {
     const cfg = this.server(name);
@@ -500,8 +505,9 @@ export class McpOAuthService {
   }
   private finishAttempt(attempt: Attempt): void {
     clearTimeout(attempt.timer);
-    this.attempts.delete(attempt.loginId);
+    if (!this.attempts.delete(attempt.loginId)) return;
     attempt.server.close();
+    this.options.onLoginEnded?.(attempt.loginId);
   }
   cancelLogin(name: string): void {
     this.epochs.set(name, (this.epochs.get(name) ?? 0) + 1);

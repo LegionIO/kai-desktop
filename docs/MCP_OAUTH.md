@@ -4,6 +4,10 @@ Kai supports OAuth for URL-based MCP servers over Streamable HTTP and legacy SSE
 
 Save and enable a server in **Settings → MCP Servers**, then select **Sign in** when authentication is required. Background startup and failed tools never open a browser. Expiring access tokens refresh silently; revoked refresh tokens display **Sign in again**, and scope challenges display **Additional permissions required**. Select **Reconnect** to authorize again. A failed call stays failed; subsequent calls use the restored connection and refreshed tool discovery.
 
+Desktop sign-in opens a dedicated Kai window, separate from the agent's Browser tabs. Its temporary browser session has no app preload and is cleared when the window closes. Success, cancellation, expiration, and configuration changes close the window. If a provider requires an external browser or an existing browser SSO session, select **Open in system browser**. Terminal sign-in uses the system browser; web clients open the sign-in page on their own device.
+
+Expand an MCP tool call in chat to see its **Input** and **Result**, including tools that return plain text.
+
 ## Client registration
 
 Kai tries an explicitly configured client ID first, its hosted client metadata document when the server advertises support, then dynamic client registration. Servers that support neither metadata documents nor dynamic registration need a client ID from the server administrator. Set an optional client secret using **Set client secret** on the saved server; secrets never belong in configuration.

@@ -12,6 +12,28 @@ afterEach(() => {
   uninstallAppBridgeStub();
   vi.restoreAllMocks();
 });
+it('opens desktop sign-in in Kai and offers an explicit system-browser fallback', async () => {
+  const openLogin = vi.fn(async () => {});
+  installAppBridgeStub({ mcp: mcpApiFixture({ openLogin }) });
+  const { rerender } = render(<McpAuthControls name="fixture" status={mcpStatusFixture} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+  await waitFor(() => expect(openLogin).toHaveBeenCalledWith('fixture-login', 'in-app'));
+  expect(window.open).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Open in system browser' }));
+  await waitFor(() => expect(openLogin).toHaveBeenCalledWith('fixture-login', 'system'));
+  rerender(<McpAuthControls name="fixture" status={{ ...mcpStatusFixture, state: 'authenticating' }} />);
+  rerender(<McpAuthControls name="fixture" status={mcpStatusFixture} />);
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+});
+it('opens sign-in on the browser client device instead of the backend desktop', async () => {
+  const openLogin = vi.fn(async () => {});
+  installAppBridgeStub({ __isWebBridge: true, mcp: mcpApiFixture({ openLogin }) });
+  render(<McpAuthControls name="fixture" status={mcpStatusFixture} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+  await screen.findByRole('link', { name: 'Open sign-in page' });
+  expect(window.open).toHaveBeenCalledWith('https://auth.test/authorize', '_blank', 'noopener,noreferrer');
+  expect(openLogin).not.toHaveBeenCalled();
+});
 it('never opens a browser for background authentication notices and deduplicates updates', async () => {
   let notify!: (status: McpStatus[]) => void;
   installAppBridgeStub({

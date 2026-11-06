@@ -45,6 +45,7 @@ export interface McpApi {
   getStatus(): Promise<McpStatus[]>;
   onStatusChanged(callback: (status: McpStatus[]) => void): () => void;
   login(name: string): Promise<McpLogin>;
+  openLogin(loginId: string, browser?: 'in-app' | 'system'): Promise<void>;
   completeLogin(loginId: string, callbackUrl: string): Promise<void>;
   cancelLogin(name: string): Promise<void>;
   reconnect(name: string): Promise<void>;

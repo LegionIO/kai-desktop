@@ -4,7 +4,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IpcMain } from 'electron';
 import type { AppConfig } from '../../config/schema.js';
-const mocks = vi.hoisted(() => ({ broadcast: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), open: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  broadcast: vi.fn(),
+  connect: vi.fn(),
+  disconnect: vi.fn(),
+  open: vi.fn(),
+  inApp: vi.fn(),
+  close: vi.fn(),
+}));
+vi.mock('../../mcp/login-window.js', () => ({
+  McpLoginWindows: class {
+    open = mocks.inApp;
+    close = mocks.close;
+  },
+}));
 vi.mock('electron', () => ({
   safeStorage: { isEncryptionAvailable: () => false },
   shell: { openExternal: mocks.open },
@@ -76,4 +89,16 @@ it('rejects unknown reconnects and browser opening without an active attempt', a
   expect(() => invoke('mcp:open-login', 'a'.repeat(48))).toThrow('expired');
   expect(reconnect).not.toHaveBeenCalled();
   expect(mocks.open).not.toHaveBeenCalled();
+});
+it('uses the validated attempt for in-app sign-in and keeps the CLI/system fallback', async () => {
+  const id = 'a'.repeat(48);
+  vi.spyOn(service, 'authorizationUrl').mockReturnValue('https://auth.test/authorize');
+  mocks.open.mockResolvedValue(undefined);
+  await invoke('mcp:open-login', id, 'in-app');
+  expect(mocks.inApp).toHaveBeenCalledExactlyOnceWith(id);
+  expect(mocks.open).not.toHaveBeenCalled();
+  await invoke('mcp:open-login', id);
+  expect(mocks.open).toHaveBeenCalledExactlyOnceWith('https://auth.test/authorize');
+  expect(mocks.close).toHaveBeenCalledExactlyOnceWith(id);
+  expect(() => invoke('mcp:open-login', id, 'unknown')).toThrow();
 });
