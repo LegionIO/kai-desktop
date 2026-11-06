@@ -8,6 +8,7 @@ import { httpMock } from '../../../vitest.setup.js';
 import {
   fixtureEncryption,
   oauthCallback,
+  oauthDeferred,
   oauthHandlers,
   oauthMetadata,
   oauthServer,
@@ -17,13 +18,15 @@ import { McpCredentialStore } from '../credential-store.js';
 import { McpOAuthService, mcpCredentialKey } from '../oauth-service.js';
 
 let home: string, store: McpCredentialStore, service: McpOAuthService;
+let encryption: ReturnType<typeof fixtureEncryption>;
 const authorized = vi.fn(async () => {});
 beforeAll(() => httpMock.server.listen({ onUnhandledRequest: 'error' }));
 afterAll(() => httpMock.server.close());
 beforeEach(() => {
   Object.defineProperty(globalThis.crypto, 'subtle', { value: webcrypto.subtle, configurable: true });
   home = mkdtempSync(join(tmpdir(), 'kai-oauth-test-'));
-  store = new McpCredentialStore(home, fixtureEncryption());
+  encryption = fixtureEncryption();
+  store = new McpCredentialStore(home, encryption);
   service = new McpOAuthService(store, { onAuthorized: authorized, metadataUrl: 'https://kai.test/oauth/client.json' });
   service.configure([oauthServer]);
   authorized.mockClear();
@@ -72,16 +75,60 @@ describe('registration, discovery and local callback', () => {
       'expired or was already completed',
     );
   });
-  it('uses DCR when CIMD is unavailable and reuses the registered redirect port', async () => {
-    httpMock.use(...oauthHandlers({ ...oauthMetadata, client_id_metadata_document_supported: false }));
-    const first = await signIn();
-    httpMock.expectHit('/register');
-    await service.logout('fixture');
-    const second = await service.login('fixture');
-    expect(new URL(second.authorizationUrl).searchParams.get('client_id')).toBe('dcr-client');
-    expect(new URL(second.authorizationUrl).searchParams.get('redirect_uri')).toBe(
-      new URL(first.authorizationUrl).searchParams.get('redirect_uri'),
+  it.each(['dcr-client', 'https://auth.test/clients/fixture'])(
+    'reuses the exact registered redirect for DCR client %s',
+    async (clientId) => {
+      httpMock.use(...oauthHandlers({ ...oauthMetadata, client_id_metadata_document_supported: false }, clientId));
+      const first = await signIn();
+      httpMock.expectHit('/register');
+      await service.logout('fixture');
+      const second = await service.login('fixture');
+      expect(new URL(second.authorizationUrl).searchParams.get('client_id')).toBe(clientId);
+      expect(new URL(second.authorizationUrl).searchParams.get('redirect_uri')).toBe(
+        new URL(first.authorizationUrl).searchParams.get('redirect_uri'),
+      );
+    },
+  );
+  it('invalidates the prior issuer credentials durably before signing in with another issuer', async () => {
+    const configured = { ...oauthServer, oauth: { clientId: 'registered' } };
+    service.configure([configured]);
+    service.setClientSecret('fixture', 'original-issuer-secret');
+    await signIn();
+    vi.spyOn(encryption, 'encryptString').mockImplementation(() => {
+      throw new Error('Keychain unavailable');
+    });
+    let authorization: string | null = null;
+    let body = '';
+    httpMock.use(
+      http.get('https://mcp.test/.well-known/oauth-protected-resource/mcp', () =>
+        HttpResponse.json({
+          resource: oauthServer.url,
+          authorization_servers: ['https://other-auth.test'],
+        }),
+      ),
+      http.get('https://other-auth.test/.well-known/oauth-authorization-server', () =>
+        HttpResponse.json({
+          ...oauthMetadata,
+          issuer: 'https://other-auth.test',
+          authorization_endpoint: 'https://other-auth.test/authorize',
+          token_endpoint: 'https://other-auth.test/token',
+        }),
+      ),
+      http.post('https://other-auth.test/token', async ({ request }) => {
+        authorization = request.headers.get('authorization');
+        body = await request.text();
+        return HttpResponse.json({ ...oauthTokens, access_token: 'other-issuer-access' });
+      }),
     );
+    const flow = await service.login('fixture');
+    expect(service.status('fixture').hasClientSecret).toBe(false);
+    expect(store.get(mcpCredentialKey(configured)).tokens).toBeUndefined();
+    await service.completeLogin(flow.loginId, oauthCallback(flow, { iss: 'https://other-auth.test' }));
+    expect(authorization).toBeNull();
+    expect(body).not.toContain('original-issuer-secret');
+    expect(service.status('fixture').storage).toBe('session');
+    expect(store.get(mcpCredentialKey(configured)).tokens?.access_token).toBe('other-issuer-access');
+    expect(new McpCredentialStore(home, fixtureEncryption()).get(mcpCredentialKey(configured))).toEqual({});
   });
   it.each([false, true])('prefers pre-registered clients (confidential=%s)', async (confidential) => {
     service.configure([{ ...oauthServer, oauth: { clientId: 'registered' } }]);
@@ -173,6 +220,104 @@ describe('registration, discovery and local callback', () => {
 });
 
 describe('refresh and recovery', () => {
+  it.each(['success', 'invalid_grant'])('does not let a stale refresh %s overwrite a new login', async (result) => {
+    await signIn();
+    expire();
+    const started = oauthDeferred(),
+      release = oauthDeferred();
+    const fresh = { ...oauthTokens, access_token: 'new-login-access', refresh_token: 'new-login-refresh' };
+    httpMock.use(
+      http.post('https://auth.test/token', async ({ request }) => {
+        const body = new URLSearchParams(await request.text());
+        if (body.get('grant_type') === 'authorization_code') return HttpResponse.json(fresh);
+        started.resolve();
+        await release.promise;
+        return result === 'success'
+          ? HttpResponse.json({ ...oauthTokens, access_token: 'stale-refresh-access' })
+          : HttpResponse.json({ error: 'invalid_grant' }, { status: 400 });
+      }),
+    );
+    const pending = service.authenticatedFetch(oauthServer)(oauthServer.url!);
+    const rejected = expect(pending).rejects.toThrow('login changed');
+    try {
+      await started.promise;
+      await signIn();
+    } finally {
+      release.resolve();
+    }
+    await rejected;
+    expect(store.get(mcpCredentialKey(oauthServer)).tokens).toEqual(fresh);
+    expect(new McpCredentialStore(home, fixtureEncryption()).get(mcpCredentialKey(oauthServer)).tokens).toEqual(fresh);
+    expect(service.status('fixture').state).toBe('authorized');
+  });
+  it('does not let a late 401 replace an active sign-in status', async () => {
+    await signIn();
+    const started = oauthDeferred(),
+      release = oauthDeferred();
+    httpMock.use(
+      http.all(oauthServer.url!, async () => {
+        started.resolve();
+        await release.promise;
+        return new HttpResponse(null, { status: 401 });
+      }),
+    );
+    const pending = service.authenticatedFetch(oauthServer)(oauthServer.url!);
+    const rejected = expect(pending).rejects.toThrow('login changed');
+    await started.promise;
+    const flow = await service.login('fixture');
+    release.resolve();
+    await rejected;
+    expect(service.status('fixture').state).toBe('authenticating');
+    await service.completeLogin(flow.loginId, oauthCallback(flow));
+    expect(service.status('fixture').state).toBe('authorized');
+  });
+  it('coalesces refresh only within the current login generation', async () => {
+    await signIn();
+    expire();
+    const oldStarted = oauthDeferred(),
+      releaseOld = oauthDeferred(),
+      releaseNew = oauthDeferred();
+    let refreshes = 0;
+    httpMock.use(
+      http.post('https://auth.test/token', async ({ request }) => {
+        const body = new URLSearchParams(await request.text());
+        if (body.get('grant_type') === 'authorization_code')
+          return HttpResponse.json({
+            ...oauthTokens,
+            access_token: 'new-login-access',
+            refresh_token: 'new-login-refresh',
+          });
+        refreshes++;
+        if (body.get('refresh_token') === oauthTokens.refresh_token) {
+          oldStarted.resolve();
+          await releaseOld.promise;
+          return HttpResponse.json(oauthTokens);
+        }
+        await releaseNew.promise;
+        return HttpResponse.json({ ...oauthTokens, access_token: 'current-access', refresh_token: 'current-refresh' });
+      }),
+    );
+    const fetch = service.authenticatedFetch(oauthServer);
+    const oldRejected = expect(fetch(oauthServer.url!)).rejects.toThrow('login changed');
+    try {
+      await oldStarted.promise;
+      await signIn();
+      expire();
+      const current = fetch(oauthServer.url!);
+      await vi.waitFor(() => expect(refreshes).toBe(2));
+      releaseOld.resolve();
+      await oldRejected;
+      const coalesced = fetch(oauthServer.url!);
+      releaseNew.resolve();
+      expect((await current).status).toBe(200);
+      expect((await coalesced).status).toBe(200);
+      expect(refreshes).toBe(2);
+      expect(store.get(mcpCredentialKey(oauthServer)).tokens?.refresh_token).toBe('current-refresh');
+    } finally {
+      releaseOld.resolve();
+      releaseNew.resolve();
+    }
+  });
   it('serializes concurrent refresh and persists rotated tokens across restart', async () => {
     await signIn();
     expire();

@@ -51,6 +51,19 @@ it('tests a saved server with its credential identity despite its temporary conn
   expect(mocks.connect.mock.calls[0][1]).toEqual(config.mcpServers[0]);
   expect(mocks.open).not.toHaveBeenCalled();
 });
+it('isolates simultaneous connection tests even when they start in the same millisecond', async () => {
+  await Promise.all([
+    invoke('mcp:test-connection', config.mcpServers[0]),
+    invoke('mcp:test-connection', config.mcpServers[0]),
+  ]);
+  const names = mocks.connect.mock.calls.map(([server]) => server.name);
+  expect(new Set(names).size).toBe(2);
+  expect(mocks.connect.mock.calls.map(([, credential]) => credential)).toEqual([
+    config.mcpServers[0],
+    config.mcpServers[0],
+  ]);
+  expect(mocks.disconnect.mock.calls.map(([name]) => name).sort()).toEqual(names.sort());
+});
 it('does not report saved authorization for an unsaved configuration', async () => {
   service.store.set(mcpCredentialKey(config.mcpServers[0]), { tokens: oauthTokens });
   const result = (await invoke('mcp:test-connection', { ...oauthServer, oauth: { clientId: 'other' } })) as {

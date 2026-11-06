@@ -81,7 +81,7 @@ export function registerMcpHandlers(
       return { status: 'error' as const, toolCount: 0, error: 'Invalid server payload' };
     }
     // Use a temporary name so we don't pollute the real connection pool
-    const testName = `__test__${server.name}__${Date.now()}`;
+    const testName = `__test__${server.name}__${crypto.randomUUID()}`;
     // Bound the whole test: connectMcpServer's connect() handshake has no
     // timeout, so a hung stdio/url server would otherwise pin this handler (and
     // keep the spawned test process alive) forever. Race a deadline; the finally

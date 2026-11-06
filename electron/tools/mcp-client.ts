@@ -182,7 +182,7 @@ async function connectMcpServerInner(
   epoch: number,
 ): Promise<McpConnection> {
   const existing = connections.get(server.name);
-  if (existing && existing.status === 'connected') return existing;
+  if (existing?.status === 'connected' && existing.fingerprint === serverFingerprint(server)) return existing;
 
   // Hoisted so the catch can tear down a client/transport that connected before
   // a later step (listTools / tool conversion) threw — otherwise a stdio child
@@ -191,6 +191,16 @@ async function connectMcpServerInner(
   let transport: Transport | null = null;
 
   try {
+    if (existing) {
+      connections.delete(server.name);
+      try {
+        await existing.client?.close();
+      } catch {
+        /* The failed connection must still be replaced. */
+      }
+    }
+    if (connectionEpochs.get(server.name) !== epoch)
+      throw new McpOAuthError('MCP connection was cancelled. Reconnect to try again.');
     client = new Client({ name: __BRAND_MCP_CLIENT_NAME, version: '1.0.0' });
 
     if (server.url && !server.command) {
@@ -330,6 +340,9 @@ export async function disconnectMcpServer(name: string): Promise<void> {
   connectionEpochs.set(name, (connectionEpochs.get(name) ?? 0) + 1);
   pendingConnections.delete(name);
   const conn = connections.get(name);
+  // Stop handing out a closing client before awaiting transport teardown.
+  connections.delete(name);
+  statusChanged?.();
   if (conn?.client) {
     try {
       await conn.client.close();
@@ -337,8 +350,6 @@ export async function disconnectMcpServer(name: string): Promise<void> {
       /* ignore */
     }
   }
-  if (connections.get(name) === conn) connections.delete(name);
-  statusChanged?.();
 }
 
 /** Close every MCP connection in the pool. Called from app-quit teardown so
@@ -346,7 +357,7 @@ export async function disconnectMcpServer(name: string): Promise<void> {
  *  NOT killed automatically when its parent Electron process exits). */
 export async function disconnectAllMcpServers(): Promise<void> {
   oauthService?.dispose();
-  const names = Array.from(connections.keys());
+  const names = [...new Set([...connections.keys(), ...pendingConnections.keys()])];
   await Promise.allSettled(names.map((name) => disconnectMcpServer(name)));
 }
 

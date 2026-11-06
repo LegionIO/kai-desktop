@@ -85,7 +85,7 @@ export class McpOAuthService {
   private attempts = new Map<string, Attempt>();
   private starting = new Map<string, Promise<McpLogin>>();
   private preparing = new Map<string, AbortController>();
-  private refreshing = new Map<string, Promise<OAuthTokens>>();
+  private refreshing = new Map<string, { epoch: number; promise: Promise<OAuthTokens> }>();
   private epochs = new Map<string, number>();
   private readonly fetchFn: FetchLike;
 
@@ -285,7 +285,9 @@ export class McpOAuthService {
   private async startLogin(name: string): Promise<McpLogin> {
     const cfg = this.server(name);
     const key = mcpCredentialKey(cfg),
-      epoch = this.epochs.get(name) ?? 0;
+      epoch = (this.epochs.get(name) ?? 0) + 1;
+    // Explicit login supersedes requests and refreshes from the previous session.
+    this.epochs.set(name, epoch);
     const abort = new AbortController();
     this.preparing.set(name, abort);
     let listener: Server | undefined;
@@ -293,7 +295,14 @@ export class McpOAuthService {
     try {
       const info = await this.discover(cfg, abort.signal);
       const resource = this.resource(cfg, info);
-      const old = this.store.get(key);
+      this.assertCurrent(name, key, epoch);
+      let old = this.store.get(key);
+      if (old.discovery && old.discovery.authorizationServerUrl !== info.authorizationServerUrl) {
+        // A changed issuer must never inherit tokens, registration, or a client
+        // secret. Keep this invalidation durable even during a keychain outage.
+        this.store.invalidate(key);
+        old = {};
+      }
       const metadata = info.authorizationServerMetadata! as ExtendedMetadata;
       // Registration is issuer-specific, even when the MCP URL is unchanged.
       let client = old.discovery?.authorizationServerUrl === info.authorizationServerUrl ? old.client : undefined;
@@ -327,7 +336,7 @@ export class McpOAuthService {
       await new Promise<void>((resolve, reject) => {
         listener!.once('error', reject);
         const priorPort =
-          old.redirectUri && client && !client.client_id.startsWith('https:') && !cfg.oauth?.clientId
+          old.redirectUri && client && 'redirect_uris' in client && !cfg.oauth?.clientId
             ? Number(new URL(old.redirectUri).port)
             : 0;
         listener!.listen(cfg.oauth?.callbackPort ?? priorPort, host === 'localhost' ? 'localhost' : '127.0.0.1', () =>
@@ -523,11 +532,11 @@ export class McpOAuthService {
 
   private refresh(name: string, rejectedToken?: string): Promise<OAuthTokens> {
     const cfg = this.server(name),
-      key = mcpCredentialKey(cfg);
-    const pending = this.refreshing.get(key);
-    if (pending) return pending;
-    const old = this.store.get(key),
+      key = mcpCredentialKey(cfg),
       epoch = this.epochs.get(name) ?? 0;
+    const pending = this.refreshing.get(key);
+    if (pending?.epoch === epoch) return pending.promise;
+    const old = this.store.get(key);
     if (rejectedToken && old.tokens && old.tokens.access_token !== rejectedToken) return Promise.resolve(old.tokens);
     if (!old.tokens?.refresh_token || !old.client || !old.discovery)
       return Promise.reject(this.requireLogin(name, 'expired'));
@@ -563,9 +572,9 @@ export class McpOAuthService {
           : new McpOAuthError('OAuth refresh is temporarily unavailable. Try again; your credentials were kept.');
       }
     })().finally(() => {
-      this.refreshing.delete(key);
+      if (this.refreshing.get(key)?.promise === run) this.refreshing.delete(key);
     });
-    this.refreshing.set(key, run);
+    this.refreshing.set(key, { epoch, promise: run });
     return run;
   }
 

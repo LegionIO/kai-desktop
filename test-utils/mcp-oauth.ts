@@ -25,7 +25,7 @@ export const oauthTokens = {
   expires_in: 100,
   scope: 'read',
 };
-export function oauthHandlers(metadata: Record<string, unknown> = oauthMetadata) {
+export function oauthHandlers(metadata: Record<string, unknown> = oauthMetadata, clientId = 'dcr-client') {
   return [
     http.get('https://mcp.test/.well-known/oauth-protected-resource/mcp', () =>
       HttpResponse.json({
@@ -36,12 +36,20 @@ export function oauthHandlers(metadata: Record<string, unknown> = oauthMetadata)
     ),
     http.get('https://auth.test/.well-known/oauth-authorization-server', () => HttpResponse.json(metadata)),
     http.post('https://auth.test/register', async ({ request }) =>
-      HttpResponse.json({ ...((await request.json()) as object), client_id: 'dcr-client' }),
+      HttpResponse.json({ ...((await request.json()) as object), client_id: clientId }),
     ),
     http.post('https://auth.test/token', () => HttpResponse.json(oauthTokens)),
     http.post('https://auth.test/revoke', () => new HttpResponse(null, { status: 200 })),
     http.all('https://mcp.test/mcp', () => new HttpResponse('ok')),
   ];
+}
+
+export function oauthDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 export function oauthCallback(flow: McpLogin, values: Record<string, string | null> = {}) {
   const auth = new URL(flow.authorizationUrl);

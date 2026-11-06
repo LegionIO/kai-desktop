@@ -49,9 +49,9 @@ If the browser runs on a different device, the loopback callback may show a conn
 
 Credentials are stored separately from configuration in `mcp/credentials.enc` under Kai's application home. Electron's OS-backed secure storage encrypts tokens and registration credentials. The directory and atomic file writes are private. If secure storage cannot be used, Kai reports session-only storage and preserves any existing unreadable vault; unlocking the OS keychain and restarting restores access to persistent credentials.
 
-Credential identity includes the saved server name, endpoint, and OAuth settings; registration is additionally checked against the issuer. Changing identity invalidates affected credentials. Connection tests use the same identity for saved configurations. Save an unsaved configuration before signing in.
+Credential identity includes the saved server name, endpoint, and OAuth settings. Changing identity or the discovered authorization server invalidates its tokens, registration, and client secret, including during a keychain outage. Enter a client secret again if the new authorization server requires one. Connection tests use the same identity for saved configurations. Save an unsaved configuration before signing in.
 
-A definite HTTP 401 permits one coordinated refresh and one retry. Timeouts, connection loss, and ordinary server errors are not replayed. Transient refresh failures preserve credentials. Sign out clears local tokens and attempts revocation when advertised; the UI explicitly distinguishes local sign-out from confirmed server revocation.
+A definite HTTP 401 permits one coordinated refresh and one retry. Timeouts, connection loss, and ordinary server errors are not replayed. Transient refresh failures preserve credentials. Starting a new sign-in supersedes pending refreshes and requests so delayed responses cannot replace the new authorization. Sign out clears local tokens and attempts revocation when advertised; the UI explicitly distinguishes local sign-out from confirmed server revocation.
 
 ## Deployment and validation
 

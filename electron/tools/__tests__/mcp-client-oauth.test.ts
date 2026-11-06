@@ -54,7 +54,7 @@ import {
   getMcpStatus,
   setMcpOAuthService,
 } from '../mcp-client.js';
-import { fixtureEncryption, oauthServer } from '../../../test-utils/mcp-oauth.js';
+import { fixtureEncryption, oauthDeferred, oauthServer } from '../../../test-utils/mcp-oauth.js';
 let service: McpOAuthService;
 beforeEach(() => {
   vi.clearAllMocks();
@@ -104,6 +104,54 @@ it('does not resurrect a connection when disconnected during discovery', async (
   await vi.waitFor(() => expect(resolve).toBeTypeOf('function'));
   await disconnectMcpServer(oauthServer.name);
   resolve({ tools: [] });
+  await pending;
+  expect(getMcpStatus()).toEqual([]);
+  expect(mocks.close).toHaveBeenCalled();
+});
+it('closes a disconnected client before replacing it', async () => {
+  const first = await connectMcpServer(oauthServer);
+  first.transport.onerror?.(new Error('Connection lost'));
+  expect(first.status).toBe('disconnected');
+  const second = await connectMcpServer(oauthServer);
+  expect(second.status).toBe('connected');
+  expect(second.client).not.toBe(first.client);
+  expect(mocks.close).toHaveBeenCalledTimes(1);
+  expect(mocks.close.mock.invocationCallOrder[0]).toBeLessThan(mocks.connect.mock.invocationCallOrder[1]);
+});
+it('replaces a connected client when the endpoint changes', async () => {
+  const first = await connectMcpServer(oauthServer);
+  const replacement = { ...oauthServer, url: 'https://mcp.test/other' };
+  const second = await connectMcpServer(replacement);
+  expect(second.client).not.toBe(first.client);
+  expect(mocks.close).toHaveBeenCalledTimes(1);
+  expect(mocks.http.mock.calls[1][0].href).toBe(replacement.url);
+});
+it('does not reuse or remove a client that reconnects while its predecessor is closing', async () => {
+  const first = await connectMcpServer(oauthServer);
+  const closing = oauthDeferred();
+  mocks.close.mockReturnValueOnce(closing.promise);
+  const disconnecting = disconnectMcpServer(oauthServer.name);
+  try {
+    const second = await connectMcpServer(oauthServer);
+    expect(second.client).not.toBe(first.client);
+    closing.resolve();
+    await disconnecting;
+    expect(getMcpStatus()).toEqual([{ name: 'fixture', status: 'connected', toolCount: 1, error: undefined }]);
+  } finally {
+    closing.resolve();
+  }
+});
+it('does not resurrect a pending connection after shutdown', async () => {
+  const discovering = oauthDeferred(),
+    tools = oauthDeferred<{ tools: [] }>();
+  mocks.listTools.mockImplementationOnce(() => {
+    discovering.resolve();
+    return tools.promise;
+  });
+  const pending = connectMcpServer(oauthServer);
+  await discovering.promise;
+  await disconnectAllMcpServers();
+  tools.resolve({ tools: [] });
   await pending;
   expect(getMcpStatus()).toEqual([]);
   expect(mocks.close).toHaveBeenCalled();
