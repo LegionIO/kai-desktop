@@ -1,3 +1,4 @@
+import { parseMcpCommand, runMcpCommand } from './mcp-auth.js';
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
@@ -38,6 +39,7 @@ export async function runCliClient(): Promise<void> {
     process.exit(0);
   }
 
+  const mcpCommand = parseMcpCommand(process.argv.slice(2));
   const socketPath = getSocketPath();
   const token = getBridgeToken();
   // In the interactive Ink REPL the banner UI draws immediately, so transient
@@ -85,6 +87,15 @@ export async function runCliClient(): Promise<void> {
 
   // `--list-models|--list-profiles|--list-runtimes`: print the list then exit
   // (no turn, no REPL). Requires a connected backend (done above).
+  if (mcpCommand) {
+    try {
+      await runMcpCommand(activeClient, mcpCommand);
+    } finally {
+      activeClient.close();
+    }
+    process.exit(0);
+  }
+
   if (list) {
     await listResources(activeClient, list);
     activeClient.close();

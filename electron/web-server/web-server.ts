@@ -1,3 +1,4 @@
+import { getAppHome } from '../local-bridge/paths.js';
 import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
@@ -81,7 +82,7 @@ const PRE_READ_TIMEOUT_MS = 10_000;
 
 /* ── File-backed session store ─────────────────────────────────────── */
 
-const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
+const SESSIONS_DIR = join(getAppHome(), 'data');
 const SESSIONS_PATH = join(SESSIONS_DIR, 'web-sessions.json');
 
 /** token -> expiry epoch ms. Map (not plain object) so prototype keys like '__proto__' can't poison lookups. */
@@ -492,7 +493,15 @@ export function getBridgeScript(): string {
       testEmbedding: function() { return invoke('memory:test-embedding'); }
     },
     mcp: {
-      testConnection: function(server) { return invoke('mcp:test-connection', server); }
+      testConnection: function(server) { return invoke('mcp:test-connection', server); },
+      getStatus: function() { return invoke('mcp:status'); },
+      onStatusChanged: function(cb) { return on('mcp:status-changed', cb); },
+      login: function(name) { return invoke('mcp:login', name); },
+      completeLogin: function(id, url) { return invoke('mcp:complete-login', id, url); },
+      cancelLogin: function(name) { return invoke('mcp:cancel-login', name); },
+      reconnect: function(name) { return invoke('mcp:reconnect', name); },
+      logout: function(name) { return invoke('mcp:logout', name); },
+      setClientSecret: function(name, secret) { return invoke('mcp:set-client-secret', name, secret); }
     },
     cliTools: {
       checkBinaries: function(names) { return invoke('cli-tools:check-binaries', names); }

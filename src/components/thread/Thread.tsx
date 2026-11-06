@@ -1,3 +1,4 @@
+import { McpAuthNotice } from '@/components/mcp/McpAuthControls';
 import {
   useState,
   useEffect,
@@ -232,6 +233,7 @@ export const Thread: FC<{
         />
         <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
         <RuntimeNoticeBanner />
+        <McpAuthNotice />
         <FallbackBanner />
         <ComputerUseFallbackBanner />
         {mode === 'chat' ? (
@@ -881,13 +883,17 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
         })();
         if (totalSize !== null && totalSize > TEXT_PREVIEW_MAX_BYTES * 1.4) {
           if (!cancelled)
-            setFetchedText(`(${filename} is too large to preview inline — ${(totalSize / 1024 / 1024).toFixed(1)} MB.)`);
+            setFetchedText(
+              `(${filename} is too large to preview inline — ${(totalSize / 1024 / 1024).toFixed(1)} MB.)`,
+            );
           return;
         }
         const blob = await resp.blob();
         if (blob.size > TEXT_PREVIEW_MAX_BYTES * 1.4) {
           if (!cancelled)
-            setFetchedText(`(${filename} is too large to preview inline — ${(blob.size / 1024 / 1024).toFixed(1)} MB.)`);
+            setFetchedText(
+              `(${filename} is too large to preview inline — ${(blob.size / 1024 / 1024).toFixed(1)} MB.)`,
+            );
           return;
         }
         let decoded = await blob.text();
@@ -1054,12 +1060,7 @@ const FilePreviewModal: FC<{
           // sandbox with NO allow-scripts: the native PDF viewer still renders, but a
           // file whose real bytes are script-bearing (e.g. an SVG mislabeled PDF, or a
           // MIME/extension mismatch) cannot execute in this same-origin-served frame.
-          <iframe
-            src={src}
-            sandbox=""
-            className="w-[80vw] h-[85vh] rounded-lg bg-white"
-            title="PDF preview"
-          />
+          <iframe src={src} sandbox="" className="w-[80vw] h-[85vh] rounded-lg bg-white" title="PDF preview" />
         ) : (
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />
         )}

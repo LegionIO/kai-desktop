@@ -83,7 +83,7 @@ import { buildCliTools } from './tools/cli-tools.js';
 import { retryPendingSubAgentResumes } from './tools/sub-agent.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
-import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
+import { rebuildMcpTools, disconnectMcpServer, disconnectAllMcpServers } from './tools/mcp-client.js';
 import { loadSkillsAsTools, resolveSkillsDir, skillsDirectoryFingerprint } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerPlatformHandlers } from './ipc/platform.js';
@@ -1883,6 +1883,7 @@ if (gotSingleInstanceLock) {
     const fingerprintConfig = (cfg: AppConfig): Record<string, string> =>
       Object.fromEntries((Object.keys(cfg) as Array<keyof AppConfig>).map((k) => [k, JSON.stringify(cfg[k]) ?? '']));
     let lastConfigFingerprints = fingerprintConfig(getConfig());
+    let mcpOAuth: ReturnType<typeof registerMcpHandlers> | undefined;
     let lastMcpFingerprint = JSON.stringify(getConfig().mcpServers ?? []);
     let lastSkillsFingerprint = JSON.stringify({
       enabled: getConfig().skills?.enabled ?? [],
@@ -1962,6 +1963,7 @@ if (gotSingleInstanceLock) {
       const newMcpFp = JSON.stringify(config.mcpServers ?? []);
       if (newMcpFp !== lastMcpFingerprint) {
         lastMcpFingerprint = newMcpFp;
+        mcpOAuth?.configure(config.mcpServers);
         console.info(`[${__BRAND_PRODUCT_NAME}] MCP servers changed, rebuilding...`);
         rebuildMcpTools(config.mcpServers ?? [])
           .then((mcpTools) => {
@@ -2213,7 +2215,12 @@ if (gotSingleInstanceLock) {
     });
     // Late-joining / reloaded clients sync their initial compacting set via this query.
     ipcMain.handle('conversations:compacting-ids', () => compactingConversationIds());
-    registerMcpHandlers(ipcMain);
+    mcpOAuth = registerMcpHandlers(ipcMain, APP_HOME, getConfig, async (name) => {
+      await disconnectMcpServer(name);
+      const tools = await rebuildMcpTools(getConfig().mcpServers);
+      updateMcpTools(tools);
+      syncRealtimeTools();
+    });
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerPlatformHandlers(ipcMain, () => primaryWindowRef);

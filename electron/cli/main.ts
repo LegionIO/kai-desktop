@@ -1,3 +1,4 @@
+import { parseMcpCommand, runMcpCommand } from './mcp-auth.js';
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
@@ -27,6 +28,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  const mcpCommand = parseMcpCommand(process.argv.slice(2));
   const socketPath = getSocketPath();
   const token = getBridgeToken();
   // Interactive REPL only when we have a real terminal AND no one-shot flag. In
@@ -64,6 +66,15 @@ async function main(): Promise<void> {
 
   const mismatch = checkVersionMismatch(activeClient);
   if (mismatch) cliLog(mismatch);
+
+  if (mcpCommand) {
+    try {
+      await runMcpCommand(activeClient, mcpCommand);
+    } finally {
+      activeClient.close();
+    }
+    process.exit(0);
+  }
 
   if (list) {
     await listResources(activeClient, list);

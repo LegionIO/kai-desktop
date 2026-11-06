@@ -1,3 +1,4 @@
+import type { McpApi, McpServerConfig, McpStatus, McpLogin, McpLogout, McpTestResult } from '../shared/mcp.js';
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface } from '../shared/computer-use.js';
 import type { AppShotPayload } from '../shared/app-shots.js';
@@ -361,19 +362,24 @@ const appAPI = {
   },
 
   mcp: {
-    testConnection: (server: {
-      name: string;
-      url?: string;
-      command?: string;
-      args?: string[];
-      env?: Record<string, string>;
-    }) =>
-      ipcRenderer.invoke('mcp:test-connection', server) as Promise<{
-        status: string;
-        toolCount: number;
-        error?: string;
-      }>,
-  },
+    testConnection: (server: McpServerConfig) =>
+      ipcRenderer.invoke('mcp:test-connection', server) as Promise<McpTestResult>,
+    getStatus: () => ipcRenderer.invoke('mcp:status') as Promise<McpStatus[]>,
+    onStatusChanged: (callback: (status: McpStatus[]) => void) => {
+      const handler = (_event: unknown, status: McpStatus[]) => callback(status);
+      ipcRenderer.on('mcp:status-changed', handler);
+      return () => {
+        ipcRenderer.removeListener('mcp:status-changed', handler);
+      };
+    },
+    login: (name: string) => ipcRenderer.invoke('mcp:login', name) as Promise<McpLogin>,
+    completeLogin: (id: string, url: string) => ipcRenderer.invoke('mcp:complete-login', id, url) as Promise<void>,
+    cancelLogin: (name: string) => ipcRenderer.invoke('mcp:cancel-login', name) as Promise<void>,
+    reconnect: (name: string) => ipcRenderer.invoke('mcp:reconnect', name) as Promise<void>,
+    logout: (name: string) => ipcRenderer.invoke('mcp:logout', name) as Promise<McpLogout>,
+    setClientSecret: (name: string, secret: string | null) =>
+      ipcRenderer.invoke('mcp:set-client-secret', name, secret) as Promise<void>,
+  } satisfies McpApi,
 
   cliTools: {
     checkBinaries: (binaryNames: string[]) =>

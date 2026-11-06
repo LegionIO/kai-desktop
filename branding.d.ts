@@ -24,6 +24,7 @@ declare const __BRAND_SIDEBAR_SECTION_TASKS: string;
 // ── Protocol & machine IDs ────────────────────────────────────────────────
 declare const __BRAND_MEDIA_PROTOCOL: string;
 declare const __BRAND_MCP_CLIENT_NAME: string;
+declare const __BRAND_MCP_CLIENT_METADATA_URL: string;
 declare const __BRAND_USER_AGENT: string;
 declare const __BRAND_AGENT_ID: string;
 declare const __BRAND_RESOURCE_ID: string;
