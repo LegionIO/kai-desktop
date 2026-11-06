@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 const mocks = vi.hoisted(() => ({
   connect: vi.fn(),
   listTools: vi.fn(),
@@ -55,6 +56,7 @@ import {
   setMcpOAuthService,
 } from '../mcp-client.js';
 import { fixtureEncryption, oauthDeferred, oauthServer } from '../../../test-utils/mcp-oauth.js';
+import { mcpChatTool } from '../../../test-utils/mcp-schema.js';
 let service: McpOAuthService;
 beforeEach(() => {
   vi.clearAllMocks();
@@ -161,4 +163,70 @@ it('coalesces simultaneous connects and leaves stdio unauthenticated', async () 
   await Promise.all([connectMcpServer(server), connectMcpServer(server)]);
   expect(mocks.stdio).toHaveBeenCalledTimes(1);
   expect(mocks.http).not.toHaveBeenCalled();
+});
+
+it.each([
+  { label: 'plain text', content: 'Hello' },
+  { label: 'content parts', content: [{ type: 'text', text: 'Hello' }] },
+])('validates and executes a discovered chat tool with $label', async ({ content }) => {
+  mocks.listTools.mockResolvedValueOnce({ tools: [mcpChatTool()] });
+  const conn = await connectMcpServer(oauthServer);
+  const args = { messages: [{ role: 'user', content }] };
+  const parsed = conn.tools[0].inputSchema.parse(args);
+  expect(parsed).toEqual(args);
+  expect(await conn.tools[0].execute(parsed, { toolCallId: 'chat-fixture' })).toBe('ok');
+  expect(mocks.calls[0].mock.calls[0][0]).toEqual({ name: 'chat', arguments: args });
+});
+
+it('rejects chat content outside the advertised alternatives', async () => {
+  mocks.listTools.mockResolvedValueOnce({ tools: [mcpChatTool()] });
+  const conn = await connectMcpServer(oauthServer);
+  for (const content of [42, null, { text: 'Hello' }, ['Hello']]) {
+    expect(conn.tools[0].inputSchema.safeParse({ messages: [{ role: 'user', content }] }).success).toBe(false);
+  }
+  expect(mocks.calls[0]).not.toHaveBeenCalled();
+});
+
+it('keeps chat alternatives in the schema exposed to model runtimes', async () => {
+  mocks.listTools.mockResolvedValueOnce({ tools: [mcpChatTool()] });
+  const conn = await connectMcpServer(oauthServer);
+  expect(z.toJSONSchema(conn.tools[0].inputSchema)).toMatchObject({
+    properties: {
+      messages: {
+        items: {
+          properties: {
+            content: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'object' } }] },
+          },
+        },
+      },
+    },
+  });
+});
+
+it.each([
+  { keyword: 'oneOf', integerAccepted: false },
+  { keyword: 'anyOf', integerAccepted: true },
+])('preserves $keyword semantics when alternatives overlap', async ({ keyword, integerAccepted }) => {
+  mocks.listTools.mockResolvedValueOnce({
+    tools: [mcpChatTool({ [keyword]: [{ type: 'number' }, { type: 'integer' }] })],
+  });
+  const conn = await connectMcpServer(oauthServer);
+  const accepts = (content: unknown) =>
+    conn.tools[0].inputSchema.safeParse({ messages: [{ role: 'user', content }] }).success;
+  expect(accepts(1.5)).toBe(true);
+  expect(accepts(1)).toBe(integerAccepted);
+  expect(accepts('1')).toBe(false);
+});
+
+it('preserves base constraints alongside alternatives', async () => {
+  mocks.listTools.mockResolvedValueOnce({
+    tools: [mcpChatTool({ type: 'string', minLength: 3, anyOf: [{ enum: ['ok', 'ready'] }, { enum: ['pending'] }] })],
+  });
+  const conn = await connectMcpServer(oauthServer);
+  const accepts = (content: string) =>
+    conn.tools[0].inputSchema.safeParse({ messages: [{ role: 'user', content }] }).success;
+  expect(accepts('ready')).toBe(true);
+  expect(accepts('pending')).toBe(true);
+  expect(accepts('ok')).toBe(false);
+  expect(accepts('unknown')).toBe(false);
 });

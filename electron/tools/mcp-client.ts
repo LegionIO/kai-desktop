@@ -67,6 +67,10 @@ export function setMcpOAuthService(service: McpOAuthService, onChanged: () => vo
 function jsonSchemaToZod(schema: Record<string, unknown>): Z.ZodTypeAny {
   if (!schema || typeof schema !== 'object') return z.object({}).passthrough();
 
+  // Preserve alternatives in both validation and the schema sent to models.
+  // Zod's JSON Schema reader retains oneOf exclusivity and sibling constraints.
+  if (Array.isArray(schema.oneOf) || Array.isArray(schema.anyOf)) return z.fromJSONSchema(schema);
+
   const type = schema.type as string | undefined;
 
   if (type === 'string') {
