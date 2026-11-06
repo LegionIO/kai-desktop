@@ -215,6 +215,19 @@ jobs:
           stable_path="dist/${stable_name}"
           mv "$artifact_path" "$stable_path"
 
+          # Keep every installer URL in the update feed aligned with the
+          # stable-named asset that will be attached to the GitHub release.
+          ORIGINAL_DMG="$name" STABLE_DMG="$stable_name" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import YAML from 'yaml';
+          const manifest = YAML.parse(fs.readFileSync('dist/latest-mac.yml', 'utf8'));
+          for (const file of manifest.files ?? []) {
+            if (file.url === process.env.ORIGINAL_DMG) file.url = process.env.STABLE_DMG;
+          }
+          if (manifest.path === process.env.ORIGINAL_DMG) manifest.path = process.env.STABLE_DMG;
+          fs.writeFileSync('dist/latest-mac.yml', YAML.stringify(manifest));
+          NODE
+
           echo "path=$stable_path" >> "$GITHUB_OUTPUT"
           echo "name=$stable_name" >> "$GITHUB_OUTPUT"
 

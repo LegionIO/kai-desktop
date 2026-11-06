@@ -11,6 +11,8 @@ import {
 import type { ToolDefinition } from '../../../tools/types.js';
 import { RUNTIME_BRIDGE_SKIP_TOOLS } from '../types.js';
 import { hookDispatcher } from '../../hooks/dispatcher.js';
+import { connectMcpServer, disconnectMcpServer } from '../../../tools/mcp-client.js';
+import { mcpChatTool } from '../../../../test-utils/mcp-schema.js';
 
 function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
@@ -162,6 +164,54 @@ describe('CodexMcpBridge', () => {
       expect(exposed).not.toMatch(/codex-secret|alice:password/);
     } finally {
       await client.close();
+    }
+  });
+
+  it('validates discovered chat unions through the actual MCP bridge before executing', async () => {
+    const sourceConfig = { name: 'chat-fixture', url: 'https://mcp.test/chat', enabled: true };
+    const connect = vi.spyOn(Client.prototype, 'connect').mockResolvedValueOnce(undefined);
+    const listTools = vi.spyOn(Client.prototype, 'listTools').mockResolvedValueOnce({ tools: [mcpChatTool()] });
+    const source = await connectMcpServer(sourceConfig).finally(() => {
+      connect.mockRestore();
+      listTools.mockRestore();
+    });
+    const client = new Client({ name: 'chat-bridge-test', version: '1.0.0' });
+    try {
+      expect(source.status).toBe('connected');
+      const execute = vi.spyOn(source.client, 'callTool').mockResolvedValue({
+        content: [{ type: 'text', text: 'Chat connected.' }],
+      });
+      bridge = new CodexMcpBridge();
+      const url = await bridge.start(source.tools, 'chat-test-conversation', '/tmp');
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(url), {
+          requestInit: { headers: { Authorization: `Bearer ${bridge.getAuthToken()}` } },
+        }),
+      );
+      const catalog = await client.listTools();
+      expect(catalog.tools[0].inputSchema).toMatchObject({
+        properties: {
+          messages: {
+            items: { properties: { content: { oneOf: [{ type: 'string' }, { type: 'array' }] } } },
+          },
+        },
+      });
+      for (const content of ['Hello', [{ type: 'text', text: 'Hello' }]]) {
+        const args = { messages: [{ role: 'user', content }] };
+        const result = await client.callTool({ name: catalog.tools[0].name, arguments: args });
+        expect(result.isError).not.toBe(true);
+        expect(result.content).toEqual([{ type: 'text', text: 'Chat connected.' }]);
+        expect(execute.mock.lastCall?.[0]).toEqual({ name: 'chat', arguments: args });
+      }
+      const invalid = await client.callTool({
+        name: catalog.tools[0].name,
+        arguments: { messages: [{ role: 'user', content: 42 }] },
+      });
+      expect(invalid.isError).toBe(true);
+      expect(execute).toHaveBeenCalledTimes(2);
+    } finally {
+      await client.close();
+      await disconnectMcpServer(sourceConfig.name);
     }
   });
 
