@@ -1,10 +1,12 @@
 import { createServer } from 'node:http';
 
 /** Local controlled OAuth/MCP server; no external accounts or network access. */
-export async function startMcpOAuthFixture() {
+export async function startMcpOAuthFixture(options: { dynamicRegistration?: boolean; refreshTokens?: boolean } = {}) {
   let origin = '',
     version = 0,
-    refreshes = 0;
+    refreshes = 0,
+    registrations = 0;
+  const clients = new Map<string, string[]>();
   const behavior = { rejectAccess: false, rejectRefresh: false };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', origin);
@@ -23,14 +25,30 @@ export async function startMcpOAuthFixture() {
         response_types_supported: ['code'],
         code_challenge_methods_supported: ['S256'],
         token_endpoint_auth_methods_supported: ['none'],
-        client_id_metadata_document_supported: true,
+        client_id_metadata_document_supported: !options.dynamicRegistration,
+        ...(options.dynamicRegistration ? { registration_endpoint: `${origin}/register` } : {}),
         authorization_response_iss_parameter_supported: true,
       });
+    if (url.pathname === '/register' && options.dynamicRegistration) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const metadata = JSON.parse(body);
+      const clientId = `fixture-client-${++registrations}`;
+      clients.set(clientId, metadata.redirect_uris);
+      return json({ ...metadata, client_id: clientId }, 201);
+    }
     if (url.pathname === '/revoke') {
       res.writeHead(200).end();
       return;
     }
     if (url.pathname === '/authorize') {
+      if (options.dynamicRegistration && !clients.has(url.searchParams.get('client_id')!))
+        return json({ error: 'invalid_client' }, 400);
+      if (
+        options.dynamicRegistration &&
+        !clients.get(url.searchParams.get('client_id')!)!.includes(url.searchParams.get('redirect_uri')!)
+      )
+        return json({ error: 'invalid_request' }, 400);
       const callback = new URL(url.searchParams.get('redirect_uri')!);
       callback.searchParams.set('state', url.searchParams.get('state')!);
       callback.searchParams.set('code', 'controlled-code');
@@ -45,6 +63,8 @@ export async function startMcpOAuthFixture() {
       let body = '';
       for await (const chunk of req) body += chunk;
       const params = new URLSearchParams(body);
+      if (options.dynamicRegistration && !clients.has(params.get('client_id')!))
+        return json({ error: 'invalid_client' }, 400);
       if (params.get('grant_type') === 'refresh_token') {
         refreshes++;
         if (behavior.rejectRefresh) return json({ error: 'invalid_grant' }, 400);
@@ -53,7 +73,7 @@ export async function startMcpOAuthFixture() {
       version++;
       return json({
         access_token: `fixture-access-${version}`,
-        refresh_token: `fixture-refresh-${version}`,
+        ...(options.refreshTokens === false ? {} : { refresh_token: `fixture-refresh-${version}` }),
         token_type: 'Bearer',
         expires_in: 3600,
         scope: 'read',
@@ -96,6 +116,8 @@ export async function startMcpOAuthFixture() {
     origin,
     behavior,
     refreshes: () => refreshes,
+    registrations: () => registrations,
+    loseRegistrations: () => clients.clear(),
     callback(authorizationUrl: string) {
       const auth = new URL(authorizationUrl),
         callback = new URL(auth.searchParams.get('redirect_uri')!);

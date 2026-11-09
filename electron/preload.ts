@@ -377,6 +377,7 @@ const appAPI = {
       ipcRenderer.invoke('mcp:open-login', id, browser) as Promise<void>,
     completeLogin: (id: string, url: string) => ipcRenderer.invoke('mcp:complete-login', id, url) as Promise<void>,
     cancelLogin: (name: string) => ipcRenderer.invoke('mcp:cancel-login', name) as Promise<void>,
+    resetRegistration: (name: string) => ipcRenderer.invoke('mcp:reset-registration', name) as Promise<void>,
     reconnect: (name: string) => ipcRenderer.invoke('mcp:reconnect', name) as Promise<void>,
     logout: (name: string) => ipcRenderer.invoke('mcp:logout', name) as Promise<McpLogout>,
     setClientSecret: (name: string, secret: string | null) =>

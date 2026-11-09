@@ -77,6 +77,7 @@ describe('web bridge ↔ preload parity', () => {
   // Namespaces required to be a full method-level mirror of preload. Other
   // namespaces (dialog, mic, image…) are intentionally degraded in web mode.
   const fullMirrorNamespaces = [
+    'mcp',
     'plugins',
     'tasks',
     'agents',

@@ -500,6 +500,7 @@ export function getBridgeScript(): string {
       openLogin: function(id, browser) { return invoke('mcp:open-login', id, browser); },
       completeLogin: function(id, url) { return invoke('mcp:complete-login', id, url); },
       cancelLogin: function(name) { return invoke('mcp:cancel-login', name); },
+      resetRegistration: function(name) { return invoke('mcp:reset-registration', name); },
       reconnect: function(name) { return invoke('mcp:reconnect', name); },
       logout: function(name) { return invoke('mcp:logout', name); },
       setClientSecret: function(name, secret) { return invoke('mcp:set-client-secret', name, secret); }

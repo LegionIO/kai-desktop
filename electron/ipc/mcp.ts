@@ -60,6 +60,12 @@ export function registerMcpHandlers(
     ),
   );
   ipcMain.handle('mcp:cancel-login', (_event, value: unknown) => service.cancelLogin(name.parse(value)));
+  ipcMain.handle('mcp:reset-registration', async (_event, value: unknown) => {
+    const serverName = name.parse(value);
+    service.resetRegistration(serverName);
+    await disconnectMcpServer(serverName);
+    notify();
+  });
   ipcMain.handle('mcp:reconnect', async (_event, value: unknown) => {
     const serverName = name.parse(value);
     if (!getConfig().mcpServers.some((cfg) => cfg.name === serverName && cfg.enabled !== false))

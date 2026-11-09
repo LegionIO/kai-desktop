@@ -33,6 +33,7 @@ export function mcpApiFixture(overrides: Partial<McpApi> = {}): McpApi {
     completeLogin: async () => {},
     openLogin: async () => {},
     cancelLogin: async () => {},
+    resetRegistration: async () => {},
     reconnect: async () => {},
     logout: async () => ({ localCleared: true, revocation: 'unsupported' }),
     setClientSecret: async () => {},

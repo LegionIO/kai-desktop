@@ -27,10 +27,15 @@ export async function runMcpCommand(client: LocalBridgeClient, args: string[]): 
       );
     return;
   }
-  if (!name || !['login', 'logout', 'reconnect', 'client-secret'].includes(action))
+  if (!name || !['login', 'logout', 'reconnect', 'reset-registration', 'client-secret'].includes(action))
     throw new Error(
-      'Usage: kai mcp list | login <name> [--no-browser] | logout <name> | reconnect <name> | client-secret <name>',
+      'Usage: kai mcp list | login <name> [--no-browser] | logout <name> | reconnect <name> | reset-registration <name> | client-secret <name>',
     );
+  if (action === 'reset-registration') {
+    await client.invoke('mcp:reset-registration', name);
+    process.stdout.write('Local OAuth registration cleared. Run kai mcp login <name> to register again.\n');
+    return;
+  }
   if (action === 'logout') {
     const result = await client.invoke<McpLogout>('mcp:logout', name);
     process.stdout.write(`Signed out locally. Server revocation: ${result.revocation}.\n`);
@@ -76,6 +81,9 @@ export async function runMcpCommand(client: LocalBridgeClient, args: string[]): 
       process.stdout.write('OS secure storage is unavailable. Credentials last for this backend session only.\n');
     const flow = await startMcpLogin(client, name, args.includes('--no-browser'));
     process.stdout.write(`Open this URL to sign in:\n${flow.authorizationUrl}\n`);
+    process.stdout.write(
+      'If the page shows invalid_client without returning to Kai, cancel and use kai mcp reset-registration <name>, then sign in again. This applies only to dynamic clients.\n',
+    );
     const finished = new Promise<void>((resolve, reject) => {
       const update = (items: McpStatus[]) => {
         const state = items.find((item) => item.name === name);

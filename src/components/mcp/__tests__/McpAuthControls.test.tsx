@@ -34,6 +34,35 @@ it('opens sign-in on the browser client device instead of the backend desktop', 
   expect(window.open).toHaveBeenCalledWith('https://auth.test/authorize', '_blank', 'noopener,noreferrer');
   expect(openLogin).not.toHaveBeenCalled();
 });
+it.each([false, true])('offers an explicit reset while the sign-in page is stuck (web=%s)', async (web) => {
+  const resetRegistration = vi.fn(async () => {});
+  const login = vi.fn(mcpApiFixture().login);
+  const completeLogin = vi.fn(async () => {});
+  installAppBridgeStub({ __isWebBridge: web, mcp: mcpApiFixture({ resetRegistration, login, completeLogin }) });
+  render(<McpAuthControls name="fixture" status={{ ...mcpStatusFixture, canResetRegistration: true }} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+  const callback = await screen.findByLabelText('Callback URL');
+  fireEvent.change(callback, { target: { value: 'http://localhost/callback?code=private-code' } });
+  expect(screen.getByText(/If the sign-in page shows invalid_client/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Reset registration' }));
+  await waitFor(() => expect(resetRegistration).toHaveBeenCalledExactlyOnceWith('fixture'));
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  expect(login).toHaveBeenCalledTimes(1);
+  expect(completeLogin).not.toHaveBeenCalled();
+  expect(document.body.textContent).not.toContain('private-code');
+  expect(screen.getByText(/Local registration cleared/)).toBeInTheDocument();
+});
+it('does not offer a registration reset for configured or metadata clients', () => {
+  installAppBridgeStub({ mcp: mcpApiFixture() });
+  render(
+    <McpAuthControls
+      name="fixture"
+      status={{ ...mcpStatusFixture, canResetRegistration: false }}
+      clientId="registered"
+    />,
+  );
+  expect(screen.queryByRole('button', { name: 'Reset registration' })).not.toBeInTheDocument();
+});
 it('never opens a browser for background authentication notices and deduplicates updates', async () => {
   let notify!: (status: McpStatus[]) => void;
   installAppBridgeStub({

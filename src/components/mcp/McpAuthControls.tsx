@@ -79,6 +79,24 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
     setLogin(null);
     void run(() => app.mcp.cancelLogin(name));
   };
+  const resetRegistration = () =>
+    run(async () => {
+      await app.mcp.resetRegistration(name);
+      setOpen(false);
+      setLogin(null);
+      setCallback('');
+      setMessage('Local registration cleared. Select Sign in to register again.');
+    });
+  const resetControl = status?.canResetRegistration && status.state !== 'authorized' && (
+    <button
+      type="button"
+      className={buttonClass}
+      disabled={busy || status.enabled === false}
+      onClick={() => void resetRegistration()}
+    >
+      Reset registration
+    </button>
+  );
 
   return (
     <div className="space-y-2 text-xs">
@@ -89,6 +107,7 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
         </p>
       )}
       <div className="flex flex-wrap gap-2">
+        {resetControl}
         {status?.state !== 'authorized' && (
           <button
             type="button"
@@ -218,6 +237,15 @@ export function McpAuthControls({ name, status, clientId }: { name: string; stat
               <p role="status" className="mt-3 break-words text-sm">
                 {message}
               </p>
+            )}
+            {resetControl && (
+              <div className="mt-4 space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  If the sign-in page shows invalid_client, reset Kai’s saved registration, then sign in again. This
+                  clears local authorization for this server.
+                </p>
+                {resetControl}
+              </div>
             )}
             <form
               className="mt-5 space-y-3"

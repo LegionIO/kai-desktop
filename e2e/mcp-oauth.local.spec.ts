@@ -194,6 +194,57 @@ test('dedicated desktop sign-in windows complete and cancel without exposing the
   ).rejects.toThrow('expired');
 });
 
+test('reset recovers a lost dynamic registration from an invalid_client page without refresh tokens', async () => {
+  const idp = await startMcpOAuthFixture({ dynamicRegistration: true, refreshTokens: false });
+  try {
+    const config = { name: 'registration-fixture', url: `${idp.origin}/mcp`, enabled: true };
+    await handle.page.evaluate(async (server) => {
+      await (window as unknown as ApiWindow).app.config.set('mcpServers', [server]);
+    }, config);
+    const status = () =>
+      handle.page.evaluate(async () => (await (window as unknown as ApiWindow).app.mcp.getStatus())[0]);
+    await expect.poll(async () => (await status())?.state).toBe('required');
+    const first = await handle.page.evaluate(() =>
+      (window as unknown as ApiWindow).app.mcp.login('registration-fixture'),
+    );
+    const callback = await fetch(idp.callback(first.authorizationUrl));
+    expect(callback.status).toBe(200);
+    await callback.text();
+    await expect.poll(async () => (await status())?.toolCount).toBe(1);
+
+    idp.loseRegistrations();
+    idp.behavior.rejectAccess = true;
+    await handle.page.evaluate(
+      async (server) => (window as unknown as ApiWindow).app.mcp.testConnection(server),
+      config,
+    );
+    await expect.poll(async () => (await status())?.reason).toBe('expired');
+    const notice = handle.page.getByRole('complementary', { name: 'MCP sign-in required' });
+    const rejectedWindow = handle.app.waitForEvent('window');
+    await notice.getByRole('button', { name: 'Reconnect', exact: true }).click();
+    const rejected = await rejectedWindow;
+    await expect(rejected.locator('body')).toContainText('invalid_client');
+    expect(idp.registrations()).toBe(1);
+    await handle.page.getByRole('dialog').getByRole('button', { name: 'Reset registration' }).click();
+    await expect.poll(() => rejected.isClosed()).toBe(true);
+    await expect(handle.page.getByRole('dialog')).toHaveCount(0);
+    expect(idp.registrations()).toBe(1);
+    const restoredWindow = handle.app.waitForEvent('window');
+    await notice.getByRole('button', { name: 'Sign in', exact: true }).click();
+    const restored = await restoredWindow;
+    await expect(restored.getByRole('heading', { name: 'Controlled sign-in' })).toBeVisible();
+    await restored.getByRole('link', { name: 'Authorize fixture' }).click();
+    await expect.poll(() => restored.isClosed()).toBe(true);
+    await expect.poll(async () => (await status())?.state).toBe('authorized');
+    await expect.poll(async () => (await status())?.toolCount).toBe(1);
+    expect(idp.registrations()).toBe(2);
+    expect(idp.refreshes()).toBe(0);
+  } finally {
+    await handle.page.evaluate(async () => (window as unknown as ApiWindow).app.config.set('mcpServers', []));
+    await idp.close();
+  }
+});
+
 test('expanded MCP calls display inputs and output in the real desktop renderer', async () => {
   await handle.page.evaluate(async (part) => {
     const timestamp = new Date().toISOString();

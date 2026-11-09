@@ -30,3 +30,12 @@ it('reports local logout separately from server revocation', async () => {
   expect(invoke).toHaveBeenCalledExactlyOnceWith('mcp:logout', 'fixture');
   expect(output).toHaveBeenCalledWith('Signed out locally. Server revocation: failed.\n');
 });
+it('resets registration without opening a browser or starting another login', async () => {
+  const output = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+  const invoke = vi.fn(async () => undefined);
+  await runMcpCommand(clientWith(invoke), ['reset-registration', 'fixture']);
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('mcp:reset-registration', 'fixture');
+  expect(output).toHaveBeenCalledWith(
+    'Local OAuth registration cleared. Run kai mcp login <name> to register again.\n',
+  );
+});

@@ -11,6 +11,7 @@ import {
   oauthDeferred,
   oauthHandlers,
   oauthMetadata,
+  oauthRegistrationLossFixture,
   oauthServer,
   oauthTokens,
 } from '../../../test-utils/mcp-oauth.js';
@@ -242,6 +243,179 @@ describe('registration, discovery and local callback', () => {
 });
 
 describe('refresh and recovery', () => {
+  it.each(['callback', 'token'])(
+    'forgets a rejected dynamic client at the validated %s boundary without retrying automatically',
+    async (boundary) => {
+      const idp = oauthRegistrationLossFixture();
+      httpMock.use(...idp.handlers);
+      const flow = await service.login('fixture');
+      idp.loseRegistrations();
+      await expect(
+        service.completeLogin(
+          flow.loginId,
+          oauthCallback(flow, boundary === 'callback' ? { error: 'invalid_client', code: null } : {}),
+        ),
+      ).rejects.toThrow('Sign in to register again');
+      expect(store.get(mcpCredentialKey(oauthServer))).toEqual({});
+      expect(service.status('fixture').reason).toBe('invalid-client');
+      expect(idp.registrations()).toBe(1);
+      const [next, concurrent] = await Promise.all([service.login('fixture'), service.login('fixture')]);
+      expect(next).toEqual(concurrent);
+      expect(idp.registrations()).toBe(2);
+      await service.completeLogin(next.loginId, oauthCallback(next));
+      expect(service.status('fixture').state).toBe('authorized');
+    },
+  );
+  it.each<Record<string, string | null>>([{ state: 'wrong' }, { iss: 'https://evil.test' }, { iss: null }])(
+    'does not reset registration for an unvalidated error callback %#',
+    async (values) => {
+      httpMock.use(...oauthRegistrationLossFixture().handlers);
+      const flow = await service.login('fixture');
+      const before = store.get(mcpCredentialKey(oauthServer));
+      await expect(
+        service.completeLogin(
+          flow.loginId,
+          oauthCallback(flow, {
+            error: 'invalid_client',
+            code: null,
+            ...values,
+          }),
+        ),
+      ).rejects.toThrow();
+      expect(store.get(mcpCredentialKey(oauthServer))).toEqual(before);
+      expect(service.status('fixture').state).toBe('authenticating');
+      await service.completeLogin(flow.loginId, oauthCallback(flow));
+      expect(service.status('fixture').state).toBe('authorized');
+    },
+  );
+  it.each(['invalid_request', 'unauthorized_client', 'access_denied'])(
+    'preserves the dynamic client after callback error %s',
+    async (error) => {
+      httpMock.use(...oauthRegistrationLossFixture().handlers);
+      const flow = await service.login('fixture');
+      const before = store.get(mcpCredentialKey(oauthServer));
+      await expect(service.completeLogin(flow.loginId, oauthCallback(flow, { error, code: null }))).rejects.toThrow();
+      expect(store.get(mcpCredentialKey(oauthServer))).toEqual(before);
+    },
+  );
+  it.each(['metadata', 'configured'])(
+    'preserves %s client identity and rejects explicit registration reset',
+    async (kind) => {
+      const cfg = kind === 'configured' ? { ...oauthServer, oauth: { clientId: 'registered' } } : oauthServer;
+      service.configure([cfg]);
+      if (kind === 'configured') service.setClientSecret('fixture', 'configured-secret');
+      await signIn();
+      const before = store.get(mcpCredentialKey(cfg));
+      const flow = await service.login('fixture');
+      await expect(
+        service.completeLogin(flow.loginId, oauthCallback(flow, { error: 'invalid_client', code: null })),
+      ).rejects.toThrow('Check its client ID');
+      const after = store.get(mcpCredentialKey(cfg));
+      expect(after.client).toEqual(before.client);
+      expect(after.clientSecret).toBe(before.clientSecret);
+      expect(after.tokens).toBeUndefined();
+      expect(service.status('fixture').canResetRegistration).toBe(false);
+      expect(() => service.resetRegistration('fixture')).toThrow('Only dynamic');
+      expect(store.get(mcpCredentialKey(cfg))).toEqual(after);
+    },
+  );
+  it.each(['invalid_client', 'unauthorized_client'])(
+    'handles refresh error %s without mistaking authorization restrictions for a lost registration',
+    async (error) => {
+      httpMock.use(...oauthHandlers({ ...oauthMetadata, client_id_metadata_document_supported: false }));
+      await signIn();
+      const client = store.get(mcpCredentialKey(oauthServer)).client;
+      expire();
+      httpMock.use(http.post('https://auth.test/token', () => HttpResponse.json({ error }, { status: 400 })));
+      await expect(service.authenticatedFetch(oauthServer)(oauthServer.url!)).rejects.toThrow();
+      expect(store.get(mcpCredentialKey(oauthServer)).client).toEqual(error === 'invalid_client' ? undefined : client);
+    },
+  );
+  it('retains dynamic registration after a transient token exchange failure', async () => {
+    const idp = oauthRegistrationLossFixture();
+    httpMock.use(...idp.handlers);
+    const flow = await service.login('fixture');
+    const before = store.get(mcpCredentialKey(oauthServer));
+    httpMock.use(http.post('https://auth.test/token', () => new HttpResponse(null, { status: 503 })));
+    await expect(service.completeLogin(flow.loginId, oauthCallback(flow))).rejects.toThrow();
+    expect(store.get(mcpCredentialKey(oauthServer))).toEqual(before);
+    await service.login('fixture');
+    expect(idp.registrations()).toBe(1);
+  });
+  it.each(['dcr-client', 'https://auth.test/clients/fixture'])(
+    'can explicitly reset legacy DCR registration %s without touching another server',
+    async (clientId) => {
+      httpMock.use(...oauthHandlers({ ...oauthMetadata, client_id_metadata_document_supported: false }, clientId));
+      await signIn();
+      const key = mcpCredentialKey(oauthServer);
+      const old = store.get(key);
+      delete old.clientRegistration;
+      store.set(key, old);
+      const other = { ...oauthServer, name: 'other' };
+      service.configure([oauthServer, other]);
+      store.set(mcpCredentialKey(other), old);
+      expect(service.status('fixture').canResetRegistration).toBe(true);
+      vi.spyOn(encryption, 'encryptString').mockImplementation(() => {
+        throw new Error('Keychain unavailable');
+      });
+      service.resetRegistration('fixture');
+      const restarted = new McpCredentialStore(home, fixtureEncryption());
+      expect(restarted.get(key)).toEqual({});
+      expect(restarted.get(mcpCredentialKey(other))).toEqual(old);
+    },
+  );
+  it('does not let a reset attempt restore credentials after a new login', async () => {
+    const idp = oauthRegistrationLossFixture();
+    httpMock.use(...idp.handlers);
+    const flow = await service.login('fixture');
+    const started = oauthDeferred(),
+      release = oauthDeferred();
+    httpMock.use(
+      http.post('https://auth.test/token', async ({ request }) => {
+        const body = new URLSearchParams(await request.text());
+        if (body.get('client_id') === 'dynamic-1') {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({ error: 'invalid_client' }, { status: 400 });
+        }
+        return HttpResponse.json(oauthTokens);
+      }),
+    );
+    const pending = service.completeLogin(flow.loginId, oauthCallback(flow)).catch((error: unknown) => error);
+    await started.promise;
+    service.resetRegistration('fixture');
+    const fresh = await signIn();
+    release.resolve();
+    expect(await pending).toBeInstanceOf(Error);
+    expect(service.status('fixture').state).toBe('authorized');
+    expect(store.get(mcpCredentialKey(oauthServer)).client?.client_id).toBe('dynamic-2');
+    expect(store.get(mcpCredentialKey(oauthServer)).tokens).toEqual(oauthTokens);
+    expect(new URL(fresh.authorizationUrl).searchParams.get('client_id')).toBe('dynamic-2');
+  });
+  it('recovers explicitly when a no-refresh IdP loses registration and renders invalid_client without a callback', async () => {
+    const idp = oauthRegistrationLossFixture();
+    httpMock.use(...idp.handlers);
+    const first = await signIn();
+    expect(store.get(mcpCredentialKey(oauthServer)).tokens?.refresh_token).toBeUndefined();
+    idp.loseRegistrations();
+    expire();
+    await expect(service.authenticatedFetch(oauthServer)(oauthServer.url!)).rejects.toThrow('Sign in again');
+    const stale = await service.login('fixture');
+    const page = await fetch(stale.authorizationUrl);
+    expect(page.status).toBe(400);
+    expect(await page.json()).toEqual({ error: 'invalid_client' });
+    expect(idp.registrations()).toBe(1);
+
+    service.resetRegistration('fixture');
+    await expect(service.completeLogin(stale.loginId, oauthCallback(stale))).rejects.toThrow('expired');
+    const recovered = await signIn();
+    expect(new URL(recovered.authorizationUrl).searchParams.get('client_id')).toBe('dynamic-2');
+    expect(new URL(recovered.authorizationUrl).searchParams.get('state')).not.toBe(
+      new URL(first.authorizationUrl).searchParams.get('state'),
+    );
+    expect(service.status('fixture').state).toBe('authorized');
+    expect(idp.registrations()).toBe(2);
+  });
   it.each(['success', 'invalid_grant'])('does not let a stale refresh %s overwrite a new login', async (result) => {
     await signIn();
     expire();

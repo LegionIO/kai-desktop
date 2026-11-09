@@ -1329,13 +1329,22 @@ export function App({
           // `/mcp test <name>`         → test-connect a configured server
           const parts = arg.trim().split(/\s+/).filter(Boolean);
           const sub = parts[0]?.toLowerCase();
-          if (['login', 'logout', 'reconnect'].includes(sub ?? '')) {
+          if (['login', 'logout', 'reconnect', 'reset-registration'].includes(sub ?? '')) {
             const name = parts[1];
             if (!name) {
-              pushTurn({ kind: 'note', text: 'Usage: /mcp login|logout|reconnect <name> [--no-browser]' });
+              pushTurn({
+                kind: 'note',
+                text: 'Usage: /mcp login|logout|reconnect|reset-registration <name> [--no-browser]',
+              });
               break;
             }
-            if (sub === 'logout') {
+            if (sub === 'reset-registration') {
+              await client.invoke('mcp:reset-registration', name);
+              pushTurn({
+                kind: 'note',
+                text: 'Local OAuth registration cleared. Use /mcp login <name> to register again.',
+              });
+            } else if (sub === 'logout') {
               const result = await client.invoke<McpLogout>('mcp:logout', name);
               pushTurn({ kind: 'note', text: `Signed out locally. Server revocation: ${result.revocation}.` });
             } else {

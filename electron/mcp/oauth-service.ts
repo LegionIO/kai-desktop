@@ -128,12 +128,53 @@ export class McpOAuthService {
       storage: this.store.storage,
       hasClientSecret: Boolean(record.clientSecret),
       hasCredentials: Boolean(record.tokens),
+      canResetRegistration: Boolean(cfg && this.isDynamicClient(cfg, record)),
       ...this.states.get(name),
     };
   }
   private change(name: string, state: Partial<McpAuthStatus>): void {
     this.states.set(name, state);
     this.options.onChanged?.();
+  }
+  private isDynamicClient(cfg: McpServerConfig, record: McpCredentials): boolean {
+    if (cfg.oauth?.clientId || !record.client) return false;
+    if (record.clientRegistration) return record.clientRegistration === 'dynamic';
+    // Older vaults have no provenance field. DCR responses include registered
+    // redirect URIs; CIMD records contain only the metadata URL as client_id.
+    return Boolean(
+      record.discovery?.authorizationServerMetadata?.registration_endpoint && 'redirect_uris' in record.client,
+    );
+  }
+  /** Explicit, local reset for an IdP error page that never sends a callback. */
+  resetRegistration(name: string): void {
+    const cfg = this.server(name),
+      key = mcpCredentialKey(cfg);
+    if (!this.isDynamicClient(cfg, this.store.get(key)))
+      throw new McpOAuthError(
+        'Only dynamic OAuth registrations can be reset. Check the configured client ID, metadata URL, and redirect settings.',
+      );
+    this.cancelLogin(name);
+    this.store.invalidate(key);
+    this.change(name, {
+      state: 'required',
+      reason: 'sign-in',
+      message: 'Local OAuth registration cleared. Sign in to register again.',
+    });
+  }
+  private rejectClient(name: string, key: string): McpOAuthError {
+    const cfg = this.server(name),
+      record = this.store.get(key);
+    const dynamic = this.isDynamicClient(cfg, record);
+    this.store.invalidate(key);
+    if (!dynamic) this.store.set(key, { ...record, tokens: undefined, issuedAt: undefined, expiresAt: undefined });
+    const error = new McpOAuthError(
+      dynamic
+        ? 'The server rejected Kai’s dynamic OAuth registration. Sign in to register again.'
+        : 'The server rejected the OAuth client. Check its client ID, secret, metadata URL, and allowed redirect URI.',
+      'invalid-client',
+    );
+    this.change(name, { state: 'required', reason: error.reason, message: error.message });
+    return error;
   }
   private server(name: string, requireEnabled = true): McpServerConfig & { url: string } {
     const server = this.servers.get(name);
@@ -311,6 +352,7 @@ export class McpOAuthService {
       const metadata = info.authorizationServerMetadata! as ExtendedMetadata;
       // Registration is issuer-specific, even when the MCP URL is unchanged.
       let client = old.discovery?.authorizationServerUrl === info.authorizationServerUrl ? old.client : undefined;
+      let clientRegistration = old.clientRegistration ?? (this.isDynamicClient(cfg, old) ? 'dynamic' : 'metadata');
       const host = cfg.oauth?.callbackHost ?? '127.0.0.1';
       const loginId = randomBytes(24).toString('hex');
       listener = createServer((request, response) => {
@@ -360,15 +402,18 @@ export class McpOAuthService {
       if (metadata.scopes_supported?.includes('offline_access')) scopes.add('offline_access');
       const scope = [...scopes].filter(Boolean).join(' ') || undefined;
       if (cfg.oauth?.clientId) {
+        clientRegistration = 'configured';
         client = { client_id: cfg.oauth.clientId, ...(old.clientSecret ? { client_secret: old.clientSecret } : {}) };
       } else if (!client) {
         const metadataUrl = cfg.oauth?.clientMetadataUrl ?? this.options.metadataUrl ?? __BRAND_MCP_CLIENT_METADATA_URL;
         if (metadata.client_id_metadata_document_supported && metadataUrl) {
+          clientRegistration = 'metadata';
           const url = secureUrl(metadataUrl);
           if (url.protocol !== 'https:' || url.pathname === '/')
             throw new McpOAuthError('Client metadata must have an HTTPS document URL.');
           client = { client_id: url.href };
         } else if (metadata.registration_endpoint) {
+          clientRegistration = 'dynamic';
           client = await registerClient(info.authorizationServerUrl, {
             metadata,
             scope,
@@ -424,6 +469,7 @@ export class McpOAuthService {
       this.store.set(key, {
         ...old,
         client,
+        clientRegistration,
         discovery: info,
         redirectUri: redirect,
         ...(old.discovery?.authorizationServerUrl !== info.authorizationServerUrl
@@ -471,8 +517,10 @@ export class McpOAuthService {
     ) {
       throw new McpOAuthError('The OAuth callback issuer does not match the authorization server.');
     }
+    this.assertCurrent(attempt.name, attempt.key, attempt.epoch);
     if (callback.searchParams.has('error')) {
       this.cancelLogin(attempt.name);
+      if (callback.searchParams.get('error') === 'invalid_client') throw this.rejectClient(attempt.name, attempt.key);
       throw new McpOAuthError('Authorization was declined. You can sign in again.');
     }
     const code = callback.searchParams.get('code');
@@ -496,6 +544,9 @@ export class McpOAuthService {
       await this.options.onAuthorized?.(attempt.name);
     } catch (error) {
       this.finishAttempt(attempt);
+      this.assertCurrent(attempt.name, attempt.key, attempt.epoch);
+      if (this.status(attempt.name).state !== 'authorized' && errorCode(error) === 'invalid_client')
+        throw this.rejectClient(attempt.name, attempt.key);
       if ((this.epochs.get(attempt.name) ?? 0) === attempt.epoch && this.status(attempt.name).state !== 'authorized')
         this.requireLogin(attempt.name, 'sign-in');
       throw error instanceof McpOAuthError
@@ -562,14 +613,14 @@ export class McpOAuthService {
       } catch (error) {
         this.assertCurrent(name, key, epoch);
         const code = errorCode(error);
-        if (['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(code ?? '')) {
+        if (code === 'invalid_client') throw this.rejectClient(name, key);
+        if (['invalid_grant', 'unauthorized_client'].includes(code ?? '')) {
           const current = this.store.get(key);
           this.store.invalidate(key);
           this.store.set(key, {
             ...current,
             tokens: undefined,
             expiresAt: undefined,
-            ...(code !== 'invalid_grant' && !cfg.oauth?.clientId ? { client: undefined, discovery: undefined } : {}),
           });
           throw this.requireLogin(name, code === 'invalid_grant' ? 'expired' : 'invalid-client');
         }

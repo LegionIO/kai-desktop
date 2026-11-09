@@ -29,6 +29,10 @@ export function McpLoginPanel({
       <Text bold>Sign in to {stripControl(flow.name)}</Text>
       <Text>{flow.authorizationUrl}</Text>
       <Text dimColor>Complete sign-in in your browser, or paste the full callback URL below. Esc cancels.</Text>
+      <Text dimColor>
+        If the page shows invalid_client, press Esc and use /mcp reset-registration followed by the server name, then
+        /mcp login. Only dynamic registrations can be reset.
+      </Text>
       <TextInput
         value={callback}
         onChange={setCallback}

@@ -8,6 +8,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 export type McpCredentials = {
   clientSecret?: string;
   client?: OAuthClientInformationMixed;
+  clientRegistration?: 'dynamic' | 'metadata' | 'configured';
   discovery?: OAuthServerInfo;
   tokens?: OAuthTokens;
   issuedAt?: number;

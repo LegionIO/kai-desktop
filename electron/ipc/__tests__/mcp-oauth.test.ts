@@ -90,6 +90,21 @@ it('rejects unknown reconnects and browser opening without an active attempt', a
   expect(reconnect).not.toHaveBeenCalled();
   expect(mocks.open).not.toHaveBeenCalled();
 });
+it('disconnects only after a successful registration reset and never opens a browser', async () => {
+  const reset = vi.spyOn(service, 'resetRegistration').mockImplementation(() => {});
+  await invoke('mcp:reset-registration', 'fixture');
+  expect(reset).toHaveBeenCalledExactlyOnceWith('fixture');
+  expect(mocks.disconnect).toHaveBeenCalledExactlyOnceWith('fixture');
+  expect(mocks.open).not.toHaveBeenCalled();
+  expect(mocks.inApp).not.toHaveBeenCalled();
+});
+it('preserves a configured client and connection when registration reset is rejected', async () => {
+  service.setClientSecret('fixture', 'private-value');
+  await expect(invoke('mcp:reset-registration', 'fixture')).rejects.toThrow('Only dynamic');
+  expect(service.status('fixture').hasClientSecret).toBe(true);
+  expect(mocks.disconnect).not.toHaveBeenCalled();
+  expect(JSON.stringify(mocks.broadcast.mock.calls)).not.toContain('private-value');
+});
 it('uses the validated attempt for in-app sign-in and keeps the CLI/system fallback', async () => {
   const id = 'a'.repeat(48);
   vi.spyOn(service, 'authorizationUrl').mockReturnValue('https://auth.test/authorize');

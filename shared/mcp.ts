@@ -30,6 +30,7 @@ export type McpAuthStatus = {
   storage: 'encrypted' | 'session';
   hasClientSecret: boolean;
   hasCredentials: boolean;
+  canResetRegistration?: boolean;
 };
 export type McpStatus = McpAuthStatus & {
   enabled: boolean;
@@ -48,6 +49,7 @@ export interface McpApi {
   openLogin(loginId: string, browser?: 'in-app' | 'system'): Promise<void>;
   completeLogin(loginId: string, callbackUrl: string): Promise<void>;
   cancelLogin(name: string): Promise<void>;
+  resetRegistration(name: string): Promise<void>;
   reconnect(name: string): Promise<void>;
   logout(name: string): Promise<McpLogout>;
   setClientSecret(name: string, secret: string | null): Promise<void>;

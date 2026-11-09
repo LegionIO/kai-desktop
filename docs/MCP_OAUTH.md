@@ -41,11 +41,12 @@ kai mcp list
 kai mcp login example
 kai mcp login example --no-browser
 kai mcp reconnect example --no-browser
+kai mcp reset-registration example
 kai mcp logout example
 kai mcp client-secret example
 ```
 
-Within the terminal chat, use `/mcp login example`, `/mcp reconnect example`, or `/mcp logout example`. `--no-browser` prints the sign-in link. SSH/headless Linux sessions also avoid opening a browser automatically. Login and client-secret commands require an interactive terminal.
+Within the terminal chat, use `/mcp login example`, `/mcp reconnect example`, `/mcp reset-registration example`, or `/mcp logout example`. `--no-browser` prints the sign-in link. SSH/headless Linux sessions also avoid opening a browser automatically. Login and client-secret commands require an interactive terminal.
 
 If the browser runs on a different device, the loopback callback may show a connection error after consent. Copy the full address into Kai's **Callback URL** field or terminal prompt. This input is hidden and sent through authenticated IPC; it is never added to the chat transcript. Login attempts expire after five minutes. Cancel closes the listener and invalidates the pending callback.
 
@@ -56,6 +57,12 @@ Credentials are stored separately from configuration in `mcp/credentials.enc` un
 Credential identity includes the saved server name, endpoint, and OAuth settings. Changing identity or the discovered authorization server invalidates its tokens, registration, and client secret, including during a keychain outage. Enter a client secret again if the new authorization server requires one. Connection tests use the same identity for saved configurations. Save an unsaved configuration before signing in.
 
 A definite HTTP 401 permits one coordinated refresh and one retry. Timeouts, connection loss, and ordinary server errors are not replayed. Transient refresh failures preserve credentials. Starting a new sign-in supersedes pending refreshes and requests so delayed responses cannot replace the new authorization. Sign out clears local tokens and attempts revocation when advertised; the UI explicitly distinguishes local sign-out from confirmed server revocation.
+
+An authorization server can lose its dynamic client registrations, for example after its database is recreated. Kai then needs a new registration as well as new tokens. A validated `invalid_client` callback or token response clears the affected dynamic registration; the next user-initiated **Sign in** registers again. There is no automatic registration retry loop. Other authorization errors and temporary failures preserve the registration.
+
+Some providers show `invalid_client` on their sign-in page without returning to Kai. Kai cannot observe that response. Select **Reset registration** in the login dialog or server controls, then select **Sign in**. In a terminal, cancel login and run `kai mcp reset-registration example` followed by `kai mcp login example`. This also works when the provider issues no refresh tokens and the access token has expired. Signing out alone retains the registration.
+
+Reset cancels any pending login and clears only that server's local dynamic registration and authorization. It does not revoke server-side credentials, open a browser, or register a replacement until you sign in. Configured client IDs and hosted metadata clients cannot be reset this way; check their client ID, secret, metadata URL, and allowed redirect URI with the server administrator. Callback state, issuer, redirect and PKCE validation still apply during recovery.
 
 ## Deployment and validation
 

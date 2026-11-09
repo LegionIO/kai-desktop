@@ -44,6 +44,41 @@ export function oauthHandlers(metadata: Record<string, unknown> = oauthMetadata,
   ];
 }
 
+/** Models an IdP that loses its dynamic client database and issues no refresh tokens. */
+export function oauthRegistrationLossFixture() {
+  const clients = new Set<string>();
+  let registrations = 0;
+  return {
+    loseRegistrations: () => clients.clear(),
+    registrations: () => registrations,
+    handlers: [
+      http.post('https://auth.test/register', async ({ request }) => {
+        const clientId = `dynamic-${++registrations}`;
+        clients.add(clientId);
+        return HttpResponse.json({ ...((await request.json()) as object), client_id: clientId });
+      }),
+      http.get('https://auth.test/authorize', ({ request }) => {
+        const clientId = new URL(request.url).searchParams.get('client_id')!;
+        return clients.has(clientId)
+          ? new HttpResponse('Sign in')
+          : HttpResponse.json({ error: 'invalid_client' }, { status: 400 });
+      }),
+      http.post('https://auth.test/token', async ({ request }) => {
+        const body = new URLSearchParams(await request.text());
+        return clients.has(body.get('client_id')!)
+          ? HttpResponse.json({ ...oauthTokens, refresh_token: undefined })
+          : HttpResponse.json({ error: 'invalid_client' }, { status: 400 });
+      }),
+      ...oauthHandlers({
+        ...oauthMetadata,
+        client_id_metadata_document_supported: false,
+        grant_types_supported: ['authorization_code'],
+        scopes_supported: ['read'],
+      }),
+    ],
+  };
+}
+
 export function oauthDeferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((done) => {
