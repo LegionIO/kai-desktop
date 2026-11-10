@@ -118,6 +118,7 @@
     "@mastra/schema-compat": "^1.2.8",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "0.130.0",
+    "@radix-ui/react-alert-dialog": "^1.1.15",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-checkbox": "^1.4.1",
     "@radix-ui/react-collapsible": "^1.1.12",
