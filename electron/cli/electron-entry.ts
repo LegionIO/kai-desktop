@@ -1,4 +1,5 @@
 import { parseMcpCommand, runMcpCommand } from './mcp-auth.js';
+import { parseMcpServe, serveMcp } from './mcp-serve.js';
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
@@ -25,6 +26,11 @@ import { confirmFolderTrust } from './folder-trust.js';
  * of the REPL, matching the standalone `kai` entry.
  */
 export async function runCliClient(): Promise<void> {
+  const connector = parseMcpServe(process.argv.slice(2));
+  if (connector) {
+    await serveMcp(connector.credential, true);
+    process.exit(0);
+  }
   // Silence Node's own deprecation warnings (e.g. the `punycode` DEP0040 a
   // transitive dep triggers) — printed to stderr before our UI draws and pure
   // noise to a `kai` user who can't act on them.

@@ -17,6 +17,7 @@ import {
   detectClaudeAgentSdk,
   resolveClaudeCliPath,
   detectCodexSdk,
+  resolveCodexCliPath,
   detectPiCli,
   resolvePiCliPath,
   resetDetectionCache,
@@ -56,6 +57,15 @@ describe('detect.ts — success is cached, miss is rechecked', () => {
 });
 
 describe('detect.ts — path resolvers return the string or undefined', () => {
+  it('resolves the detected Codex CLI for the SDK fallback', async () => {
+    resolveBinaryPathSync.mockReturnValue('/fixture/bin/codex');
+    expect(await detectCodexSdk()).toBe(true);
+    expect(await resolveCodexCliPath()).toBe('/fixture/bin/codex');
+    expect(resolveBinaryPathSync).toHaveBeenCalledTimes(1);
+    resetDetectionCache();
+    resolveBinaryPathSync.mockReturnValue(null);
+    expect(await resolveCodexCliPath()).toBeUndefined();
+  });
   it('resolveClaudeCliPath returns the absolute path when found, undefined when missing', async () => {
     resolveBinaryPathSync.mockReturnValue('/usr/local/bin/claude');
     expect(await resolveClaudeCliPath()).toBe('/usr/local/bin/claude');

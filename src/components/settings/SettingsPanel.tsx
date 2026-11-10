@@ -18,6 +18,7 @@ import { GeneralSettings } from './GeneralSettings';
 import { AutomationsSettings } from './AutomationsSettings';
 import { DiagnosticsSettings } from './DiagnosticsSettings';
 import { BrowserSettings } from './BrowserSettings';
+import { PluginBridgeSettings } from './PluginBridgeSettings';
 import { searchSettings, breadcrumb, type SettingsSearchEntry } from './search-index';
 import { SettingsFocusContext, type SettingsFocusRequest, type SettingsProps } from './shared';
 
@@ -25,6 +26,7 @@ export type SettingsSection =
   | 'models'
   | 'usage'
   | 'tools'
+  | 'plugin-bridge'
   | 'automations'
   | 'general'
   | 'browser'
@@ -39,6 +41,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Models' },
   { key: 'usage', label: 'Usage' },
   { key: 'tools', label: 'Tools' },
+  { key: 'plugin-bridge', label: 'Plugin Bridge' },
   { key: 'automations', label: 'Automations' },
   { key: 'general', label: 'Application' },
   { key: 'browser', label: 'Browser' },
@@ -187,124 +190,125 @@ export const SettingsPanel: FC<{
   return (
     <SettingsFocusContext.Provider value={focusRequest}>
       <div className="flex h-full flex-col bg-background md:flex-row">
-      <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
-        <div className="px-2 pt-2 md:px-3 md:pt-0 md:pb-2">
-          <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-2.5 py-1.5">
-            <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <input
-              ref={searchRef}
-              type="text"
-              placeholder="Search settings…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') {
-                  if (query) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setQuery('');
+        <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
+          <div className="px-2 pt-2 md:px-3 md:pt-0 md:pb-2">
+            <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-2.5 py-1.5">
+              <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <input
+                ref={searchRef}
+                type="text"
+                placeholder="Search settings…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    if (query) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setQuery('');
+                    }
+                    searchRef.current?.blur();
+                  } else if (e.key === 'Enter' && results.length > 0) {
+                    handleResultClick(results[0]);
                   }
-                  searchRef.current?.blur();
-                } else if (e.key === 'Enter' && results.length > 0) {
-                  handleResultClick(results[0]);
-                }
-              }}
-              className="min-w-0 flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
-            />
+                }}
+                className="min-w-0 flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div
+            ref={navRef}
+            className={
+              searching
+                ? 'block space-y-1 px-2 pb-2 max-h-[45vh] overflow-y-auto md:max-h-none md:overflow-visible md:px-3 md:pb-0'
+                : 'flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0'
+            }
+          >
+            {searching ? (
+              results.length > 0 ? (
+                results.map((entry) => (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    onClick={() => handleResultClick(entry)}
+                    className="flex w-full min-w-0 shrink-0 flex-col items-start gap-0.5 rounded-2xl px-3 py-2 text-left text-xs font-medium text-muted-foreground transition-all hover:bg-muted/80 hover:text-foreground"
+                  >
+                    <span className="w-full truncate text-foreground">{entry.label}</span>
+                    <span className="w-full truncate text-[10px] text-muted-foreground/70">{breadcrumb(entry)}</span>
+                  </button>
+                ))
+              ) : (
+                <div className="px-3 py-4 text-center text-[11px] text-muted-foreground/70">No settings match</div>
+              )
+            ) : (
+              sections.map((section) => (
+                <button
+                  key={section.key}
+                  type="button"
+                  data-active={activeSection === section.key}
+                  onClick={() => {
+                    setActiveSection(section.key);
+                    setFocus(null);
+                  }}
+                  className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
+                    activeSection === section.key
+                      ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
+                      : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+                  }`}
+                >
+                  {section.label}
+                  <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
+                </button>
+              ))
+            )}
           </div>
         </div>
 
-        <div
-          ref={navRef}
-          className={
-            searching
-              ? 'block space-y-1 px-2 pb-2 max-h-[45vh] overflow-y-auto md:max-h-none md:overflow-visible md:px-3 md:pb-0'
-              : 'flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0'
-          }
-        >
-          {searching ? (
-            results.length > 0 ? (
-              results.map((entry) => (
-                <button
-                  key={entry.id}
-                  type="button"
-                  onClick={() => handleResultClick(entry)}
-                  className="flex w-full min-w-0 shrink-0 flex-col items-start gap-0.5 rounded-2xl px-3 py-2 text-left text-xs font-medium text-muted-foreground transition-all hover:bg-muted/80 hover:text-foreground"
-                >
-                  <span className="w-full truncate text-foreground">{entry.label}</span>
-                  <span className="w-full truncate text-[10px] text-muted-foreground/70">{breadcrumb(entry)}</span>
-                </button>
-              ))
-            ) : (
-              <div className="px-3 py-4 text-center text-[11px] text-muted-foreground/70">No settings match</div>
-            )
-          ) : (
-            sections.map((section) => (
-              <button
-                key={section.key}
-                type="button"
-                data-active={activeSection === section.key}
-                onClick={() => {
-                  setActiveSection(section.key);
-                  setFocus(null);
-                }}
-                className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
-                  activeSection === section.key
-                    ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
-                    : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-                }`}
-              >
-                {section.label}
-                <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
-              </button>
-            ))
+        <div ref={contentRef} className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
+          {activeSection === 'models' && (
+            <ModelSettings config={config} updateConfig={updateConfig} focusTab={focusTab} focusNonce={focusNonce} />
+          )}
+          {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
+          {activeSection === 'plugin-bridge' && <PluginBridgeSettings focusTab={focusTab} focusNonce={focusNonce} />}
+          {activeSection === 'tools' && (
+            <CombinedToolsSettings
+              config={config}
+              updateConfig={updateConfig}
+              focusTab={focusTab}
+              focusNonce={focusNonce}
+            />
+          )}
+          {activeSection === 'automations' && (
+            <AutomationsSettings config={config} updateConfig={updateConfig} onOpenConversation={onOpenConversation} />
+          )}
+          {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
+          {activeSection === 'voice' && (
+            <VoiceSettings config={config} updateConfig={updateConfig} focusTab={focusTab} focusNonce={focusNonce} />
+          )}
+          {activeSection === 'media-generation' && (
+            <MediaGenerationSettings
+              config={config}
+              updateConfig={updateConfig}
+              focusTab={focusTab}
+              focusNonce={focusNonce}
+            />
+          )}
+          {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
+          {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
+          {activeSection === 'diagnostics' && <DiagnosticsSettings config={config} updateConfig={updateConfig} />}
+          {activeSection === 'general' && (
+            <ApplicationSettings
+              config={config}
+              updateConfig={updateConfig}
+              focusTab={focusTab}
+              focusNonce={focusNonce}
+            />
+          )}
+          {activeSection === 'browser' && (
+            <BrowserSettings config={config} updateConfig={updateConfig} conversationId={selectedConversationId} />
           )}
         </div>
-      </div>
-
-      <div ref={contentRef} className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
-        {activeSection === 'models' && (
-          <ModelSettings config={config} updateConfig={updateConfig} focusTab={focusTab} focusNonce={focusNonce} />
-        )}
-        {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
-        {activeSection === 'tools' && (
-          <CombinedToolsSettings
-            config={config}
-            updateConfig={updateConfig}
-            focusTab={focusTab}
-            focusNonce={focusNonce}
-          />
-        )}
-        {activeSection === 'automations' && (
-          <AutomationsSettings config={config} updateConfig={updateConfig} onOpenConversation={onOpenConversation} />
-        )}
-        {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'voice' && (
-          <VoiceSettings config={config} updateConfig={updateConfig} focusTab={focusTab} focusNonce={focusNonce} />
-        )}
-        {activeSection === 'media-generation' && (
-          <MediaGenerationSettings
-            config={config}
-            updateConfig={updateConfig}
-            focusTab={focusTab}
-            focusNonce={focusNonce}
-          />
-        )}
-        {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'diagnostics' && <DiagnosticsSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'general' && (
-          <ApplicationSettings
-            config={config}
-            updateConfig={updateConfig}
-            focusTab={focusTab}
-            focusNonce={focusNonce}
-          />
-        )}
-        {activeSection === 'browser' && (
-          <BrowserSettings config={config} updateConfig={updateConfig} conversationId={selectedConversationId} />
-        )}
-      </div>
       </div>
     </SettingsFocusContext.Provider>
   );

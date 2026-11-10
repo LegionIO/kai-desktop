@@ -23,7 +23,9 @@ import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
 import { notifyClientCountChanged } from '../local-bridge/local-server.js';
-import { invokeHandler } from './ipc-bridge.js';
+import { invokeHandler, invokeHumanWebHandler } from './ipc-bridge.js';
+import { handleMcpHttp, closeMcpHttpSessions } from '../mcp-sharing/http-hook.js';
+import { safeMcpLoginReturn } from '../mcp-sharing/oauth.js';
 import { ensureSelfSignedCert } from './self-signed.js';
 import { getLoginPageHtml } from './login-page.js';
 
@@ -492,6 +494,14 @@ export function getBridgeScript(): string {
       clear: function(opts) { return invoke('memory:clear', opts); },
       testEmbedding: function() { return invoke('memory:test-embedding'); }
     },
+    pluginBridge: {
+      snapshot: function() { return invoke('plugin-bridge:snapshot'); },
+      discover: function() { return invoke('plugin-bridge:discover'); },
+      mutate: function(change) { return invoke('plugin-bridge:mutate', change); },
+      previewClient: function(host) { return invoke('plugin-bridge:preview-client', host); },
+      applyClient: function(id, write) { return invoke('plugin-bridge:apply-client', id, write); },
+      createToken: function(name, days) { return invoke('plugin-bridge:create-token', name, days); }
+    },
     mcp: {
       testConnection: function(server) { return invoke('mcp:test-connection', server); },
       getStatus: function() { return invoke('mcp:status'); },
@@ -955,6 +965,14 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
   const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const urlPath = (req.url ?? '/').split('?')[0];
+    const mcpBrowserSession =
+      config.auth.mode === 'password' && hasValidSession(req)
+        ? crypto
+            .createHash('sha256')
+            .update(parseCookies(req)[__BRAND_APP_SLUG + '_session'])
+            .digest('hex')
+        : undefined;
+    if (handleMcpHttp(req, res, mcpBrowserSession)) return;
 
     // --- Auth-exempt API endpoints ---
 
@@ -1078,7 +1096,9 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     if (urlPath === '/login') {
       if (config.auth.mode === 'anonymous' || isAuthenticated(req, config)) {
-        res.writeHead(302, { Location: '/' });
+        res.writeHead(302, {
+          Location: safeMcpLoginReturn(new URL(req.url ?? '/', 'http://localhost').searchParams.get('returnTo')),
+        });
         res.end();
         return;
       }
@@ -1492,7 +1512,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
   httpServer.on('upgrade', handleUpgrade);
 
-  wss.on('connection', (ws: WebSocket) => {
+  wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
     webClients.add(ws);
 
     // Per-connection in-flight cap: each WS message spawns an independent async
@@ -1542,7 +1562,9 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         const invokeArgs = Array.isArray(msg.args) ? msg.args : [];
         inFlight += 1;
         try {
-          const result = await invokeHandler(msg.channel, ...invokeArgs);
+          const invoke =
+            config.auth.mode === 'password' && hasValidSession(request) ? invokeHumanWebHandler : invokeHandler;
+          const result = await invoke(msg.channel, ...invokeArgs);
           ws.send(JSON.stringify({ id, type: 'result', data: result }));
         } catch (err) {
           ws.send(
@@ -1638,6 +1660,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 }
 
 export async function stopWebServer(): Promise<void> {
+  await closeMcpHttpSessions();
   // Close all web client connections
   for (const ws of webClients) {
     try {

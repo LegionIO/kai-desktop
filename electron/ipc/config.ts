@@ -1,4 +1,5 @@
 import type { IpcMain } from 'electron';
+import { assertBridgeConfigWriteAllowed } from '../plugin-bridge/state.js';
 import { assertPluginLifecycleConfigWriteAllowed } from '../plugins/plugin-lifecycle-config-guard.js';
 import { readFileSync, existsSync, watch, mkdirSync, chmodSync, statSync, type FSWatcher } from 'fs';
 import { randomBytes } from 'crypto';
@@ -1080,6 +1081,8 @@ function applyExternalModelConfig(config: AppConfig, _appHome: string): AppConfi
 
 export function desktopConfigPayload(config: AppConfig): Record<string, unknown> {
   return {
+    pluginBridge: config.pluginBridge,
+    mcpExport: config.mcpExport,
     agent: config.agent,
     models: config.models,
     memory: config.memory,
@@ -1342,7 +1345,12 @@ export function registerConfigHandlers(
   mayWriteBrowserConfig: (event: unknown) => boolean = () => false,
   onBrowserChanged?: (config: AppConfig['browser']) => void,
   onWorkspaceConfigMutation?: (mutation: WorkspaceConfigMutation) => void,
-): { setConfig: (path: string, value: unknown) => void; reloadConfig: () => void; closeSettingsWatchers: () => void } {
+): {
+  setConfig: (path: string, value: unknown) => void;
+  setBridgeConfig: (path: 'pluginBridge' | 'mcpExport', value: unknown) => void;
+  reloadConfig: () => void;
+  closeSettingsWatchers: () => void;
+} {
   let currentConfig = readEffectiveConfig(appHome);
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
   let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
@@ -1589,7 +1597,8 @@ export function registerConfigHandlers(
   // Used by both the IPC handler and the plugin system.
   const llmProviderKeys = new Set(['anthropic', 'openai', 'gemini', 'bedrock', 'ollama']);
 
-  const setConfigImpl = (path: string, value: unknown): void => {
+  const setConfigImpl = (path: string, value: unknown, bridgeApproval = false): void => {
+    if (!bridgeApproval) assertBridgeConfigWriteAllowed(path);
     // Fold in any pending external edit BEFORE mutating (R169) so this internal write can't clobber
     // an external change that arrived within the reload debounce window.
     const flushed = flushPendingReload();
@@ -1750,5 +1759,13 @@ export function registerConfigHandlers(
     }
   };
 
-  return { setConfig: setConfigImpl, reloadConfig, closeSettingsWatchers };
+  return {
+    setConfig: (path, value) => setConfigImpl(path, value),
+    setBridgeConfig: (path, value) => {
+      if (!['pluginBridge', 'mcpExport'].includes(path)) throw new Error('Invalid bridge configuration section.');
+      setConfigImpl(path, appConfigSchema.shape[path].parse(value), true);
+    },
+    reloadConfig,
+    closeSettingsWatchers,
+  };
 }

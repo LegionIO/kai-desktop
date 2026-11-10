@@ -40,6 +40,7 @@ import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/mess
 import { rehydrateModelMedia, stripUnresolvedOffloadedMedia } from '../agent/offload-display-media.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
 import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submit-gate.js';
+import { settleBridgeTurn } from '../plugin-bridge/lifecycle.js';
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
@@ -207,6 +208,7 @@ import { applyPostToolUseHooks, prepareToolUseWithHooks } from '../agent/hooks/t
 
 type ActiveStreamState = {
   abort: () => void;
+  signal?: AbortSignal;
   token: string;
   /** Sticky provenance: this run was admitted with native Browser authority.
    * Revocation removes its tools but must not let a web/secondary surface take
@@ -346,6 +348,7 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
     }
   }
   if (activeStreams.get(conversationId)?.token !== token) return;
+  settleBridgeTurn(conversationId, activeStreams.get(conversationId)?.signal);
   // Finalize the GUI persistence fallback BEFORE dropping ownership: EVERY terminal path that
   // cleans up an owned stream — the main finally AND every early-exit (config error, hook denial,
   // provider return, etc.) — must run it, else a renderer reload loses the partial output and the
@@ -545,11 +548,7 @@ async function splitBranchMediaForTokenSum(
   // the single source of truth — a divergent inline copy previously over-counted
   // over-size / sanitizer-dropped media and wrongly shrank the media budget. appHome
   // lets it attribute an offloaded kai-media:// attachment its real size (else 0).
-  const { stripped, nativeMediaTokens, retainedMediaBytes } = await stripBranchMediaForCount(
-    messages,
-    signal,
-    appHome,
-  );
+  const { stripped, nativeMediaTokens, retainedMediaBytes } = await stripBranchMediaForCount(messages, signal, appHome);
   return { messages: stripped, nativeMediaTokens, branchMediaBytes: retainedMediaBytes };
 }
 
@@ -3466,6 +3465,11 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
   return workspaceToolDefinitions;
 }
 
+/** Bridge additions have their own source; native plugin and MCP reloads stay unchanged. */
+export function updateBridgeTools(tools: ToolDefinition[]): void {
+  registeredTools = normalizeRegisteredTools([...registeredTools.filter((tool) => tool.source !== 'bridge'), ...tools]);
+}
+
 /** Hot-swap MCP tools without touching built-in, skill, or plugin tools */
 export function updateMcpTools(mcpTools: ToolDefinition[]): void {
   const nonMcp = registeredTools.filter((t) => t.source !== 'mcp');
@@ -4174,6 +4178,7 @@ export function registerAgentHandlers(
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     activeStreams.set(conversationId, {
       abort: () => controller.abort(),
+      signal: controller.signal,
       token: streamToken,
       // Reserve Browser authority immediately for a primary-renderer request.
       // Runtime/plugin filtering below may downgrade it, but while asynchronous
@@ -4462,6 +4467,8 @@ export function registerAgentHandlers(
     {
       const promptDispatch = await hookDispatcher.dispatch('UserPromptSubmit', {
         conversationId,
+        cwd: effectiveCwd,
+        abortSignal: controller.signal,
         messages,
         systemPrompt: effectiveSystemPrompt,
         modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,

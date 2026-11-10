@@ -21,12 +21,17 @@ import { MAX_TOOL_NAME_LENGTH, makeSafeToolName } from '../../tools/naming.js';
 import { buildMcpToolContent } from '../tool-model-content.js';
 import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
 import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
+import { exportedResult } from '../../mcp-sharing/protocol.js';
+import { installImportedRuntimeProtocol, type RuntimeMcpEntry } from '../../plugin-bridge/runtime-protocol.js';
+import type { Server as McpProtocolServer } from '@modelcontextprotocol/sdk/server/index.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 // ---------------------------------------------------------------------------
 // Types (dynamic imports — avoid hard compile-time dependency on MCP SDK)
 // ---------------------------------------------------------------------------
 
 type McpServerInstance = {
+  server: McpProtocolServer;
   resource(
     name: string,
     uri: string,
@@ -39,10 +44,7 @@ type McpServerInstance = {
     name: string,
     description: string,
     schema: Record<string, unknown>,
-    handler: (args: Record<string, unknown>) => Promise<{
-      content: Array<Record<string, unknown> & { type: string }>;
-      isError?: boolean;
-    }>,
+    handler: (args: Record<string, unknown>) => Promise<CallToolResult>,
   ): unknown;
   connect(transport: unknown): Promise<void>;
   close(): Promise<void>;
@@ -69,7 +71,7 @@ export function getCodexMcpToolEntries(tools: ToolDefinition[]): CodexMcpToolEnt
   for (const tool of tools) {
     // Prefer originalName (e.g. "rally_list_user_story_tasks") over the scoped
     // name (e.g. "plugin__rally__rally_list_user_story_tasks") for model use.
-    const preferredName = makeCodexMcpToolName(tool.originalName ?? tool.name);
+    const preferredName = makeCodexMcpToolName(tool.bridge ? tool.name : (tool.originalName ?? tool.name));
     const fallbackName = makeCodexMcpToolName(tool.name);
     const name = seen.has(preferredName) ? makeUniqueToolName(fallbackName, seen) : preferredName;
     seen.add(name);
@@ -125,6 +127,10 @@ export function buildCodexMcpServerConfig(
 ): Record<string, unknown> {
   return {
     url,
+    // Imported tools are part of this turn's approved execution plan. Do not
+    // start the model with an incomplete catalog when optional MCP startup
+    // grace expires; an unavailable import must fail explicitly.
+    ...(tools.some((tool) => tool.bridge) ? { required: true } : {}),
     // Codex CLI's streamable-HTTP MCP transport reads the bearer token from
     // an env var named here, NOT from an http_headers map. The runtime sets
     // process.env[<authTokenEnvVar>] before spawning the CLI. The env var
@@ -298,19 +304,27 @@ export class CodexMcpBridge {
     // 2. Register each Kai tool
     //    Use originalName when available for cleaner tool names in the Codex CLI.
     //    Map from MCP-facing name back to the internal tool for handler dispatch.
+    const runtimeEntries: RuntimeMcpEntry[] = [];
     for (const { name: finalName, tool } of toolEntries) {
       const zodShape = extractZodShape(tool.inputSchema);
 
       // Build the handler
       const boundTool = tool;
-      const handler = async (args: Record<string, unknown>) => {
+      const handler = async (
+        args: Record<string, unknown>,
+        extra?: { signal: AbortSignal; onProgress?: ToolExecutionContext['onProgress'] },
+      ): Promise<CallToolResult> => {
         const toolCallId = `codex-mcp-${randomUUID()}`;
         const context: ToolExecutionContext = {
           toolCallId,
           conversationId,
           browserOwnerId,
           cwd,
-          abortSignal,
+          abortSignal:
+            boundTool.bridge && extra?.signal
+              ? AbortSignal.any([extra.signal, ...(abortSignal ? [abortSignal] : [])])
+              : abortSignal,
+          onProgress: extra?.onProgress,
         };
 
         try {
@@ -334,6 +348,7 @@ export class CodexMcpBridge {
             },
             execute: (validatedArgs) => boundTool.execute(validatedArgs, context),
           });
+          if (boundTool.bridge) return exportedResult(result);
           // A tool that returns an error-shaped result (isError / error field)
           // must surface as an MCP error, not a successful call — otherwise Codex
           // treats a failed tool as success.
@@ -348,6 +363,7 @@ export class CodexMcpBridge {
           };
         }
       };
+      runtimeEntries.push({ name: finalName, tool, call: handler });
 
       // Register with McpServer — use shape if available, otherwise pass empty shape
       if (zodShape) {
@@ -356,6 +372,7 @@ export class CodexMcpBridge {
         (this.mcpServer as unknown as McpServerInstance).tool(finalName, tool.description ?? '', {}, handler);
       }
     }
+    if (tools.some((tool) => tool.bridge)) installImportedRuntimeProtocol(this.mcpServer.server, runtimeEntries);
 
     // 3. Create transport (stateful mode — required for multi-request MCP sessions)
     this.transport = new StreamableHTTPServerTransport({

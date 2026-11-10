@@ -9,7 +9,7 @@
  *
  * POSIX-only (unix-domain socket); skipped on win32.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import net from 'net';
 import type { Server, Socket } from 'net';
 import { mkdtempSync, rmSync } from 'fs';
@@ -109,6 +109,23 @@ afterEach(async () => {
 });
 
 describe.skipIf(isWin)('LocalBridgeClient', () => {
+  it('stops pending reconnect retries when the connector lifetime ends', async () => {
+    client = new LocalBridgeClient(socketPath, 'fixture-token');
+    const controller = new AbortController();
+    const attempts = vi.spyOn(client, 'connect');
+    const reconnecting = client.reconnect(60_000, controller.signal);
+    await vi.waitFor(() => expect(attempts).toHaveBeenCalled());
+    controller.abort();
+    expect(await reconnecting).toBe(false);
+    expect(client.isConnected()).toBe(false);
+    const count = attempts.mock.calls.length;
+    await startServer();
+    // An already-cancelled recovery must not attach even when a backend appears.
+    expect(await client.reconnect(60_000, controller.signal)).toBe(false);
+    expect(attempts).toHaveBeenCalledTimes(count);
+    expect(serverSockets).toHaveLength(0);
+  });
+
   it('connects and completes the auth handshake when a token is provided', async () => {
     await startServer();
     client = new LocalBridgeClient(socketPath, 'the-token');

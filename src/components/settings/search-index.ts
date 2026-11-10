@@ -17,6 +17,7 @@ export const SECTION_LABELS: Record<SettingsSection, string> = {
   models: 'Models',
   usage: 'Usage',
   tools: 'Tools',
+  'plugin-bridge': 'Plugin Bridge',
   automations: 'Automations',
   general: 'Application',
   browser: 'Browser',
@@ -29,6 +30,9 @@ export const SECTION_LABELS: Record<SettingsSection, string> = {
 };
 
 export const TAB_LABELS: Record<string, string> = {
+  imports: 'Import Plugins',
+  sharing: 'Share Kai',
+  activity: 'Activity',
   // Models
   profiles: 'Profiles',
   runtimes: 'Runtimes',
@@ -53,6 +57,28 @@ export const TAB_LABELS: Record<string, string> = {
 };
 
 export const SETTINGS_INDEX: SettingsSearchEntry[] = [
+  {
+    id: 'pluginBridge.enabled',
+    label: 'Import installed Claude and Codex plugins',
+    section: 'plugin-bridge',
+    tab: 'imports',
+    keywords: ['bridge', 'clanks', 'permissions', 'dedup', 'hooks'],
+  },
+  {
+    id: 'mcpExport.enabled',
+    label: 'Share Kai tools through MCP',
+    section: 'plugin-bridge',
+    tab: 'sharing',
+    keywords: ['export', 'connector', 'msgraph', 'claude', 'codex'],
+  },
+  {
+    id: 'mcpExport.remote',
+    fallbackId: 'mcpExport.enabled',
+    label: 'Remote MCP sharing, OAuth and tokens',
+    section: 'plugin-bridge',
+    tab: 'sharing',
+    keywords: ['authentication', 'https', 'revoke'],
+  },
   {
     id: 'browser.dataScope',
     label: 'Browser data scope',

@@ -160,16 +160,36 @@ export class LocalBridgeClient {
    * the socket path until `deadlineMs` elapses (a survivor may be re-electing /
    * respawning a backend). Returns true on success.
    */
-  async reconnect(deadlineMs: number): Promise<boolean> {
+  async reconnect(deadlineMs: number, signal?: AbortSignal): Promise<boolean> {
     const start = Date.now();
-    for (;;) {
-      try {
-        await this.connect();
-        return true;
-      } catch {
-        if (Date.now() - start > deadlineMs) return false;
-        await new Promise((r) => setTimeout(r, 300));
+    const cancel = () => this.close();
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+      for (;;) {
+        if (signal?.aborted) return false;
+        try {
+          await this.connect();
+          if (signal?.aborted) {
+            this.close();
+            return false;
+          }
+          return true;
+        } catch {
+          if (signal?.aborted || Date.now() - start > deadlineMs) return false;
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              signal?.removeEventListener('abort', done);
+              resolve();
+            };
+            const timer = setTimeout(done, 300);
+            signal?.addEventListener('abort', done, { once: true });
+            if (signal?.aborted) done();
+          });
+        }
       }
+    } finally {
+      signal?.removeEventListener('abort', cancel);
     }
   }
 

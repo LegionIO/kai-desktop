@@ -55,6 +55,12 @@ export async function detectCodexSdk(): Promise<boolean> {
   return _codexCliPath !== false;
 }
 
+/** Use the detected host CLI when the SDK's optional bundled binary is absent. */
+export async function resolveCodexCliPath(): Promise<string | undefined> {
+  if (typeof _codexCliPath !== 'string') _codexCliPath = resolveCliPath('codex');
+  return _codexCliPath || undefined;
+}
+
 /**
  * Returns `true` when the `pi` CLI binary is found on PATH.
  * Required for the pi coding-agent runtime to function.

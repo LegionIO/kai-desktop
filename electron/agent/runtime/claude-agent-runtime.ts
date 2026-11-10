@@ -48,6 +48,10 @@ import { homedir } from 'os';
 import type { z } from 'zod';
 import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
 import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { Server as McpProtocolServer } from '@modelcontextprotocol/sdk/server/index.js';
+import { exportedResult } from '../../mcp-sharing/protocol.js';
+import { installImportedRuntimeProtocol, type RuntimeMcpEntry } from '../../plugin-bridge/runtime-protocol.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging
@@ -203,6 +207,10 @@ const CLAUDE_CAPABILITIES: RuntimeCapabilities = {
  * Keep in sync with @anthropic-ai/claude-agent-sdk when updating.
  */
 type SdkOptions = {
+  settingSources?: Array<'user' | 'project' | 'local'>;
+  strictMcpConfig?: boolean;
+  plugins?: Array<{ type: 'local'; path: string }>;
+  settings?: { enabledPlugins: Record<string, boolean> };
   abortController?: AbortController;
   cwd?: string;
   model?: string;
@@ -339,6 +347,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // (buildScopedToolName), but we enforce it here as a safety net.
         const usedNames = new Set<string>();
 
+        const runtimeEntries: RuntimeMcpEntry[] = [];
         const sdkTools = bridgeableTools.map((t) => {
           let safeName = t.name.length > MAX_TOOL_NAME_LENGTH ? t.name.slice(0, MAX_TOOL_NAME_LENGTH) : t.name;
           // Resolve collisions from truncation by appending a counter
@@ -355,12 +364,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
             debugLog(`[BRIDGE] Truncated tool name lengths source=${t.name.length} resolved=${safeName.length}`);
           }
           const rawShape = extractZodShape(t.inputSchema);
-          return sdkTool(
-            safeName,
-            t.description ?? '',
-            rawShape,
-            createToolHandler(t, conversationId, cwd, abortSignal, options.browserOwnerId),
-          );
+          const handler = createToolHandler(t, conversationId, cwd, abortSignal, options.browserOwnerId);
+          runtimeEntries.push({ name: safeName, tool: t, call: handler });
+          return sdkTool(safeName, t.description ?? '', rawShape, handler);
         });
 
         const kaiServer = sdkCreateMcpServer({
@@ -368,6 +374,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
           version: '1.0.0',
           tools: sdkTools,
         });
+        if (bridgeableTools.some((tool) => tool.bridge))
+          installImportedRuntimeProtocol(
+            (kaiServer as { instance: { server: McpProtocolServer } }).instance.server,
+            runtimeEntries,
+          );
 
         mcpServers = { kai: kaiServer };
         debugLog(`[BRIDGE] Created MCP bridge toolCount=${sdkTools.length}`);
@@ -500,6 +511,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     );
 
     const sdkOptions: SdkOptions = {
+      // Kai owns plugin consent and MCP loading. Keep the normal auth/session
+      // home, but never inherit standalone Claude plugin or MCP enablement.
+      settingSources: [],
+      strictMcpConfig: true,
+      plugins: [],
+      settings: { enabledPlugins: {} },
       abortController,
       // Default to homedir when no working directory is set. Using process.cwd()
       // would point at the kai-desktop source tree, causing the Claude Code
@@ -1141,16 +1158,6 @@ function extractZodShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
   return { input: schema };
 }
 
-/** MCP CallToolResult shape returned by tool handlers. */
-type CallToolResult = {
-  content: Array<
-    | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mimeType: string }
-    | { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } }
-  >;
-  isError?: boolean;
-};
-
 type ClaudeToolExecutionContext = ToolExecutionContext & {
   conversationId: string;
   /** The OWNING run's stream token, captured at handler creation (bound to THIS run). Lets the
@@ -1177,12 +1184,17 @@ function createToolHandler(
   const owningStreamToken = getActiveStreamTokenForConversation(conversationId);
   // Approval-backed special tools stay inside this wrapper so lifecycle hooks
   // can deny or rewrite their input and sanitize their result.
-  return async (args: unknown): Promise<CallToolResult> => {
+  return async (args: unknown, extra: unknown): Promise<CallToolResult> => {
+    const request = extra as { signal?: AbortSignal; onProgress?: ToolExecutionContext['onProgress'] } | undefined;
+    const callSignal =
+      toolDef.bridge && request?.signal
+        ? AbortSignal.any([request.signal, ...(abortSignal ? [abortSignal] : [])])
+        : abortSignal;
     // If THIS run was already aborted (superseded / Stopped) before a queued callback fires, do NOT
     // execute enter_plan_mode (R144 f-1): it would persist plan-first but never emit the result
     // MAIN's mid-stream interception needs to restart, so the SUCCESSOR run continues with its
     // mutating tool set while disk/UI show Plan-First. The turn is over — refuse.
-    if (toolDef.name === 'enter_plan_mode' && abortSignal?.aborted) {
+    if (toolDef.name === 'enter_plan_mode' && callSignal?.aborted) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'The turn was stopped.' }) }],
         isError: true,
@@ -1196,7 +1208,8 @@ function createToolHandler(
       conversationId,
       browserOwnerId,
       cwd,
-      abortSignal,
+      abortSignal: callSignal,
+      onProgress: request?.onProgress,
       owningStreamToken,
       // The SDK runtime IS a gateable plan-mode context: enter_plan_mode restarts via MAIN's
       // name-stamped mid-stream interception (R139) and exit_plan_mode is gated below. So the plan
@@ -1225,6 +1238,7 @@ function createToolHandler(
           return toolDef.execute(validatedArgs, context);
         },
       });
+      if (toolDef.bridge) return exportedResult(result);
       // Surface an error-shaped tool result as a tool error, not a success.
       const resultIsError =
         !!result &&

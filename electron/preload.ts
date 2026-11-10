@@ -1,4 +1,5 @@
 import type { McpApi, McpServerConfig, McpStatus, McpLogin, McpLogout, McpTestResult } from '../shared/mcp.js';
+import type { PluginBridgeApi, BridgeMutation, PluginHost } from '../shared/plugin-bridge.js';
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface } from '../shared/computer-use.js';
 import type { AppShotPayload } from '../shared/app-shots.js';
@@ -360,6 +361,15 @@ const appAPI = {
         error?: string;
       }>,
   },
+
+  pluginBridge: {
+    snapshot: () => ipcRenderer.invoke('plugin-bridge:snapshot'),
+    discover: () => ipcRenderer.invoke('plugin-bridge:discover'),
+    mutate: (change: BridgeMutation) => ipcRenderer.invoke('plugin-bridge:mutate', change),
+    previewClient: (host: PluginHost) => ipcRenderer.invoke('plugin-bridge:preview-client', host),
+    applyClient: (id: string, write: boolean) => ipcRenderer.invoke('plugin-bridge:apply-client', id, write),
+    createToken: (name: string, days: number) => ipcRenderer.invoke('plugin-bridge:create-token', name, days),
+  } satisfies PluginBridgeApi,
 
   mcp: {
     testConnection: (server: McpServerConfig) =>

@@ -15,6 +15,7 @@ import type { AgentRuntime, RuntimeId } from './types.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
 import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-compat.js';
+import { attachBridgeRuntime } from '../../plugin-bridge/lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // Registry state
@@ -28,6 +29,7 @@ const runtimes = new Map<RuntimeId, AgentRuntime>();
 
 /** Register a runtime adapter.  Overwrites any previous registration. */
 export function registerRuntime(runtime: AgentRuntime): void {
+  attachBridgeRuntime(runtime);
   runtimes.set(runtime.id, runtime);
 }
 

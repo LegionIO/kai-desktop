@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { existsSync } from 'fs';
 import { tryConnect, type LocalBridgeClient } from './client.js';
 
@@ -39,7 +39,10 @@ export function checkVersionMismatch(client: LocalBridgeClient): string | null {
  */
 export function spawnHeadlessBackend(fromElectron: boolean): Promise<boolean> {
   if (fromElectron) {
-    const child = spawn(process.execPath, ['--kai-headless'], {
+    // Unpackaged Electron needs the same entry point as the connector. Without
+    // it, Electron opens its welcome page instead of starting Kai's backend.
+    const args = process.defaultApp ? [resolve(process.argv[1]), '--kai-headless'] : ['--kai-headless'];
+    const child = spawn(process.execPath, args, {
       detached: true,
       stdio: 'ignore',
       env: { ...process.env, KAI_HEADLESS: '1', KAI_CLI: '' },
@@ -123,9 +126,16 @@ export async function waitForSocket(
  * surviving/re-elected leader first, else spawn a fresh headless backend and
  * reconnect. Preserves the client's event subscriptions.
  */
-export async function recoverBackend(client: LocalBridgeClient, fromElectron: boolean): Promise<boolean> {
-  if (await client.reconnect(6000)) return true;
+export async function recoverBackend(
+  client: LocalBridgeClient,
+  fromElectron: boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return false;
+  if (await client.reconnect(6000, signal)) return true;
+  if (signal?.aborted) return false;
   cliLog('backend gone — starting a new headless one…');
   if (!(await spawnHeadlessBackend(fromElectron))) return false;
-  return client.reconnect(BOOT_TIMEOUT_MS);
+  if (signal?.aborted) return false;
+  return client.reconnect(BOOT_TIMEOUT_MS, signal);
 }

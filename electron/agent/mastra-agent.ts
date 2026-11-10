@@ -1,3 +1,5 @@
+import { bridgeStream } from '../plugin-bridge/lifecycle.js';
+import { importedResultForModel } from '../mcp-sharing/protocol.js';
 import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
 import {
@@ -230,8 +232,8 @@ function withTemperatureOmissionHeader(modelConfig: LLMModelConfig): LLMModelCon
   };
 }
 
-function toMastraInputSchema(inputSchema: ToolDefinition['inputSchema']) {
-  const jsonSchema = z.toJSONSchema(inputSchema, { target: 'draft-7' }) as JsonStandardSchemaInput & {
+function toMastraInputSchema(inputSchema: ToolDefinition['inputSchema'], original?: Record<string, unknown>) {
+  const jsonSchema = (original ?? z.toJSONSchema(inputSchema, { target: 'draft-7' })) as JsonStandardSchemaInput & {
     properties?: Record<string, unknown>;
     additionalProperties?: unknown;
   };
@@ -291,7 +293,7 @@ function toMastraTools(
     result[tool.name] = createTool({
       id: tool.name,
       description: tool.description,
-      inputSchema: toMastraInputSchema(tool.inputSchema),
+      inputSchema: toMastraInputSchema(tool.inputSchema, tool.bridge ? tool.jsonInputSchema : undefined),
       execute: async (input, options) => {
         const mastraOptions = options as MastraToolExecutionOptions | undefined;
         // Mastra's adapter can surface the tool-call id EITHER at the top level
@@ -373,7 +375,7 @@ function toMastraTools(
       // native model content, so the model sees real images rather than an
       // opaque base64 string buried in JSON. Falls back to json/text otherwise.
       toModelOutput: (output: unknown) => {
-        const { modelContent, cleaned } = extractModelContent(output);
+        const { modelContent, cleaned } = extractModelContent(tool.bridge ? importedResultForModel(output) : output);
         if (!modelContent) {
           return typeof cleaned === 'string'
             ? { type: 'text', value: cleaned }
@@ -1219,7 +1221,30 @@ export async function createWorkspaceToolDefinitions(
     }));
 }
 
-export async function* streamAgentResponse(
+export function streamAgentResponse(...args: Parameters<typeof streamAgentResponseImpl>): AsyncGenerator<StreamEvent> {
+  const [conversationId, messages, modelConfig, config, tools, dbPath, options] = args;
+  return bridgeStream(
+    (next) =>
+      streamAgentResponseImpl(conversationId, next.messages, modelConfig, next.config, tools, dbPath, {
+        ...options,
+        abortSignal: next.abortSignal,
+      }),
+    'mastra',
+    {
+      conversationId,
+      messages,
+      config,
+      tools,
+      appHome: '',
+      cwd: options?.cwd,
+      abortSignal: options?.abortSignal,
+      parentModelKey: options?.parentModelKey,
+      conversationMetadata: { parentConversationId: options?.bridgeParentConversationId },
+    },
+  );
+}
+
+async function* streamAgentResponseImpl(
   conversationId: string,
   messages: unknown[],
   modelConfig: LLMModelConfig,
@@ -1229,6 +1254,7 @@ export async function* streamAgentResponse(
   options?: {
     reasoningEffort?: ReasoningEffort;
     abortSignal?: AbortSignal;
+    bridgeParentConversationId?: string;
     cwd?: string;
     /** No live user watching this run — see ToolExecutionContext.isHeadless. */
     isHeadless?: boolean;
@@ -2138,6 +2164,7 @@ export async function* streamWithFallback(
   options?: {
     reasoningEffort?: ReasoningEffort;
     abortSignal?: AbortSignal;
+    bridgeParentConversationId?: string;
     cwd?: string;
     /** No live user watching this run — see ToolExecutionContext.isHeadless. */
     isHeadless?: boolean;

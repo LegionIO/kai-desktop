@@ -29,7 +29,7 @@
 import { _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 
 export interface ElectronHandle {
   app: ElectronApplication;
@@ -62,10 +62,10 @@ function launchArgs(mainPath: string): string[] {
 }
 
 export async function launchElectronForSmoke(
-  options: { browserIntegrationTest?: boolean } = {},
+  options: { browserIntegrationTest?: boolean; relativeEntry?: boolean } = {},
 ): Promise<ElectronHandle> {
   const userDataDir = mkdtempSync(join(tmpdir(), 'kai-ipc-smoke-'));
-  const mainPath = mainEntryPoint();
+  const mainPath = options.relativeEntry ? relative(process.cwd(), mainEntryPoint()) : mainEntryPoint();
 
   const app = await electron.launch({
     args: launchArgs(mainPath),

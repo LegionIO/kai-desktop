@@ -17,6 +17,8 @@ import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js'
 import { buildMcpToolContent } from '../tool-model-content.js';
 import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
 import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
+import { exportedResult } from '../../mcp-sharing/protocol.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,14 +30,7 @@ export type McpToolListEntry = {
   inputSchema: Record<string, unknown>;
 };
 
-export type McpToolCallResult = {
-  content: Array<
-    | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mimeType: string }
-    | { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } }
-  >;
-  isError?: boolean;
-};
+export type McpToolCallResult = CallToolResult;
 
 // ---------------------------------------------------------------------------
 // Schema conversion cache
@@ -109,9 +104,11 @@ export class ToolMcpBridge {
   /** Returns tool definitions in MCP list_tools format with real JSON Schemas. */
   listTools(): McpToolListEntry[] {
     return Array.from(this.tools.values()).map((tool) => ({
+      ...(tool.bridge ? tool.mcpDescriptor : {}),
       name: tool.name,
       description: tool.description ?? '',
-      inputSchema: zodToJsonSchemaObject(tool.inputSchema),
+      inputSchema: (tool.bridge ? tool.jsonInputSchema : undefined) ?? zodToJsonSchemaObject(tool.inputSchema),
+      ...(tool.bridge && tool.jsonOutputSchema ? { outputSchema: tool.jsonOutputSchema } : {}),
     }));
   }
 
@@ -155,6 +152,7 @@ export class ToolMcpBridge {
         },
         execute: (validatedArgs) => tool.execute(validatedArgs, context),
       });
+      if (tool.bridge) return exportedResult(result);
 
       // Surface an error-shaped tool result as an MCP error, not a success.
       const resultIsError =

@@ -131,7 +131,8 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
     })
   }).then(function(res) {
     if (res.ok) {
-      window.location.href = '/';
+      const next = new URLSearchParams(window.location.search).get('returnTo') || '/';
+      window.location.href = /^\\/mcp\\/consent\\?request=[A-Za-z0-9_-]{43}$/.test(next) ? next : '/';
     } else {
       err.classList.add('visible');
       btn.disabled = false;

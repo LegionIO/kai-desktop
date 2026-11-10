@@ -218,15 +218,8 @@ async function connectMcpServerInner(
     // Discover tools (time-boxed so a server that accepts the connection but hangs on listTools
     // can't stall the serial startup for the SDK-default 60s — R169).
     const { tools: mcpTools } = await withTimeout(client.listTools(), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP listTools');
-    const tools: ToolDefinition[] = mcpTools.map((t) => ({
-      name: buildScopedToolName('mcp', server.name, t.name),
-      description: `[MCP: ${server.name}] ${t.description ?? t.name}`,
-      inputSchema: t.inputSchema ? jsonSchemaToZod(t.inputSchema as Record<string, unknown>) : z.object({}),
-      source: 'mcp',
-      sourceId: server.name,
-      originalName: t.name,
-      aliases: [`${server.name}:${t.name}`],
-      execute: async (input: unknown, context?: ToolExecutionContext) => {
+    const tools: ToolDefinition[] = mcpTools.map((t) => {
+      const executeMcp = async (input: unknown, context?: ToolExecutionContext) => {
         // Propagate chat/user cancellation and cap the call so a hung MCP server
         // can't keep the tool promise (and the agent turn) alive forever.
         const current = connections.get(server.name);
@@ -237,23 +230,50 @@ async function connectMcpServerInner(
             auth?.reason,
           );
         }
-        const result = await current.client.callTool(
-          { name: t.name, arguments: input as Record<string, unknown> },
-          undefined,
-          {
-            ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
-            timeout: MCP_CALL_TIMEOUT_MS,
-            resetTimeoutOnProgress: true,
-            maxTotalTimeout: MCP_CALL_MAX_TOTAL_MS,
-          },
-        );
-        if (result.isError) throw new Error(JSON.stringify(result.content));
-        // Extract text from content array
-        const content = result.content as Array<{ type: string; text?: string }>;
-        if (content.length === 1 && content[0].type === 'text') return content[0].text;
-        return result.content;
-      },
-    }));
+        return current.client.callTool({ name: t.name, arguments: input as Record<string, unknown> }, undefined, {
+          ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
+          timeout: MCP_CALL_TIMEOUT_MS,
+          resetTimeoutOnProgress: true,
+          maxTotalTimeout: MCP_CALL_MAX_TOTAL_MS,
+          ...(context?.connectorClientId && context.onProgress
+            ? {
+                onprogress: (progress: { progress: number; total?: number; message?: string }) =>
+                  context.onProgress?.({
+                    progress: progress.progress,
+                    total: progress.total,
+                    stream: 'stdout',
+                    delta: progress.message ?? '',
+                    output: progress.message ?? '',
+                    bytesSeen: progress.progress,
+                    truncated: false,
+                    stopped: false,
+                  }),
+              }
+            : {}),
+        });
+      };
+      return {
+        name: buildScopedToolName('mcp', server.name, t.name),
+        description: `[MCP: ${server.name}] ${t.description ?? t.name}`,
+        inputSchema: t.inputSchema ? jsonSchemaToZod(t.inputSchema as Record<string, unknown>) : z.object({}),
+        jsonInputSchema: t.inputSchema,
+        jsonOutputSchema: t.outputSchema,
+        mcpDescriptor: { title: t.title, annotations: t.annotations, _meta: t._meta, icons: t.icons },
+        source: 'mcp',
+        sourceId: server.name,
+        originalName: t.name,
+        aliases: [`${server.name}:${t.name}`],
+        executeMcp,
+        execute: async (input: unknown, context?: ToolExecutionContext) => {
+          const result = await executeMcp(input, context);
+          if (result.isError) throw new Error(JSON.stringify(result.content));
+          // Extract text from content array
+          const content = result.content as Array<{ type: string; text?: string }>;
+          if (content.length === 1 && content[0].type === 'text') return content[0].text;
+          return result.content;
+        },
+      };
+    });
 
     const connection: McpConnection = {
       name: server.name,

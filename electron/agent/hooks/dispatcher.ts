@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { dispatchBridgeEvent, hasBridgeHooks } from '../../plugin-bridge/lifecycle.js';
 import type { AppConfig, AutomationRule } from '../../config/schema.js';
 import { eventBus } from '../../automations/event-bus.js';
 import { evaluateConditions } from '../../automations/conditions.js';
@@ -376,6 +377,7 @@ export class HookDispatcher {
    * generation) must be gated through that event's enforcement too.
    */
   hasEnforcingHooksFor(event: HookEvent): boolean {
+    if (hasBridgeHooks() && ENFORCING_HOOK_EVENTS.has(event)) return true;
     const cfg = this.safeConfig();
     if (cfg && (cfg.hooks?.enabled ?? true)) this.syncUserHooks(cfg);
     if (!(cfg?.hooks?.enabled ?? true)) return false;
@@ -449,7 +451,10 @@ export class HookDispatcher {
     const enabled = cfg?.hooks?.enabled ?? true;
     const timeoutMs = cfg?.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    if (!enabled) return { payload, denied: false, modified: false };
+    const bridge = await dispatchBridgeEvent(event, payload);
+    if (!enabled) return bridge;
+    if (bridge.denied) return bridge;
+    payload = bridge.payload;
 
     if (cfg) this.syncUserHooks(cfg);
 
@@ -477,13 +482,13 @@ export class HookDispatcher {
 
     if (list.length === 0) {
       emitObserve(payload);
-      return { payload, denied: false, modified: false };
+      return { payload, denied: false, modified: bridge.modified };
     }
 
     const ordered = [...list].sort((a, b) => (a.source === b.source ? 0 : a.source === 'plugin' ? -1 : 1));
     const toolName = extractToolName(payload);
     let current = payload;
-    let modified = false;
+    let modified = bridge.modified;
 
     for (const reg of ordered) {
       if ((event === 'PreToolUse' || event === 'PostToolUse') && !matchesToolName(reg.matcher, toolName)) {

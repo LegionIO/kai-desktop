@@ -1,3 +1,4 @@
+import { endBridgeSession } from '../plugin-bridge/lifecycle.js';
 import type { IpcMain, IpcMainInvokeEvent } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
@@ -156,6 +157,7 @@ function broadcastChange(change: ConversationChange): void {
 }
 
 export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {
+  if (conversation.archived) void endBridgeSession(conversation.id).catch(() => {});
   // A suppressed (tombstoned) writeConversation returns the record it was ASKED to write
   // unchanged — nothing landed on disk. Broadcasting it would make clients recreate a phantom
   // deleted conversation absent from disk. Guard the single upsert chokepoint: if this id was
@@ -178,6 +180,7 @@ export function broadcastUpsert(appHome: string, conversation: ConversationRecor
   }
 }
 function broadcastDelete(appHome: string, id: string): void {
+  void endBridgeSession(id).catch(() => {});
   // If the DURABLE index write during delete/clear FAILED, the on-disk index still lists this id as
   // the active conversation (R163 f-1); getActiveConversationId would echo the just-deleted id and
   // other windows would retain it as active despite the list filtering it out. A deleted conversation

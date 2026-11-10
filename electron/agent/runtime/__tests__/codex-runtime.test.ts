@@ -66,6 +66,7 @@ vi.mock('@openai/codex-sdk', () => {
 
 vi.mock('../detect.js', () => ({
   detectCodexSdk: vi.fn(async () => true),
+  resolveCodexCliPath: vi.fn(async () => '/fixture/bin/codex'),
 }));
 
 // Bridge — we don't want it actually starting an MCP server.
@@ -143,6 +144,28 @@ describe('CodexRuntime', () => {
   });
 
   describe('stream — streaming events', () => {
+    it('keeps non-fatal SDK notices from ending a successful turn', async () => {
+      codexState.events = [
+        { type: 'item.completed', item: { id: 'notice', type: 'error', message: 'Deprecated host setting.' } },
+        { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Tool use completed.' } },
+      ];
+      const events = await collect(new CodexRuntime().stream(makeOptions()));
+      expect(events.some((event) => event.type === 'error')).toBe(false);
+      expect(events).toContainEqual({
+        conversationId: 'conv-1',
+        type: 'observer-message',
+        data: { toolCallId: 'notice', toolName: 'Codex notice', message: 'Deprecated host setting.' },
+      });
+      expect(events.some((event) => event.type === 'text-delta' && event.text === 'Tool use completed.')).toBe(true);
+    });
+    it.each([
+      { type: 'error', message: 'Fatal stream failure.' },
+      { type: 'turn.failed', error: { message: 'Fatal stream failure.' } },
+    ])('retains a fatal $type event', async (failure) => {
+      codexState.events = [failure];
+      const events = await collect(new CodexRuntime().stream(makeOptions()));
+      expect(events).toContainEqual({ conversationId: 'conv-1', type: 'error', error: 'Fatal stream failure.' });
+    });
     it('translates thread.started + agent_message into enrichment + text-delta + done', async () => {
       codexState.events = [
         { type: 'thread.started', thread_id: 'thr-1' },

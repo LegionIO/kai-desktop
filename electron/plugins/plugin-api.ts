@@ -450,6 +450,11 @@ function normalizePluginTool(tool: ToolDefinition): ToolDefinition {
   return {
     ...tool,
     inputSchema,
+    // Retain the original schema for the optional MCP sharing transport. The
+    // native tool still uses its existing normalized validator and executor.
+    ...(!isZodSchema(rawSchema) && rawSchema && typeof rawSchema === 'object'
+      ? { jsonInputSchema: tool.jsonInputSchema ?? (rawSchema as Record<string, unknown>) }
+      : {}),
   };
 }
 

@@ -1,8 +1,12 @@
 import type { z } from 'zod';
+import type { Tool as McpTool } from '@modelcontextprotocol/sdk/types.js';
 
-export type ToolSource = 'builtin' | 'mcp' | 'skill' | 'plugin' | 'cli' | 'browser';
+export type ToolSource = 'builtin' | 'mcp' | 'skill' | 'plugin' | 'cli' | 'browser' | 'bridge';
 
 export type ToolProgressEvent = {
+  /** MCP progress values retain their units; bytesSeen remains the UI fallback. */
+  progress?: number;
+  total?: number;
   stream: 'stdout' | 'stderr';
   delta: string;
   output: string;
@@ -19,6 +23,8 @@ export type ToolProgressEvent = {
 };
 
 export type ToolExecutionContext = {
+  bridgeSessionId?: string;
+  connectorClientId?: string;
   toolCallId: string;
   conversationId?: string;
   /** Unique owner for the current assistant run. Browser tabs and control leases
@@ -51,6 +57,14 @@ export type ToolExecutionContext = {
 };
 
 export type ToolDefinition = {
+  jsonInputSchema?: Record<string, unknown>;
+  jsonOutputSchema?: Record<string, unknown>;
+  mcpDescriptor?: Pick<McpTool, 'title' | 'annotations' | '_meta' | 'icons'>;
+  /** Preserve the source MCP envelope for connectors without changing native chat results. */
+  executeMcp?: (input: unknown, context: ToolExecutionContext) => Promise<unknown>;
+  bridge?: { instanceId: string; pluginId: string; componentId: string; origin: string[] };
+  /** Optional explicit eligibility for a tool needing a chat/UI context. */
+  mcpExportUnavailableReason?: string;
   name: string;
   description: string;
   inputSchema: z.ZodTypeAny;

@@ -16,13 +16,14 @@
 
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
 import { RUNTIME_BRIDGE_SKIP_TOOLS } from './types.js';
-import { detectCodexSdk } from './detect.js';
+import { detectCodexSdk, resolveCodexCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import { buildCodexMcpPrompt, buildCodexMcpServerConfig, CodexMcpBridge } from './codex-mcp-bridge.js';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { createRequire } from 'module';
 import { dirname, join, sep } from 'path';
 import { tmpdir } from 'os';
+import { codexIsolationConfig } from '../../plugin-bridge/runtime-isolation.js';
 
 // ---------------------------------------------------------------------------
 // Env scrubbing for the spawned Codex CLI
@@ -353,7 +354,6 @@ export class CodexRuntime implements AgentRuntime {
     // processes and avoids races between concurrent Codex runs.
     const bridgeAuthToken = bridge.getAuthToken();
     const bridgeAuthTokenEnvVar = bridge.getAuthTokenEnvVar();
-    const codexPathOverride = resolveCodexExecutable();
 
     // Declared before the try so the catch/retry handler below can still see
     // them; assigned inside the try so a throw during construction / thread
@@ -388,6 +388,9 @@ export class CodexRuntime implements AgentRuntime {
     // 5. Create Codex instance and thread, then stream + translate events
     // -----------------------------------------------------------------------
     try {
+      const codexPathOverride = resolveCodexExecutable() ?? (await resolveCodexCliPath());
+      if (!codexPathOverride)
+        throw new Error('The Codex CLI executable is missing. Install Codex or repair the SDK installation.');
       codex = new CodexCtor({
         ...(codexPathOverride ? { codexPathOverride } : {}),
         ...(apiKey ? { apiKey } : {}),
@@ -404,18 +407,28 @@ export class CodexRuntime implements AgentRuntime {
               ...(bridgeAuthTokenEnvVar && bridgeAuthToken ? { [bridgeAuthTokenEnvVar]: bridgeAuthToken } : {}),
             }
           : buildScrubbedCodexEnv(bridgeAuthTokenEnvVar, bridgeAuthToken),
-        ...(bridgeUrl
-          ? {
-              config: {
-                features: {
-                  tool_search_always_defer_mcp_tools: false,
-                },
-                mcp_servers: {
-                  kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
-                },
-              },
-            }
-          : {}),
+        config: (() => {
+          const isolated = codexIsolationConfig(options.confinedCwd ?? cwd);
+          return {
+            ...isolated,
+            mcp_servers: {
+              ...(isolated.mcp_servers as Record<string, unknown>),
+              ...(bridgeUrl
+                ? {
+                    kai: {
+                      ...buildCodexMcpServerConfig(
+                        bridgeUrl,
+                        customTools ?? [],
+                        bridgeAuthToken,
+                        bridgeAuthTokenEnvVar,
+                      ),
+                      enabled: true,
+                    },
+                  }
+                : {}),
+            },
+          };
+        })(),
       });
 
       threadOptions = {
@@ -790,11 +803,13 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
         }
 
         case 'error': {
-          if (item.message) {
+          // The SDK defines ErrorItem as non-fatal (for example deprecated
+          // host settings). Only top-level error/turn.failed ends a turn.
+          if (event.type === 'item.completed' && item.message) {
             events.push({
               conversationId,
-              type: 'error',
-              error: item.message,
+              type: 'observer-message',
+              data: { toolCallId: item.id, toolName: 'Codex notice', message: item.message },
             });
           }
           break;

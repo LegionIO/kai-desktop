@@ -42,6 +42,7 @@ if (existsSync(localPath)) {
 
 const resolved = resolveBranding(mergedBranding);
 const sandboxedBrowserPreloadPath = resolve(__dirname, 'electron/browser/page-preload.cjs');
+const bridgeApprovalPreloadPath = resolve(__dirname, 'electron/plugin-bridge/approval-preload.cjs');
 const brandDefines: Record<string, string> = {};
 for (const [key, value] of Object.entries(resolved)) {
   brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
@@ -149,6 +150,19 @@ export default defineConfig({
           });
         },
       },
+      {
+        name: 'copy-bridge-approval-preload',
+        buildStart() {
+          this.addWatchFile(bridgeApprovalPreloadPath);
+        },
+        generateBundle() {
+          this.emitFile({
+            type: 'asset',
+            fileName: 'bridge-approval.cjs',
+            source: readFileSync(bridgeApprovalPreloadPath),
+          });
+        },
+      },
     ],
     build: {
       rollupOptions: {
@@ -161,13 +175,31 @@ export default defineConfig({
   },
   renderer: {
     root: 'src',
-    plugins: [react()],
+    plugins: [
+      react(),
+      {
+        name: 'bridge-approval-csp',
+        transformIndexHtml: {
+          order: 'post',
+          handler(html, context) {
+            // The local dev server injects React refresh scripts. Production
+            // approvals load only bundled code, with no network connections.
+            if (context.server || !context.filename.endsWith('/bridge-approval/index.html')) return html;
+            return html.replace(
+              '<head>',
+              "<head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'\" />",
+            );
+          },
+        },
+      },
+    ],
     define: brandDefines,
     build: {
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/index.html'),
           'browser-chrome': resolve(__dirname, 'src/browser-chrome/index.html'),
+          'bridge-approval': resolve(__dirname, 'src/bridge-approval/index.html'),
         },
       },
     },

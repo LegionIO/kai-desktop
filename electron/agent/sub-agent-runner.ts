@@ -1,3 +1,4 @@
+import { endBridgeSession } from '../plugin-bridge/lifecycle.js';
 /**
  * Sub-Agent Execution Engine
  *
@@ -84,6 +85,8 @@ export type SubAgentRunOptions = {
   modelKey?: string | null;
   tools: ToolDefinition[];
   dbPath: string;
+  /** Inherit the parent's execution directory for tools and imported lifecycle hooks. */
+  cwd?: string;
   abortSignal?: AbortSignal;
   /** Called between agent turns to check for pending follow-up messages. */
   getFollowUp: () => Promise<string | null>;
@@ -290,6 +293,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     modelKey,
     tools,
     dbPath,
+    cwd,
     abortSignal,
     getFollowUp,
     peekFollowUp,
@@ -472,6 +476,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         {
           conversationId: subAgentConversationId,
           parentConversationId,
+          abortSignal,
+          cwd,
           messages,
           systemPrompt: subAgentConfig.systemPrompt,
           modelKey: modelConfig.modelName,
@@ -752,6 +758,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
       const subStreamOpts = {
         abortSignal,
+        cwd,
+        bridgeParentConversationId: parentConversationId,
         // Nested sub_agent inheritance: this sub-agent's own profile/model.
         parentProfileKey: profileKey ?? null,
         parentModelKey: modelKey ?? null,
@@ -1247,6 +1255,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     latestGatedMessages = [...messages];
     latestGatedSystemPrompt = subAgentConfig.systemPrompt ?? systemPrompt;
   } finally {
+    await endBridgeSession(subAgentConversationId);
     // Dispose the observer HERE (not only on the normal path) so a throw — or the
     // consumer breaking out of the generator early — can't leave the observer's
     // evaluation timer / in-flight model request running against a finished run.

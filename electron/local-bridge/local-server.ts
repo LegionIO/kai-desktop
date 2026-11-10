@@ -3,6 +3,9 @@ import { mkdirSync, existsSync, unlinkSync, chmodSync, statSync } from 'fs';
 import { timingSafeEqual } from 'crypto';
 import type { Socket, Server } from 'net';
 import { localClients, broadcastToLocalClients, markSocketActivity, msSinceActivity } from './local-clients.js';
+import { randomUUID } from 'node:crypto';
+import { getLocalMcpHandler } from '../mcp-sharing/local-hook.js';
+import type { McpPrincipal } from '../mcp-sharing/service.js';
 import { registerBroadcastSink } from '../web-server/web-clients.js';
 import { invokeHandler } from '../web-server/ipc-bridge.js';
 import { getRunDir, getSocketPath, getBridgeToken } from './paths.js';
@@ -12,6 +15,8 @@ export { getRunDir, getSocketPath } from './paths.js';
 /** Sockets that have completed the auth handshake ({type:'auth', token}).
  *  invoke/send are refused until a socket is in this set. */
 const authedClients = new WeakSet<Socket>();
+// Connector sockets never join the general IPC broadcast set.
+const mcpClients = new Map<Socket, { principal: McpPrincipal; sessionId: string; unsubscribe: () => void }>();
 
 let server: Server | null = null;
 let unregisterSink: (() => void) | null = null;
@@ -73,7 +78,13 @@ let serverVersion = '';
 let shutdownRequested = false;
 
 function clientCount(): number {
-  return localClients.size + (hasOtherClients?.() ? 1 : 0);
+  return localClients.size + mcpClients.size + (hasOtherClients?.() ? 1 : 0);
+}
+
+/** Restricted MCP connections also keep the backend alive when a GUI or
+ * suppressed plugin window closes; they never enter the general IPC set. */
+export function hasLocalBridgeClients(): boolean {
+  return localClients.size + mcpClients.size > 0;
 }
 
 function cancelIdleTimer(): void {
@@ -116,7 +127,7 @@ function attachClient(socket: Socket): void {
 
   // Destroy the socket if it doesn't complete the auth handshake in time.
   const authTimer = setTimeout(() => {
-    if (!authedClients.has(socket)) {
+    if (!authedClients.has(socket) && !mcpClients.has(socket)) {
       writeLine(socket, { type: 'error', message: 'auth timeout' });
       socket.destroy();
     }
@@ -158,6 +169,12 @@ function attachClient(socket: Socket): void {
   });
 
   const onGone = (): void => {
+    const connector = mcpClients.get(socket);
+    if (connector) {
+      connector.unsubscribe();
+      getLocalMcpHandler()?.closed(connector.principal, connector.sessionId);
+      mcpClients.delete(socket);
+    }
     clearInterval(beat);
     clearTimeout(authTimer);
     authedClients.delete(socket);
@@ -176,6 +193,12 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
     return;
   }
 
+  const connector = mcpClients.get(socket);
+  if (connector && !getLocalMcpHandler()?.active(connector.principal)) {
+    socket.destroy();
+    return;
+  }
+
   if (msg.type === 'ping') {
     writeLine(socket, { type: 'pong' });
     return;
@@ -186,6 +209,11 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
   // has no owner-only ACL) and is defense-in-depth on POSIX. Compare in constant
   // time to avoid a timing oracle on the token.
   if (msg.type === 'auth') {
+    // An authenticated connector cannot upgrade itself to administrative IPC.
+    if (mcpClients.has(socket) || authedClients.has(socket)) {
+      socket.destroy();
+      return;
+    }
     const expected = getBridgeToken();
     const provided = typeof msg.token === 'string' ? msg.token : '';
     const ok = provided.length === expected.length && timingSafeEqualStr(provided, expected);
@@ -197,6 +225,20 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
       // Include the backend version so the client can flag a mismatch with its
       // own build (a stale backend still running after an app update).
       writeLine(socket, { id: msg.id, type: 'result', data: { ok: true, serverVersion } });
+    } else if (getLocalMcpHandler()?.authenticate(provided)) {
+      const handler = getLocalMcpHandler()!;
+      const principal = handler.authenticate(provided)!;
+      const sessionId = randomUUID();
+      const unsubscribe = handler.subscribe(() => {
+        if (!handler.active(principal)) {
+          socket.destroy();
+          return;
+        }
+        writeLine(socket, { type: 'event', channel: 'kai-mcp:catalog-changed' });
+      });
+      mcpClients.set(socket, { principal, sessionId, unsubscribe });
+      cancelIdleTimer();
+      writeLine(socket, { id: msg.id, type: 'result', data: { ok: true, serverVersion, scope: 'mcp' } });
     } else {
       writeLine(socket, { id: msg.id, type: 'error', message: 'auth failed' });
       socket.destroy();
@@ -205,7 +247,7 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
   }
 
   // Everything below requires authentication.
-  if (!authedClients.has(socket)) {
+  if (!authedClients.has(socket) && !mcpClients.has(socket)) {
     if (msg.id) writeLine(socket, { id: msg.id, type: 'error', message: 'unauthenticated' });
     socket.destroy();
     return;
@@ -228,7 +270,16 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
       return;
     }
     try {
-      const result = await invokeHandler(msg.channel, ...(msg.args ?? []));
+      const connector = mcpClients.get(socket);
+      const result = connector
+        ? await getLocalMcpHandler()!.invoke(
+            connector.principal,
+            connector.sessionId,
+            msg.channel,
+            msg.args ?? [],
+            (channel, data) => writeLine(socket, { type: 'event', channel, data }),
+          )
+        : await invokeHandler(msg.channel, ...(msg.args ?? []));
       writeLine(socket, { id: msg.id, type: 'result', data: result });
     } catch (err) {
       writeLine(socket, {
@@ -242,6 +293,10 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
 
   // Fire-and-forget sends (e.g. realtime audio), mirroring the web bridge.
   if (msg.type === 'send' && msg.channel) {
+    if (mcpClients.has(socket)) {
+      socket.destroy();
+      return;
+    }
     try {
       await invokeHandler(msg.channel, msg.data);
     } catch {
@@ -451,6 +506,12 @@ export async function stopLocalServer(): Promise<void> {
     }
   }
   localClients.clear();
+  for (const [socket, connector] of mcpClients) {
+    connector.unsubscribe();
+    getLocalMcpHandler()?.closed(connector.principal, connector.sessionId);
+    socket.destroy();
+  }
+  mcpClients.clear();
 
   const srv = server;
   server = null;

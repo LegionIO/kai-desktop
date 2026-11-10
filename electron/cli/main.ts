@@ -1,4 +1,5 @@
 import { parseMcpCommand, runMcpCommand } from './mcp-auth.js';
+import { parseMcpServe, serveMcp } from './mcp-serve.js';
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
@@ -19,6 +20,11 @@ import { confirmFolderTrust } from './folder-trust.js';
  * packaged CLI uses `cli/electron-entry.ts` instead (re-execs the app binary).
  */
 async function main(): Promise<void> {
+  const connector = parseMcpServe(process.argv.slice(2));
+  if (connector) {
+    await serveMcp(connector.credential, false);
+    return;
+  }
   process.noDeprecation = true; // silence Node DEP warnings (e.g. punycode) — noise to a `kai` user
   const { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled, runtimeOverride, list } =
     parseHeadlessArgs(process.argv.slice(2));

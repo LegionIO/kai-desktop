@@ -106,6 +106,7 @@ const subAgentState = new Map<
     modelKey?: string | null;
     tools: ToolDefinition[];
     dbPath: string;
+    cwd?: string;
     parentConversationId: string;
     parentToolCallId: string;
     /** The PARENT's conversation id (ctx.conversationId) — the maxPerParent
@@ -707,6 +708,7 @@ async function resumeSubAgent(
     modelKey,
     tools,
     dbPath,
+    cwd,
     parentConversationId,
     parentToolCallId,
     parentThreadId,
@@ -920,6 +922,7 @@ async function resumeSubAgent(
       modelKey: modelKey ?? null,
       tools,
       dbPath,
+      cwd,
       abortSignal: localController.signal,
       // The slot was reserved synchronously above; tell the runner so it does not
       // re-check the cap or double-count the concurrency counter.
@@ -1015,6 +1018,7 @@ async function resumeSubAgent(
             modelKey: modelKey ?? null,
             tools,
             dbPath,
+            cwd,
             parentConversationId,
             parentToolCallId,
             parentThreadId: parentThreadId ?? null,
@@ -1447,6 +1451,7 @@ export function createSubAgentTool(
           modelKey: threadModelKey,
           tools: subAgentTools,
           dbPath,
+          cwd: ctx.cwd,
           abortSignal: localController.signal,
           getFollowUp: async () => {
             const queue = followUpQueues.get(subAgentConversationId);
@@ -1600,6 +1605,7 @@ export function createSubAgentTool(
                 modelKey: threadModelKey,
                 tools: subAgentTools,
                 dbPath,
+                cwd: ctx.cwd,
                 parentConversationId: ctx.toolCallId,
                 parentToolCallId: ctx.toolCallId,
                 parentThreadId: parentId ?? null,
@@ -1755,6 +1761,7 @@ export function createSubAgentTool(
                 modelKey: threadModelKey,
                 tools: subAgentTools,
                 dbPath,
+                cwd: ctx.cwd,
                 parentConversationId: ctx.toolCallId,
                 parentToolCallId: ctx.toolCallId,
                 parentThreadId: parentId ?? null,

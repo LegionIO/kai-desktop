@@ -1014,6 +1014,21 @@ export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins' |
 export const sidebarTabSchema = z.enum(['chats', 'tasks', 'messages', 'agents', 'plugins']);
 
 export const appConfigSchema = z.object({
+  pluginBridge: z
+    .object({
+      enabled: z.boolean().default(false),
+      claudeHome: z.string().default(''),
+      codexHome: z.string().default(''),
+    })
+    .default({ enabled: false, claudeHome: '', codexHome: '' }),
+  mcpExport: z
+    .object({
+      enabled: z.boolean().default(false),
+      remote: z
+        .object({ enabled: z.boolean().default(false), publicUrl: z.string().default('') })
+        .default({ enabled: false, publicUrl: '' }),
+    })
+    .default({ enabled: false, remote: { enabled: false, publicUrl: '' } }),
   agent: agentConfigSchema.optional(),
   models: modelsConfigSchema,
   memory: memoryConfigSchema,

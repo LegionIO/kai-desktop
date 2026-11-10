@@ -11,12 +11,15 @@
  * a failed launch doesn't leave the caller burning the full boot timeout.
  */
 import { EventEmitter } from 'node:events';
+import { resolve } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 
 // Controllable fake child: a spawn() that returns an EventEmitter we drive.
 let lastChild: (EventEmitter & { unref?: () => void }) | null = null;
+const spawnCalls: unknown[][] = [];
 vi.mock('node:child_process', () => ({
-  spawn: () => {
+  spawn: (...args: unknown[]) => {
+    spawnCalls.push(args);
     const child = new EventEmitter() as EventEmitter & { unref: () => void };
     child.unref = () => {};
     lastChild = child;
@@ -24,7 +27,8 @@ vi.mock('node:child_process', () => ({
   },
 }));
 vi.mock('child_process', () => ({
-  spawn: () => {
+  spawn: (...args: unknown[]) => {
+    spawnCalls.push(args);
     const child = new EventEmitter() as EventEmitter & { unref: () => void };
     child.unref = () => {};
     lastChild = child;
@@ -57,6 +61,24 @@ describe('checkVersionMismatch', () => {
 });
 
 describe('spawnHeadlessBackend (async fail-fast)', () => {
+  it('includes the application entry when launched by unpackaged Electron', async () => {
+    const original = process.defaultApp;
+    const argv = process.argv;
+    process.argv = [process.execPath, 'out/main/index.js'];
+    Object.defineProperty(process, 'defaultApp', { configurable: true, value: true });
+    try {
+      const result = spawnHeadlessBackend(true);
+      expect(spawnCalls.at(-1)?.slice(0, 2)).toEqual([
+        process.execPath,
+        [resolve('out/main/index.js'), '--kai-headless'],
+      ]);
+      lastChild!.emit('spawn');
+      await expect(result).resolves.toBe(true);
+    } finally {
+      Object.defineProperty(process, 'defaultApp', { configurable: true, value: original });
+      process.argv = argv;
+    }
+  });
   it('resolves true once the child emits "spawn"', async () => {
     const p = spawnHeadlessBackend(true);
     lastChild!.emit('spawn');

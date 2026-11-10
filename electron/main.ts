@@ -14,6 +14,7 @@ import {
   screen,
   powerMonitor,
   webContents,
+  safeStorage,
 } from 'electron';
 import { basename, join, resolve, sep } from 'path';
 import {
@@ -42,16 +43,23 @@ import {
 } from './diagnostics/main-diagnostics.js';
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
+import { suppressHeadlessWindow } from './local-bridge/headless-window-guard.js';
 import { beginQuitDiagnostics, type QuitDiagnosticsSession } from './diagnostics/quit-diagnostics.js';
 import { captureHeapSnapshot } from './diagnostics/heap-snapshot.js';
 import { makeCdpHeapSnapshotTake } from './diagnostics/heap-snapshot-cdp.js';
 import { initDiagnosticTrace, sweepDiagnosticTraceRetention, traceDiagnostic } from './diagnostics/debug-trace.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
+import { PluginBridgeSystem } from './plugin-bridge/system.js';
+import { registerPluginBridgeHandlers } from './ipc/plugin-bridge.js';
+import { showBridgeApproval } from './plugin-bridge/approval-window.js';
+import { normalizePackageIdentity } from './plugin-bridge/manifest.js';
+import { nativeMcpSources } from './plugin-bridge/dedup.js';
 import {
   registerAgentHandlers,
   registerTools,
   registerToolsPreservingBrowserState,
   updateMcpTools,
+  updateBridgeTools,
   updateSkillTools,
   updatePluginTools,
   updateCliTools,
@@ -233,8 +241,8 @@ import {
   stopLocalServer,
   disableIdleShutdown,
   restartIdleShutdown,
+  hasLocalBridgeClients,
 } from './local-bridge/local-server.js';
-import { localClients } from './local-bridge/local-clients.js';
 import { shouldStepAsideForUpdate, clearUpdateReady } from './local-bridge/update-signal.js';
 import { webClients } from './web-server/web-clients.js';
 import { broadcastToWebClients } from './web-server/web-clients.js';
@@ -411,19 +419,12 @@ let headlessWindowBlockActive = IS_HEADLESS;
   const origShow = proto.show;
   const origShowInactive = proto.showInactive;
   const origFocus = proto.focus;
-  const selfDestruct = function (this: BrowserWindow): void {
-    try {
-      if (!this.isDestroyed()) this.destroy();
-    } catch {
-      /* ignore */
-    }
-  };
   proto.show = function (this: BrowserWindow): void {
-    if (headlessWindowBlockActive) selfDestruct.call(this);
+    if (headlessWindowBlockActive) suppressHeadlessWindow(this);
     else origShow.call(this);
   };
   proto.showInactive = function (this: BrowserWindow): void {
-    if (headlessWindowBlockActive) selfDestruct.call(this);
+    if (headlessWindowBlockActive) suppressHeadlessWindow(this);
     else origShowInactive.call(this);
   };
   proto.focus = function (this: BrowserWindow): void {
@@ -436,20 +437,11 @@ let headlessWindowBlockActive = IS_HEADLESS;
 // a window created with the DEFAULT `{ show: true }` becomes visible during
 // construction without ever calling .show(). Catch those at the source: while
 // the headless block is active, hide + destroy any newly-created window
-// immediately. A no-op when headlessWindowBlockActive is false (normal GUI, and
+// after construction. A no-op when headlessWindowBlockActive is false (normal GUI, and
 // after promoteHeadlessToWindowed lifts the flag so the real window survives).
 app.on('browser-window-created', (_event, win) => {
   if (!headlessWindowBlockActive) return;
-  try {
-    win.hide();
-  } catch {
-    /* ignore */
-  }
-  try {
-    if (!win.isDestroyed()) win.destroy();
-  } catch {
-    /* ignore */
-  }
+  suppressHeadlessWindow(win);
 });
 
 // App-wide window-open guard: every webContents (main window, operator window,
@@ -817,6 +809,7 @@ protocol.registerSchemesAsPrivileged([
 
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
+let pluginBridgeSystem: PluginBridgeSystem | null = null;
 // Cleared once the bootstrap renderer load completes. The very first renderer
 // load in the app's lifetime coincides with plugin loadAll(); every SUBSEQUENT
 // renderer load — an in-place reload OR a freshly recreated window (health
@@ -1584,7 +1577,7 @@ function createWindow(): BrowserWindow {
     const otherVisible = BrowserWindow.getAllWindows().some(
       (w) => w !== mainWindow && !w.isDestroyed() && w.isVisible(),
     );
-    if ((localClients.size > 0 || webClients.size > 0) && !headlessWindowBlockActive && !otherVisible) {
+    if ((hasLocalBridgeClients() || webClients.size > 0) && !headlessWindowBlockActive && !otherVisible) {
       demoteWindowedToHeadlessRef();
     }
   });
@@ -1906,6 +1899,7 @@ if (gotSingleInstanceLock) {
     );
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
+      pluginBridgeSystem?.sharing.changed();
       updateActiveRealtimeSessionTools(getRegisteredTools());
       // A config change may have toggled computerUse.safety.isolatedBrowserAllowPrivateNetwork — reapply
       // the WebRTC policy to any LIVE isolated-browser window so disabling private access re-locks WebRTC
@@ -1955,6 +1949,7 @@ if (gotSingleInstanceLock) {
     let configChangedDuringStartup = false;
 
     const handleConfigChanged = (config: AppConfig) => {
+      pluginBridgeSystem?.configChanged();
       if (!initialToolsRegistered) {
         configChangedDuringStartup = true;
         return;
@@ -2156,7 +2151,7 @@ if (gotSingleInstanceLock) {
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
     let workspaceHandlers: ReturnType<typeof registerWorkspaceHandlers> | null = null;
-    const { setConfig, closeSettingsWatchers } = registerConfigHandlers(
+    const { setConfig, setBridgeConfig, closeSettingsWatchers } = registerConfigHandlers(
       ipcMain,
       APP_HOME,
       handleConfigChanged,
@@ -2522,6 +2517,76 @@ if (gotSingleInstanceLock) {
     );
     pluginManagerRef = pluginManager;
     setUpdateHookRunner(pluginManager);
+
+    pluginBridgeSystem = new PluginBridgeSystem({
+      appHome: APP_HOME,
+      getConfig,
+      setConfig: setBridgeConfig,
+      encryption: safeStorage,
+      getTools: getRegisteredTools,
+      preSend: (messages, config, systemPrompt, modelKey) =>
+        pluginManager.runPreSendHooks({
+          messages: messages as Parameters<PluginManager['runPreSendHooks']>[0]['messages'],
+          config,
+          systemPrompt,
+          modelKey: modelKey ?? config.models.defaultModelKey,
+        }),
+      publishTools: (tools) => {
+        updateBridgeTools(tools);
+        syncRealtimeTools();
+      },
+      nativeSources: () => [
+        ...nativeMcpSources(
+          getConfig(),
+          (name) => !mcpOAuth || mcpOAuth.status(name).hasCredentials || mcpOAuth.status(name).hasClientSecret,
+        ),
+        ...pluginManager.listPlugins().map((plugin) => ({
+          id: `plugin:${plugin.name}`,
+          name: plugin.displayName ?? plugin.name,
+          packageIdentity: normalizePackageIdentity(
+            getConfig().marketplace?.installedPlugins?.[plugin.name]?.repository,
+          ),
+        })),
+      ],
+      sourceEnabled: (tool) => {
+        const config = getConfig();
+        if (tool.source === 'plugin') return pluginManager.getPluginInstance(tool.sourceId ?? '')?.state === 'active';
+        if (tool.source === 'mcp') {
+          const server = config.mcpServers.find((entry) => entry.name === tool.sourceId);
+          if (
+            !server ||
+            server.enabled === false ||
+            server.name === 'kai-mcp' ||
+            server.url === config.mcpExport.remote.publicUrl
+          )
+            return false;
+          if (
+            server.command &&
+            /(?:^|[\\/])kai(?:-mcp)?(?:\.exe)?$/.test(server.command) &&
+            server.args?.includes('serve')
+          )
+            return false;
+        }
+        return true;
+      },
+      launcher: () => {
+        // A PATH wrapper can belong to an older installed Kai. Connect to the
+        // build that reviewed this grant, including its entry point in dev.
+        if (app.isPackaged) return { command: process.env.APPIMAGE || process.execPath, args: ['--kai-cli'] };
+        return { command: process.execPath, args: [resolve(process.argv[1]), '--kai-cli'] };
+      },
+    });
+    registerPluginBridgeHandlers(ipcMain, pluginBridgeSystem, {
+      isPrimary: (event) =>
+        !!primaryWindowRef &&
+        !primaryWindowRef.isDestroyed() &&
+        event.sender === primaryWindowRef.webContents &&
+        event.senderFrame === primaryWindowRef.webContents.mainFrame,
+      confirm: async (message, detail) => {
+        if (!primaryWindowRef || primaryWindowRef.isDestroyed()) return false;
+        return showBridgeApproval(primaryWindowRef, message, detail, getConfig().ui.theme);
+      },
+    });
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(
@@ -3976,6 +4041,9 @@ if (gotSingleInstanceLock) {
       });
 
     void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {
+      void pluginBridgeSystem
+        ?.initialize()
+        .catch(() => console.error('[plugin-bridge] Initialization failed; bridge components remain unavailable.'));
       eventBus.emit('app', 'ready', {});
     });
 
@@ -4030,7 +4098,7 @@ app.on('window-all-closed', () => {
   // If CLI/socket clients OR web-UI clients are still attached, don't quit —
   // the backend they depend on lives here. Revert to a dockless headless
   // background backend that idle-exits once the last client disconnects.
-  if (localClients.size > 0 || webClients.size > 0) {
+  if (hasLocalBridgeClients() || webClients.size > 0) {
     demoteWindowedToHeadlessRef();
     return;
   }
@@ -4071,6 +4139,7 @@ app.on('before-quit', (event) => {
   // Signal OTA rollback that this was a graceful quit (not a crash)
   signalGracefulQuit(__BRAND_APP_SLUG);
   cleanupOta();
+  const bridgeShutdown = pluginBridgeSystem?.close().catch(() => {});
   // Stop web UI server
   {
     const done = quitDiagSession?.step('stopWebServer');
@@ -4121,7 +4190,7 @@ app.on('before-quit', (event) => {
   taskDispatcherRef?.stop();
   {
     const done = quitDiagSession?.step('shutdownBrowserManager');
-    void shutdownBrowserManager()
+    void Promise.all([shutdownBrowserManager(), bridgeShutdown])
       .catch((error) => {
         console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to flush Browser profile data during shutdown:`, error);
       })

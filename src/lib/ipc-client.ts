@@ -1,4 +1,5 @@
 import type { McpApi } from '../../shared/mcp';
+import type { PluginBridgeApi } from '../../shared/plugin-bridge';
 import type {
   ComputerUseEvent,
   ComputerUsePermissions,
@@ -274,6 +275,7 @@ type AppAPI = {
     }) => Promise<{ success?: boolean; cleared?: string[]; error?: string }>;
     testEmbedding: () => Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>;
   };
+  pluginBridge: PluginBridgeApi;
   mcp: McpApi;
   cliTools: {
     checkBinaries: (binaryNames: string[]) => Promise<Record<string, boolean>>;

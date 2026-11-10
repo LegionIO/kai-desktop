@@ -50,6 +50,16 @@ export function installIpcCapture(ipcMain: IpcMain): void {
  * the Electron IPC transport (i.e. from the WebSocket bridge).
  */
 export async function invokeHandler(channel: string, ...args: unknown[]): Promise<unknown> {
+  return invokeCapturedHandler(channel, false, args);
+}
+
+/** Only the authenticated Web UI transport may set human UI authority. Local
+ * IPC and MCP callers always use invokeHandler, which cannot assert it. */
+export async function invokeHumanWebHandler(channel: string, ...args: unknown[]): Promise<unknown> {
+  return invokeCapturedHandler(channel, true, args);
+}
+
+async function invokeCapturedHandler(channel: string, humanWeb: boolean, args: unknown[]): Promise<unknown> {
   if (UNSUPPORTED_CHANNELS.has(channel) || channel.startsWith('browser:')) {
     throw new Error(`Channel "${channel}" is not supported in web mode`);
   }
@@ -59,6 +69,7 @@ export async function invokeHandler(channel: string, ...args: unknown[]): Promis
     const fakeEvent = {
       sender: null,
       __kaiWebBridge: true,
+      ...(humanWeb ? { __kaiHumanWeb: true } : {}),
     } as unknown as BridgeInvokeEvent;
     return handler(fakeEvent, ...args);
   }
