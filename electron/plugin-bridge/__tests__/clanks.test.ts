@@ -6,7 +6,9 @@ import type { ToolDefinition } from '../../tools/types.js';
 describe.each([
   { launcher: 'executable', nodeLauncher: false },
   { launcher: 'node script', nodeLauncher: true },
-])('Clanks MCP and lifecycle wire compatibility ($launcher)', ({ nodeLauncher }) => {
+  // These wire tests start several real Node processes per case. Allow startup
+  // contention in the full parallel suite without relaxing production timeouts.
+])('Clanks MCP and lifecycle wire compatibility ($launcher)', { timeout: 20_000 }, ({ nodeLauncher }) => {
   let f: ReturnType<typeof bridgeSystemFixture>, fixture: ReturnType<typeof installClanksFixture>;
   beforeEach(async () => {
     f = bridgeSystemFixture();
