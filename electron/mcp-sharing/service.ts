@@ -109,7 +109,13 @@ export class KaiMcpService {
       if (!source) {
         source = {
           id,
-          name: tool.sourceId ?? 'Kai built-in tools',
+          name:
+            tool.sourceId ??
+            (tool.source === 'cli'
+              ? 'Kai CLI tools'
+              : tool.source === 'browser'
+                ? 'Kai browser tools'
+                : 'Kai built-in tools'),
           imported: tool.source === 'bridge',
           selected: state.exportSources.includes(id),
           tools: [],
