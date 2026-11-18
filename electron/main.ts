@@ -17,6 +17,7 @@ import {
   safeStorage,
 } from 'electron';
 import { basename, join, resolve, sep } from 'path';
+import { spawn } from 'child_process';
 import {
   mkdirSync,
   existsSync,
@@ -4108,6 +4109,18 @@ if (gotSingleInstanceLock) {
     if (process.platform === 'darwin' && app.setActivationPolicy) {
       app.setActivationPolicy('prohibited'); // never dock / foreground the CLI process
     }
+    // LaunchServices routes a Dock/Finder "open" of Kai.app to ANY running
+    // process of the bundle — often an MCP connector or CLI. Hand it to a real GUI
+    // (which promotes the headless backend via second-instance, or boots fresh).
+    const readyAt = Date.now();
+    app.on('activate', () => {
+      if (Date.now() - readyAt < 3000) return; // shortcut: skip the launch-time activate; a click within 3s of CLI start is ignored
+      const env = { ...process.env };
+      delete env.KAI_CLI;
+      delete env.KAI_HEADLESS;
+      const args = process.defaultApp ? [resolve(process.argv[1])] : [];
+      spawn(process.execPath, args, { detached: true, stdio: 'ignore', env }).unref();
+    });
     try {
       const { runCliClient } = await import('./cli/electron-entry.js');
       await runCliClient();
