@@ -79,6 +79,11 @@ module.exports = async function afterPack(context) {
   }
   chmodPluginHosts(join(appPath, 'Contents', 'Resources'));
 
+  // Launch as a no-Dock UIElement: macOS registers the app ~200ms before any JS
+  // runs, so CLI/MCP/headless processes would otherwise flash a Dock icon.
+  // A GUI launch switches itself to 'regular' at startup (electron/main.ts).
+  setBool(appInfoPlist, 'LSUIElement', true);
+
   const localNetworkUsageDescription = plistBuddy(
     appInfoPlist,
     'Print :NSLocalNetworkUsageDescription',

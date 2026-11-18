@@ -9,7 +9,7 @@
  * Linux build.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -80,7 +80,11 @@ describe('after-pack.cjs darwin branch — exec bit + early bail', () => {
   it.runIf(onMac)('restores the kai shim exec bit inside the .app', async () => {
     const resBin = join(outDir, 'Kai.app', 'Contents', 'Resources', 'bin');
     mkdirSync(resBin, { recursive: true });
-    writeFileSync(join(outDir, 'Kai.app', 'Contents', 'Info.plist'), '<plist/>', { mode: 0o644 });
+    writeFileSync(
+      join(outDir, 'Kai.app', 'Contents', 'Info.plist'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict/></plist>\n',
+      { mode: 0o644 },
+    );
     writeFileSync(join(resBin, 'kai'), '#!/bin/sh\n', { mode: 0o644 });
     chmodSync(join(resBin, 'kai'), 0o644);
     const pluginHost = join(
@@ -99,6 +103,10 @@ describe('after-pack.cjs darwin branch — exec bit + early bail', () => {
     await afterPack(ctx('darwin', outDir));
     expect(mode(join(resBin, 'kai'))).toBe(0o755);
     expect(mode(pluginHost)).toBe(0o755);
+    // CLI/headless launches must start as a no-Dock UIElement (GUI opts back in at runtime).
+    expect(readFileSync(join(outDir, 'Kai.app', 'Contents', 'Info.plist'), 'utf8')).toMatch(
+      /<key>LSUIElement<\/key>\s*<true\/>/,
+    );
   });
 
   it('bails cleanly when the main app Info.plist is absent (any host)', async () => {

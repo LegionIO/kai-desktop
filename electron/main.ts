@@ -784,6 +784,11 @@ if (IS_HEADLESS && process.platform === 'darwin' && app.setActivationPolicy) {
 if (IS_CLI && process.platform === 'darwin' && app.setActivationPolicy) {
   app.setActivationPolicy('prohibited');
 }
+// The packaged bundle is LSUIElement (see scripts/after-pack.cjs) so CLI and
+// headless launches never show a Dock icon; a real GUI launch opts back in.
+if (!IS_CLI && !IS_HEADLESS && process.platform === 'darwin' && app.setActivationPolicy) {
+  app.setActivationPolicy('regular');
+}
 
 // Register the media protocol as a privileged scheme (must happen before app.whenReady)
 protocol.registerSchemesAsPrivileged([
