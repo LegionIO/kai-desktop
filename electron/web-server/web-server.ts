@@ -525,6 +525,8 @@ export function getBridgeScript(): string {
       toggle: function(name, enable) { return invoke('skills:toggle', name, enable); }
     },
     plugins: {
+      // A web client must not activate the server's desktop window.
+      focusWindow: noop,
       getUIState: function() { return invoke('plugin:get-ui-state'); },
       list: function() { return invoke('plugin:list'); },
       getConfig: function(pn) { return invoke('plugin:get-config', pn); },

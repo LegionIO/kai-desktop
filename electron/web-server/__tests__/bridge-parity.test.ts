@@ -111,4 +111,10 @@ describe('web bridge ↔ preload parity', () => {
     expect(typeof plugins.getAvailableUpdateCount).toBe('function');
     expect(typeof plugins.onUpdatesAvailable).toBe('function');
   });
+
+  it('resolves plugin window focus locally in web mode', async () => {
+    const webApp = evalBridgeScript();
+    const plugins = webApp.plugins as { focusWindow: () => Promise<void> };
+    await expect(plugins.focusWindow()).resolves.toBeUndefined();
+  });
 });

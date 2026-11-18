@@ -514,6 +514,7 @@ const appAPI = {
   },
 
   plugins: {
+    focusWindow: () => ipcRenderer.invoke('plugin:focus-window') as Promise<void>,
     getUIState: () => ipcRenderer.invoke('plugin:get-ui-state'),
     list: () =>
       ipcRenderer.invoke('plugin:list') as Promise<

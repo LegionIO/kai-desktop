@@ -338,6 +338,7 @@ type AppAPI = {
     onCatalogChanged: (callback: () => void) => () => void;
   };
   plugins: {
+    focusWindow: () => Promise<void>;
     getUIState: () => Promise<unknown>;
     list: () => Promise<
       Array<{

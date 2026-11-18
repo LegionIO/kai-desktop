@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BrowserWindow, IpcMain } from 'electron';
+import { app, type BrowserWindow, type IpcMain } from 'electron';
 import type { PluginManager } from '../../plugins/plugin-manager.js';
 
 vi.mock('electron', () => ({
-  app: { relaunch: vi.fn(), quit: vi.fn() },
+  app: { relaunch: vi.fn(), quit: vi.fn(), focus: vi.fn() },
 }));
 
 vi.mock('../../plugins/marketplace-service.js', () => ({
@@ -45,8 +45,13 @@ describe('plugin process control IPC', () => {
   const revokePrimaryRendererAuthority = vi.fn();
   const primaryWindow = {
     isDestroyed: () => false,
+    isMinimized: vi.fn(() => false),
+    restore: vi.fn(),
+    show: vi.fn(),
+    focus: vi.fn(),
     destroy: destroyWindow,
     webContents: {
+      mainFrame: { url: 'file:///app/index.html' },
       isDestroyed: () => false,
       loadURL,
       forcefullyCrashRenderer,
@@ -75,6 +80,36 @@ describe('plugin process control IPC', () => {
       revokePrimaryRendererAuthority,
       'file:///app/index.html',
     );
+  });
+
+  it.each([false, true])('focuses the primary plugin window (minimized: %s)', (minimized) => {
+    vi.mocked(primaryWindow.isMinimized).mockReturnValueOnce(minimized);
+    handlers.get('plugin:focus-window')?.({
+      sender: primaryWindow.webContents,
+      senderFrame: primaryWindow.webContents.mainFrame,
+    });
+    expect(primaryWindow.restore).toHaveBeenCalledTimes(minimized ? 1 : 0);
+    expect(primaryWindow.show).toHaveBeenCalledOnce();
+    expect(primaryWindow.focus).toHaveBeenCalledOnce();
+    if (process.platform === 'darwin') expect(app.focus).toHaveBeenCalledWith({ steal: true });
+    else expect(app.focus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { sender: {}, senderFrame: primaryWindow.webContents.mainFrame },
+    { sender: primaryWindow.webContents, senderFrame: {} },
+  ])('rejects focus requests from another window or an embedded frame', (event) => {
+    expect(() => handlers.get('plugin:focus-window')?.(event)).toThrow(/Only the primary renderer/);
+    expect(primaryWindow.show).not.toHaveBeenCalled();
+    expect(primaryWindow.focus).not.toHaveBeenCalled();
+    expect(app.focus).not.toHaveBeenCalled();
+  });
+
+  it('ignores focus requests after the primary window closes', () => {
+    registerPluginHandlers(ipcMain, manager, () => null, revokePrimaryRendererAuthority, 'file:///app/index.html');
+    handlers.get('plugin:focus-window')?.({});
+    expect(app.focus).not.toHaveBeenCalled();
+    expect(primaryWindow.show).not.toHaveBeenCalled();
   });
 
   it.each([

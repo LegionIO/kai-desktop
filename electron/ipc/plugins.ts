@@ -137,6 +137,22 @@ export function registerPluginHandlers(
     return pluginManager.getUIState();
   });
 
+  ipcMain.handle('plugin:focus-window', (event) => {
+    const win = getPrimaryWindow();
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+    if (
+      event.sender !== win.webContents ||
+      event.senderFrame !== win.webContents.mainFrame ||
+      !isCanonicalPrimaryRendererUrl(event.senderFrame.url, primaryRendererUrl)
+    ) {
+      throw new Error('Only the primary renderer can request plugin window focus.');
+    }
+    if (win.isMinimized()) win.restore();
+    win.show();
+    if (process.platform === 'darwin') app.focus({ steal: true });
+    win.focus();
+  });
+
   ipcMain.handle('plugin:list', () => {
     return pluginManager.listPlugins();
   });
