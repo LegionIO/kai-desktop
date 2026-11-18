@@ -5,6 +5,9 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 import { safeErrorText } from '../utils/safe-error-text.js';
 import { recordAttempt, markPluginsDone, setAttemptSuccess, removeAttempt } from './post-update-ledger.js';
 import { writeUpdateReady } from '../local-bridge/update-signal.js';
+import { beginInstallGuard, clearInstallGuard, terminateOtherAppInstances } from '../local-bridge/install-guard.js';
+import { localBridgeClientCounts } from '../local-bridge/local-server.js';
+import { webClients } from '../web-server/web-clients.js';
 import { existsSync, readFileSync, rmSync, appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -1243,6 +1246,17 @@ export async function performQuitAndInstall(opts?: {
   committedVersion = installVersion;
   committedAttemptId = attemptId;
 
+  // ShipIt aborts ("App Still Running") while ANY copy of the app runs, and MCP
+  // hosts keep relaunching `kai mcp serve` + headless backends. Block new launches
+  // first, then stop the existing ones (the dialog warned the user).
+  try {
+    beginInstallGuard(installVersion);
+    // Packaged only: unpackaged execPath is node/dev Electron, shared by unrelated processes.
+    if (process.platform === 'darwin' && app.isPackaged) await terminateOtherAppInstances(process.execPath);
+  } catch (err) {
+    console.error('[auto-update] Install guard setup failed (continuing):', err);
+  }
+
   // Let Squirrel.Mac handle extract + replace + relaunch. On the happy path this
   // never returns (the app quits within moments). If it throws SYNCHRONOUSLY (e.g.
   // the native updater rejects the staged bundle before quitting), we've already
@@ -1459,6 +1473,7 @@ let pendingFullSize: number | undefined;
 async function teardownCommittedInstall(reason: string): Promise<void> {
   if (!installCommitted) return;
   installCommitted = false;
+  clearInstallGuard(); // the install failed; let CLI/MCP clients start again
   installFailedThisSession = true;
   const rollback = committedRollback;
   committedRollback = null;
@@ -1798,6 +1813,9 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
     }
     if (!downloaded) broadcast({ state: 'idle' });
   });
+
+  // What "Install and restart" will disconnect (shown as a warning on the card).
+  ipcMain.handle('auto-update:affected-clients', () => ({ web: webClients.size, ...localBridgeClientCounts() }));
 
   ipcMain.handle('auto-update:check', async () => {
     if (!app.isPackaged && !isUpdateTestMode) return { ok: false, error: 'Updates disabled in dev mode' };

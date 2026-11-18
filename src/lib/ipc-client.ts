@@ -745,6 +745,7 @@ type AppAPI = {
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;
     install: () => Promise<{ ok: boolean; error?: string; surfaced?: boolean; started?: boolean }>;
+    affectedClients: () => Promise<{ web: number; cli: number; mcp: number }>;
     onStatus: (
       callback: (status: {
         state: string;

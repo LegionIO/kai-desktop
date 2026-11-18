@@ -244,6 +244,7 @@ import {
   hasLocalBridgeClients,
 } from './local-bridge/local-server.js';
 import { shouldStepAsideForUpdate, clearUpdateReady } from './local-bridge/update-signal.js';
+import { isInstallGuardActive, clearInstallGuard } from './local-bridge/install-guard.js';
 import { webClients } from './web-server/web-clients.js';
 import { broadcastToWebClients } from './web-server/web-clients.js';
 import { setCompactionLockNotifier, compactingConversationIds } from './agent/compaction-lock.js';
@@ -669,6 +670,15 @@ if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
   }
 }
 
+// ── Install guard ─────────────────────────────────────────────────────────
+// While a GUI-driven update is swapping the bundle, ShipIt aborts if ANY copy of
+// the app is running. Refuse to start (CLI, `kai mcp serve`, headless, GUI) so
+// MCP hosts relaunching their connector can't block the install.
+if (isInstallGuardActive(__APP_VERSION)) {
+  process.stderr.write(`[${__BRAND_PRODUCT_NAME}] An update is being installed — try again in a minute.\n`);
+  process.exit(75); // EX_TEMPFAIL; synchronous, so nothing below runs
+}
+
 // ── Single-instance lock (acquired BEFORE the OTA rollback check) ─────────
 // CLI mode never requests the singleton lock — the backend (GUI or headless)
 // owns it. A `false` here also disables the whole backend bootstrap block below.
@@ -680,6 +690,8 @@ const gotSingleInstanceLock = IS_CLI ? false : app.requestSingleInstanceLock();
 if (!IS_CLI && !gotSingleInstanceLock) {
   app.quit();
 }
+// Past the guard check, any marker is expired or names this version: clear it.
+if (gotSingleInstanceLock) clearInstallGuard();
 
 // ── OTA Bootstrap ────────────────────────────────────────────────────────
 // Check for crash-based rollback BEFORE resolving code paths, so a broken

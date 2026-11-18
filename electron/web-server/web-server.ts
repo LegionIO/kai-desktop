@@ -758,6 +758,7 @@ export function getBridgeScript(): string {
     autoUpdate: {
       check: function() { return invoke('auto-update:check'); },
       install: function() { return invoke('auto-update:install'); },
+      affectedClients: function() { return invoke('auto-update:affected-clients'); },
       onStatus: function(cb) { return on('auto-update:status', cb); }
     },
     debug: {

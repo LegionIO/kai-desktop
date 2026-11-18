@@ -87,6 +87,11 @@ export function hasLocalBridgeClients(): boolean {
   return localClients.size + mcpClients.size > 0;
 }
 
+/** Connected CLI sessions and MCP connectors, for the pre-update disconnect warning. */
+export function localBridgeClientCounts(): { cli: number; mcp: number } {
+  return { cli: localClients.size, mcp: mcpClients.size };
+}
+
 function cancelIdleTimer(): void {
   if (idleTimer) {
     clearTimeout(idleTimer);

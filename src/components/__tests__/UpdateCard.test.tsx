@@ -51,3 +51,18 @@ describe('fmtEta', () => {
     expect(fmtEta(0, 7325, 1)).toBe('2h 2m left'); // 2h 2m 5s → drops the seconds
   });
 });
+
+describe('disconnectWarning', () => {
+  const { disconnectWarning } = __test__;
+  it('says nothing when no clients would be disconnected', () => {
+    expect(disconnectWarning(undefined)).toBeNull();
+    expect(disconnectWarning({ web: 0, cli: 0, mcp: 0 })).toBeNull();
+  });
+  it('lists only non-zero client kinds with correct plurals', () => {
+    expect(disconnectWarning({ web: 1, cli: 0, mcp: 0 })).toBe('1 web client will be disconnected.');
+    expect(disconnectWarning({ web: 1, cli: 0, mcp: 3 })).toBe('1 web client and 3 MCP connections will be disconnected.');
+    expect(disconnectWarning({ web: 2, cli: 1, mcp: 1 })).toBe(
+      '2 web clients, 1 CLI session and 1 MCP connection will be disconnected.',
+    );
+  });
+});

@@ -36,8 +36,25 @@ const fmtEta = (transferred?: number, total?: number, bytesPerSecond?: number): 
   return `${hrs}h ${mins % 60}m left`;
 };
 
-/** Test-only export of the pure ETA formatter. */
-export const __test__ = { fmtEta };
+/** "1 web client and 3 MCP connections will be disconnected." or null when none. */
+const disconnectWarning = (c?: { web: number; cli: number; mcp: number }): string | null => {
+  if (!c) return null;
+  const parts = (
+    [
+      [c.web, 'web client'],
+      [c.cli, 'CLI session'],
+      [c.mcp, 'MCP connection'],
+    ] as const
+  )
+    .filter(([n]) => n > 0)
+    .map(([n, label]) => `${n} ${label}${n === 1 ? '' : 's'}`);
+  if (parts.length === 0) return null;
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+  return `${list} will be disconnected.`;
+};
+
+/** Test-only export of the pure formatters. */
+export const __test__ = { fmtEta, disconnectWarning };
 
 export const UpdateCard: FC = () => {
   const [status, setStatus] = useState<UpdateStatus>({ state: 'idle' });
@@ -65,6 +82,21 @@ export const UpdateCard: FC = () => {
   useEffect(() => {
     if (status.state === 'preparing') setInstallError(null);
   }, [status.state]);
+
+  // Clients the install will disconnect; polled while the install button shows.
+  const [affected, setAffected] = useState<{ web: number; cli: number; mcp: number }>();
+  useEffect(() => {
+    if (status.state !== 'downloaded' || !window.app?.autoUpdate?.affectedClients) return;
+    const load = () =>
+      void app.autoUpdate
+        .affectedClients()
+        .then(setAffected)
+        .catch(() => setAffected(undefined));
+    load();
+    const timer = setInterval(load, 5000);
+    return () => clearInterval(timer);
+  }, [status.state]);
+  const warning = disconnectWarning(affected);
 
   // Surface a decline reason carried on a 'downloaded' status (R29P1): a web
   // client's detached install invoke only gets a started-ack, so the reason a
@@ -300,6 +332,12 @@ export const UpdateCard: FC = () => {
             Not yet
           </button>
         </div>
+      )}
+
+      {status.state === 'downloaded' && warning && (
+        <p className="mt-3 text-sm text-amber-600 dark:text-amber-500" role="status">
+          {warning}
+        </p>
       )}
 
       {status.state === 'downloaded' && installError && (

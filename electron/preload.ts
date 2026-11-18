@@ -1081,6 +1081,8 @@ const appAPI = {
   autoUpdate: {
     check: () => ipcRenderer.invoke('auto-update:check'),
     install: () => ipcRenderer.invoke('auto-update:install'),
+    affectedClients: () =>
+      ipcRenderer.invoke('auto-update:affected-clients') as Promise<{ web: number; cli: number; mcp: number }>,
     onStatus: (callback: (status: Record<string, unknown>) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, status: Record<string, unknown>) => callback(status);
       ipcRenderer.on('auto-update:status', handler);
