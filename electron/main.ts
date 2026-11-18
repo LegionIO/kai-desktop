@@ -777,6 +777,13 @@ app.setName(__BRAND_PRODUCT_NAME);
 if (IS_HEADLESS && process.platform === 'darwin' && app.setActivationPolicy) {
   app.setActivationPolicy('accessory');
 }
+// CLI clients (incl. `kai mcp serve`, spawned in bulk by MCP hosts) must be
+// prohibited BEFORE launch finishes: set at whenReady, LaunchServices has already
+// registered them as Foreground — dock icons flash, and Dock clicks/Quit can land
+// on a CLI process instead of the real app.
+if (IS_CLI && process.platform === 'darwin' && app.setActivationPolicy) {
+  app.setActivationPolicy('prohibited');
+}
 
 // Register the media protocol as a privileged scheme (must happen before app.whenReady)
 protocol.registerSchemesAsPrivileged([

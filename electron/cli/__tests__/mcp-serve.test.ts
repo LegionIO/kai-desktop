@@ -159,9 +159,18 @@ describe('kai mcp serve connector lifecycle', () => {
     expect(backend.connection.invokeWithTimeout).not.toHaveBeenCalled();
     mocks.recover.mockRejectedValue(new Error('Backend could not recover.'));
     backend.events.emit('disconnect');
+    await expect(client.listTools()).rejects.toThrow();
     await serving;
     expect(backend.connection.close).toHaveBeenCalledOnce();
     expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('connection lost'));
+  });
+  it('does not respawn a backend on disconnect until the MCP client makes a request', async () => {
+    await connect();
+    backend.events.emit('disconnect');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mocks.recover).not.toHaveBeenCalled();
+    expect((await client.listTools()).tools).toEqual(backend.tools);
+    expect(mocks.recover).toHaveBeenCalledOnce();
   });
   it('cancels backend recovery when the external MCP client closes', async () => {
     await connect();
@@ -181,7 +190,10 @@ describe('kai mcp serve connector lifecycle', () => {
       );
     });
     backend.events.emit('disconnect');
+    const listing = client.listTools().catch(() => {});
+    await vi.waitFor(() => expect(recoverySignal).toBeDefined());
     await client.close();
+    await listing;
     await serving;
     await recoveryStopped.promise;
     expect(recoverySignal?.aborted).toBe(true);

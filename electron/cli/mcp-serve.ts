@@ -42,12 +42,33 @@ export async function serveMcp(credential: string, fromElectron: boolean): Promi
   const server = new Server({ name: 'kai-mcp', version: '1.0.0' }, { capabilities: { tools: { listChanged: true } } });
   const lifetime = new AbortController();
   let recovery: Promise<boolean> | undefined;
+  let disconnected = false;
+  const ensureBackend = async (): Promise<void> => {
+    // Recover lazily, on the next request: an eager respawn on disconnect means
+    // quitting Kai relaunches a backend at once for every attached MCP host.
+    if (disconnected && !recovery) {
+      recovery = recoverBackend(connection, fromElectron, lifetime.signal)
+        .catch(() => false)
+        .then((ok) => {
+          if (ok) disconnected = false;
+          return ok;
+        })
+        .finally(() => {
+          recovery = undefined;
+        });
+    }
+    if (recovery && !(await recovery)) {
+      cliLog('Kai backend connection lost. Reconnect the MCP client.');
+      void server.close();
+      throw new Error('Kai backend is unavailable.');
+    }
+  };
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (recovery && !(await recovery)) throw new Error('Kai backend is unavailable.');
+    await ensureBackend();
     return { tools: await connection.invoke<Tool[]>('kai-mcp:list') };
   });
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (recovery && !(await recovery)) throw new Error('Kai backend is unavailable.');
+    await ensureBackend();
     const callId = randomUUID();
     const cancel = () => {
       void connection.invoke('kai-mcp:cancel', callId).catch(() => {});
@@ -91,18 +112,8 @@ export async function serveMcp(credential: string, fromElectron: boolean): Promi
     void server.notification({ method: 'notifications/tools/list_changed' }).catch(() => {});
   });
   const stopDisconnect = connection.onDisconnect(() => {
-    if (lifetime.signal.aborted || connection.wasIntentionalClose() || recovery) return;
-    recovery = recoverBackend(connection, fromElectron, lifetime.signal)
-      .catch(() => false)
-      .finally(() => {
-        recovery = undefined;
-      });
-    void recovery.then((ok) => {
-      if (!ok && !lifetime.signal.aborted) {
-        cliLog('Kai backend connection lost. Reconnect the MCP client.');
-        void server.close();
-      }
-    });
+    if (lifetime.signal.aborted || connection.wasIntentionalClose()) return;
+    disconnected = true;
   });
   let closed!: () => void;
   const ended = new Promise<void>((resolve) => {
