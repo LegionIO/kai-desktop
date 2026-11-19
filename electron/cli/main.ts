@@ -32,7 +32,7 @@ async function main(): Promise<void> {
 
   if (help) {
     process.stdout.write(helpText() + '\n');
-    process.exit(0);
+    return process.exit(0);
   }
 
   const mcpCommand = parseMcpCommand(process.argv.slice(2));
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     const trusted = await confirmFolderTrust(process.cwd());
     if (!trusted) {
       cliLog('folder not trusted — exiting. Re-run and choose trust, or cd to a trusted folder.');
-      process.exit(0);
+      return process.exit(0);
     }
   }
 
@@ -61,14 +61,14 @@ async function main(): Promise<void> {
   const quiet = interactive || hookMode;
   let client = await tryConnect(socketPath, token);
   // Agent wake hooks fire on every session/turn: never boot a backend for them.
-  if (!client && hookMode) process.exit(0);
+  if (!client && hookMode) return process.exit(0);
   if (!client) {
     if (!quiet) cliLog('no running Kai backend found — starting a headless one…');
-    if (!(await spawnHeadlessBackend(false))) process.exit(1);
+    if (!(await spawnHeadlessBackend(false))) return process.exit(1);
     client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS, token);
     if (!client) {
       cliLog('timed out waiting for the headless backend to come up');
-      process.exit(1);
+      return process.exit(1);
     }
     if (!quiet) cliLog('headless backend ready');
   } else {
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
     } finally {
       activeClient.close();
     }
-    process.exit(0);
+    return process.exit(0);
   }
 
   if (eventsCommand) {
@@ -97,18 +97,18 @@ async function main(): Promise<void> {
         : await runEventsCommand(activeClient, eventsCommand);
     await activeClient.requestShutdown().catch(() => {});
     activeClient.close();
-    process.exit(code);
+    return process.exit(code);
   }
 
   if (list) {
     await listResources(activeClient, list);
     activeClient.close();
-    process.exit(0);
+    return process.exit(0);
   }
 
   if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, false));
-    process.exit(0);
+    return process.exit(0);
   } else {
     await runHeadlessOnce(activeClient, {
       prompt,
@@ -122,7 +122,7 @@ async function main(): Promise<void> {
     });
     await activeClient.requestShutdown();
     activeClient.close();
-    process.exit(0);
+    return process.exit(0);
   }
 }
 

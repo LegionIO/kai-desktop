@@ -26,11 +26,15 @@ import { parseEventsArgs, runEvents, runEventsCommand } from './events.js';
  * still carries `--kai-cli` — harmlessly ignored) runs one-shot headless instead
  * of the REPL, matching the standalone `kai` entry.
  */
+// Every exit is `return process.exit(...)`: in the packaged app process.exit is
+// Electron's app.exit, which does not stop this function, so a bare call falls
+// through into the next branch (e.g. a woken `events --rewake` watcher then hung
+// in the headless-prompt path instead of exiting 2, so Claude never woke).
 export async function runCliClient(): Promise<void> {
   const connector = parseMcpServe(process.argv.slice(2));
   if (connector) {
     await serveMcp(connector.credential, true);
-    process.exit(0);
+    return process.exit(0);
   }
   // Silence Node's own deprecation warnings (e.g. the `punycode` DEP0040 a
   // transitive dep triggers) — printed to stderr before our UI draws and pure
@@ -43,7 +47,7 @@ export async function runCliClient(): Promise<void> {
   // `kai --help` / `-h`: print the usage manual and exit before any connect.
   if (help) {
     process.stdout.write(helpText() + '\n');
-    process.exit(0);
+    return process.exit(0);
   }
 
   const mcpCommand = parseMcpCommand(process.argv.slice(2));
@@ -65,7 +69,7 @@ export async function runCliClient(): Promise<void> {
     const trusted = await confirmFolderTrust(process.cwd());
     if (!trusted) {
       cliLog('folder not trusted — exiting. Re-run and choose trust, or cd to a trusted folder.');
-      process.exit(0);
+      return process.exit(0);
     }
   }
 
@@ -74,16 +78,16 @@ export async function runCliClient(): Promise<void> {
   const quiet = interactive || hookMode;
   let client = await tryConnect(socketPath, token);
   // Agent wake hooks fire on every session/turn: never boot a backend for them.
-  if (!client && hookMode) process.exit(0);
+  if (!client && hookMode) return process.exit(0);
   if (!client) {
     if (!quiet) cliLog('no running Kai backend found — starting a headless one…');
     if (!(await spawnHeadlessBackend(true))) {
-      process.exit(1);
+      return process.exit(1);
     }
     client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS, token);
     if (!client) {
       cliLog('timed out waiting for the headless backend to come up');
-      process.exit(1);
+      return process.exit(1);
     }
     if (!quiet) cliLog('headless backend ready');
   } else {
@@ -107,7 +111,7 @@ export async function runCliClient(): Promise<void> {
     } finally {
       activeClient.close();
     }
-    process.exit(0);
+    return process.exit(0);
   }
 
   if (eventsCommand) {
@@ -117,18 +121,18 @@ export async function runCliClient(): Promise<void> {
         : await runEventsCommand(activeClient, eventsCommand);
     await activeClient.requestShutdown().catch(() => {});
     activeClient.close();
-    process.exit(code);
+    return process.exit(code);
   }
 
   if (list) {
     await listResources(activeClient, list);
     activeClient.close();
-    process.exit(0);
+    return process.exit(0);
   }
 
   if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, true));
-    process.exit(0);
+    return process.exit(0);
   } else {
     await runHeadlessOnce(activeClient, {
       prompt,
@@ -142,6 +146,6 @@ export async function runCliClient(): Promise<void> {
     });
     await activeClient.requestShutdown();
     activeClient.close();
-    process.exit(0);
+    return process.exit(0);
   }
 }
