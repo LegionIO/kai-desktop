@@ -5,7 +5,6 @@ import * as Switch from '@radix-ui/react-switch';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { CheckIcon, ChevronDownIcon, CopyIcon, Loader2Icon, RefreshCwIcon } from 'lucide-react';
 import { BRIDGE_APPROVAL_CANCELLED } from '../../../shared/bridge-approval';
-import { useConfig } from '@/providers/ConfigProvider';
 import { app, type AutomationSourceCatalogEntry } from '@/lib/ipc-client';
 import type {
   BridgeClientPreview,
@@ -301,7 +300,14 @@ export function PluginBridgeSettings({ focusTab, focusNonce }: { focusTab?: stri
             {snapshot.sharingEnabled && (
               <>
                 <ClientConnection api={api} busy={busy} run={run} refresh={load} />
-                <AgentWake api={api} busy={busy} run={run} snapshot={snapshot} setSnapshot={setSnapshot} />
+                <AgentWake
+                  api={api}
+                  busy={busy}
+                  run={run}
+                  snapshot={snapshot}
+                  setSnapshot={setSnapshot}
+                  mutate={mutate}
+                />
                 <RemoteSettings
                   snapshot={snapshot}
                   busy={busy}
@@ -793,26 +799,25 @@ function ClientConnection({
     </div>
   );
 }
-type WakeTrigger = { source: string; event: string; where: Array<{ path: string; value: string }> };
 function AgentWake({
   api,
   busy,
   run,
   snapshot,
   setSnapshot,
+  mutate,
 }: {
   api: PluginBridgeApi;
   busy: boolean;
   run: Run;
   snapshot: BridgeSnapshot;
   setSnapshot: (snapshot: BridgeSnapshot) => void;
+  mutate: (change: BridgeMutation) => Promise<void>;
 }) {
-  const { config, updateConfig } = useConfig();
-  const triggers: WakeTrigger[] =
-    (config as { automations?: { agentWake?: { triggers?: WakeTrigger[] } } } | null)?.automations?.agentWake
-      ?.triggers ?? [];
   const [catalog, setCatalog] = useState<AutomationSourceCatalogEntry[]>([]);
+  const [selected, setSelected] = useState(() => new Set(snapshot.sharedEvents ?? []));
   const [preview, setPreview] = useState<WakeHookPreview | null>(null);
+  useEffect(() => setSelected(new Set(snapshot.sharedEvents ?? [])), [snapshot.sharedEvents]);
   useEffect(() => {
     let alive = true;
     const load = () => void app.automations.catalog().then((c) => alive && setCatalog(c));
@@ -823,110 +828,75 @@ function AgentWake({
       off();
     };
   }, []);
-  const plugins = catalog.filter((c) => c.source.startsWith('plugin.'));
-  const save = (next: WakeTrigger[]) => updateConfig('automations.agentWake.triggers', next);
-  const patch = (i: number, change: Partial<WakeTrigger>) =>
-    save(triggers.map((t, j) => (j === i ? { ...t, ...change } : t)));
+  const plugins = catalog.filter((c) => c.source.startsWith('plugin.') && c.events.length);
+  const toggle = (key: string, on: boolean) =>
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
   return (
-    <div className="space-y-3 border-t border-border pt-5" data-setting-id="automations.agentWake">
-      <h4 className="text-xs font-semibold">Wake agents on automation triggers</h4>
+    <div className="space-y-3 border-t border-border pt-5" data-setting-id="mcpExport.events">
+      <h4 className="text-xs font-semibold">Shared automation events</h4>
       <p className="text-xs leading-relaxed text-muted-foreground">
-        When one of these plugin triggers fires, Kai wakes each running Claude Code session (including mid-turn) and
-        hands the event to Codex at its next turn. Filters match part of a payload field, ignoring case, e.g.{' '}
-        <code className="font-mono">from.displayName</code> = <code className="font-mono">Jane</code>. Kai must be
-        running.
+        Choose which plugin events Claude Code and Codex may listen to. Each session sets its own filters: ask it, e.g.
+        “wake me when Jane messages me on Teams”, and it subscribes itself. A subscribed session receives each matching
+        event’s payload, such as message previews and sender names. Claude is woken even mid-turn; Codex gets events at
+        its next turn. Kai must be running.
       </p>
-      {triggers.map((trigger, i) => {
-        const events = plugins.find((c) => c.source === trigger.source)?.events ?? [];
-        return (
-          <div key={i} className="space-y-2 rounded-lg border border-border p-3">
-            <div className="flex flex-wrap gap-2">
-              <select
-                aria-label="Trigger source"
-                className={inputClass + ' w-auto'}
-                value={trigger.source}
-                disabled={busy}
-                onChange={(e) => patch(i, { source: e.target.value, event: '' })}
-              >
-                <option value="">— plugin —</option>
-                {plugins.map((c) => (
-                  <option key={c.source} value={c.source}>
-                    {c.displayName}
-                  </option>
-                ))}
-              </select>
-              <select
-                aria-label="Trigger event"
-                className={inputClass + ' w-auto'}
-                value={trigger.event}
-                disabled={busy || !trigger.source}
-                onChange={(e) => patch(i, { event: e.target.value })}
-              >
-                <option value="">Any event</option>
-                {events.map((e) => (
-                  <option key={e.event} value={e.event}>
-                    {e.title}
-                  </option>
-                ))}
-              </select>
-              <button
-                className={buttonClass}
-                disabled={busy}
-                onClick={() => void save(triggers.filter((_, j) => j !== i))}
-              >
-                Remove trigger
-              </button>
-            </div>
-            {trigger.where.map((w, k) => (
-              <div key={k} className="flex flex-wrap items-center gap-2">
-                <input
-                  aria-label="Payload field"
-                  className={inputClass + ' w-48'}
-                  placeholder="from.displayName"
-                  value={w.path}
-                  disabled={busy}
-                  onChange={(e) =>
-                    patch(i, { where: trigger.where.map((x, m) => (m === k ? { ...x, path: e.target.value } : x)) })
-                  }
-                />
-                <span className="text-xs text-muted-foreground">contains</span>
-                <input
-                  aria-label="Payload value"
-                  className={inputClass + ' w-48'}
-                  placeholder="Jane"
-                  value={w.value}
-                  disabled={busy}
-                  onChange={(e) =>
-                    patch(i, { where: trigger.where.map((x, m) => (m === k ? { ...x, value: e.target.value } : x)) })
-                  }
-                />
-                <button
-                  className={buttonClass}
-                  disabled={busy}
-                  onClick={() => void patch(i, { where: trigger.where.filter((_, m) => m !== k) })}
-                >
-                  Remove filter
-                </button>
+      <div className="divide-y divide-border">
+        {plugins.map((plugin) => {
+          const all = `${plugin.source}:*`;
+          return (
+            <Collapsible.Root key={plugin.source} className="py-3">
+              <div className="flex items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <Selection checked={selected.has(all)} disabled={busy} onChange={(on) => toggle(all, on)}>
+                    <span className="break-words font-medium">{plugin.displayName}</span>
+                    <span className="mt-1 block text-muted-foreground">
+                      {plugin.events.length} events · Select to share all of them, including events added by future
+                      updates
+                    </span>
+                  </Selection>
+                </div>
+                <Collapsible.Trigger aria-label={`Review ${plugin.displayName} events`} className={buttonClass}>
+                  <ChevronDownIcon className="size-4" />
+                </Collapsible.Trigger>
               </div>
-            ))}
-            <button
-              className={buttonClass}
-              disabled={busy}
-              onClick={() => void patch(i, { where: [...trigger.where, { path: '', value: '' }] })}
-            >
-              Add filter
-            </button>
-          </div>
-        );
-      })}
-      <button
-        className={buttonClass}
-        disabled={busy}
-        onClick={() => void save([...triggers, { source: '', event: '', where: [] }])}
-      >
-        Add trigger
-      </button>
+              <Collapsible.Content className="mt-4 space-y-3 pl-6">
+                {plugin.events.map((event) => {
+                  const key = `${plugin.source}:${event.event}`;
+                  return (
+                    <Selection
+                      key={key}
+                      checked={selected.has(all) || selected.has(key)}
+                      disabled={busy || selected.has(all)}
+                      onChange={(on) => toggle(key, on)}
+                    >
+                      <span className="break-words font-medium">{event.title}</span>
+                      {event.description && (
+                        <span className="mt-1 block leading-relaxed text-muted-foreground">{event.description}</span>
+                      )}
+                    </Selection>
+                  );
+                })}
+              </Collapsible.Content>
+            </Collapsible.Root>
+          );
+        })}
+      </div>
+      {!plugins.length && (
+        <p className="py-3 text-xs text-muted-foreground">No plugin publishes automation events yet.</p>
+      )}
       <div className="flex flex-wrap gap-2">
+        <button
+          className={buttonClass}
+          disabled={busy}
+          onClick={() => void mutate({ action: 'events', events: [...selected].sort() })}
+        >
+          Save shared events
+        </button>
         {(['claude', 'codex'] as const).map((host) => {
           const installed = snapshot.wakeHooks?.[host];
           const name = host === 'claude' ? 'Claude Code' : 'Codex';

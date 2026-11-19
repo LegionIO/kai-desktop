@@ -6,7 +6,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { hash, object, readBoundedFile } from '../plugin-bridge/files.js';
 
 /** Marks our entries so install/remove only ever touches Kai's own hooks. */
-export const WAKE_HOOK_MARKER = ' events --shared ';
+const WAKE_HOOK_RE = / events (--shared|hint)( |$)/;
 
 type Hook = Record<string, unknown> & { command?: string };
 type Group = { matcher?: string; hooks?: Hook[] };
@@ -22,16 +22,21 @@ function quote(arg: string): string {
  * Codex has no async hooks: drain missed events on each turn boundary instead.
  */
 export function wakeHookEntries(host: PluginHost, launcher: { command: string; args: string[] }) {
-  const base = [launcher.command, ...launcher.args, 'events', '--shared'].map(quote).join(' ');
-  if (host === 'claude') {
-    const hook = { type: 'command', command: `${base} --rewake`, async: true, asyncRewake: true, timeout: 3600 };
-    return Object.fromEntries(['SessionStart', 'UserPromptSubmit', 'Stop'].map((e) => [e, [{ hooks: [hook] }]]));
-  }
-  const hook = { type: 'command', command: `${base} --drain`, timeout: 10 };
-  return Object.fromEntries(['SessionStart', 'UserPromptSubmit', 'Stop'].map((e) => [e, [{ hooks: [hook] }]]));
+  const kai = [launcher.command, ...launcher.args].map(quote).join(' ');
+  // Tells each new session it can subscribe itself (`kai events subscribe`).
+  const hint = { type: 'command', command: `${kai} events hint`, timeout: 10 };
+  const watch =
+    host === 'claude'
+      ? { type: 'command', command: `${kai} events --shared --rewake`, async: true, asyncRewake: true, timeout: 3600 }
+      : { type: 'command', command: `${kai} events --shared --drain`, timeout: 10 };
+  return {
+    SessionStart: [{ hooks: [hint, watch] }],
+    UserPromptSubmit: [{ hooks: [watch] }],
+    Stop: [{ hooks: [watch] }],
+  } as Record<string, Group[]>;
 }
 
-const isOurs = (hook: Hook) => typeof hook.command === 'string' && hook.command.includes(WAKE_HOOK_MARKER);
+const isOurs = (hook: Hook) => typeof hook.command === 'string' && WAKE_HOOK_RE.test(hook.command);
 
 /** Remove every Kai wake hook, dropping groups/events left empty. */
 export function withoutWakeHooks(file: HooksFile): HooksFile {
@@ -88,9 +93,21 @@ export class WakeHookSetup {
       throw new Error(`${path} could not be parsed. Repair it before changing Kai wake hooks.`);
     }
   }
+  /** True only when the current hook set is present; older Kai installs read as not installed. */
   installed(host: PluginHost): boolean {
     try {
-      return hasWakeHooks(this.read(this.path(host)).file);
+      const ours = (f: HooksFile) =>
+        Object.entries(object(f.hooks) as Record<string, Group[]>)
+          .map(([event, groups]) => [
+            event,
+            (Array.isArray(groups) ? groups : [])
+              .flatMap((g) => (Array.isArray(g.hooks) ? g.hooks : []))
+              .filter(isOurs),
+          ])
+          .filter(([, hooks]) => hooks.length)
+          .sort(([a], [b]) => String(a).localeCompare(String(b))); // the user's file keeps its own event order
+      const expected = ours({ hooks: wakeHookEntries(host, this.launcher()) });
+      return JSON.stringify(ours(this.read(this.path(host)).file)) === JSON.stringify(expected);
     } catch {
       return false;
     }

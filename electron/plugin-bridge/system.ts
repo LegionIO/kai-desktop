@@ -177,6 +177,7 @@ export class PluginBridgeSystem {
       activity: this.store.recent(),
       remoteProblems: remoteProblems(config),
       credentialStorage: this.credentials.storage,
+      sharedEvents: config.mcpExport.events,
       wakeHooks: { claude: this.wakeHooks.installed('claude'), codex: this.wakeHooks.installed('codex') },
     };
   }
@@ -238,6 +239,9 @@ export class PluginBridgeSystem {
       }
       case 'exports':
         this.sharing.select(change.sources, change.tools);
+        break;
+      case 'events':
+        this.options.setConfig('mcpExport', { ...config.mcpExport, events: [...new Set(change.events)] });
         break;
       case 'revoke-client':
         this.credentials.revoke(change.clientId);

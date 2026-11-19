@@ -13,7 +13,7 @@ import {
   BOOT_TIMEOUT_MS,
 } from './spawn-backend.js';
 import { confirmFolderTrust } from './folder-trust.js';
-import { parseEventsArgs, runEvents } from './events.js';
+import { parseEventsArgs, runEvents, runEventsCommand } from './events.js';
 
 /**
  * Standalone (dev) `kai` entry: run with system node against the built bundle
@@ -36,13 +36,14 @@ async function main(): Promise<void> {
   }
 
   const mcpCommand = parseMcpCommand(process.argv.slice(2));
-  const eventsFilter = parseEventsArgs(process.argv.slice(2));
+  const eventsCommand = parseEventsArgs(process.argv.slice(2));
+  const eventsFilter = eventsCommand?.kind === 'stream' ? eventsCommand.filter : undefined;
   const socketPath = getSocketPath();
   const token = getBridgeToken();
   // Interactive REPL only when we have a real terminal AND no one-shot flag. In
   // the REPL the banner UI replaces these status lines, so keep them for the
   // headless/scripting path only (stderr).
-  const interactive = !print && !eventsFilter && process.stdin.isTTY && process.stdout.isTTY;
+  const interactive = !print && !eventsCommand && process.stdin.isTTY && process.stdout.isTTY;
 
   // Workspace trust: gate an unfamiliar folder behind an explicit prompt before
   // spawning/attaching a backend (the interactive REPL can run tools scoped to
@@ -55,7 +56,8 @@ async function main(): Promise<void> {
     }
   }
 
-  const hookMode = !!(eventsFilter?.rewake || eventsFilter?.drain);
+  // Hook commands run on every session/turn: stay silent and never boot a backend for them.
+  const hookMode = !!(eventsFilter?.rewake || eventsFilter?.drain || eventsCommand?.kind === 'hint');
   const quiet = interactive || hookMode;
   let client = await tryConnect(socketPath, token);
   // Agent wake hooks fire on every session/turn: never boot a backend for them.
@@ -88,8 +90,11 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (eventsFilter) {
-    const code = await runEvents(activeClient, eventsFilter, () => recoverBackend(activeClient, false));
+  if (eventsCommand) {
+    const code =
+      eventsCommand.kind === 'stream'
+        ? await runEvents(activeClient, eventsCommand.filter, () => recoverBackend(activeClient, false))
+        : await runEventsCommand(activeClient, eventsCommand);
     await activeClient.requestShutdown().catch(() => {});
     activeClient.close();
     process.exit(code);

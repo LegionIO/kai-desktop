@@ -88,6 +88,8 @@ export type BridgeSnapshot = {
   activity: BridgeActivity[];
   remoteProblems: string[];
   credentialStorage: 'encrypted' | 'session';
+  /** Automation events agents may subscribe to: `plugin.<name>:<event>` or `plugin.<name>:*`. */
+  sharedEvents: string[];
   /** Whether Kai's agent-wake hooks are present in each host's hook file. */
   wakeHooks: Record<PluginHost, boolean>;
 };
@@ -112,7 +114,8 @@ export type BridgeMutation =
   | { action: 'sharing'; enabled: boolean }
   | { action: 'remote'; enabled: boolean; publicUrl: string }
   | { action: 'exports'; sources: string[]; tools: string[] }
-  | { action: 'revoke-client'; clientId: string };
+  | { action: 'revoke-client'; clientId: string }
+  | { action: 'events'; events: string[] };
 export type BridgeClientPreview = {
   id: string;
   host: PluginHost;

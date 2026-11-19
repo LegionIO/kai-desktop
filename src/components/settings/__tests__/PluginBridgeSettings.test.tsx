@@ -57,7 +57,10 @@ describe('Plugin Bridge human settings', () => {
             {
               source: 'plugin.msgraph',
               displayName: 'MSGraph',
-              events: [{ event: 'message-received', title: 'Message received' }],
+              events: [
+                { event: 'message-received', title: 'Message received' },
+                { event: 'typing-started', title: 'Typing started' },
+              ],
               actions: [],
             },
           ]),
@@ -202,5 +205,16 @@ describe('Plugin Bridge human settings', () => {
     await user.click(screen.getByRole('button', { name: 'Install hooks' }));
     expect(api.applyWakeHooks).toHaveBeenCalledWith('wake-preview');
     expect(await screen.findByRole('button', { name: 'Remove hooks from Claude Code' })).toBeInTheDocument();
+  });
+
+  it('shares chosen automation events with agents through a reviewed mutation', async () => {
+    snapshot = bridgeSnapshotFixture({ sharingEnabled: true });
+    const user = userEvent.setup();
+    render(<PluginBridgeSettings focusTab="sharing" />);
+    await user.click(await screen.findByRole('button', { name: 'Review MSGraph events' }));
+    await user.click(screen.getByRole('checkbox', { name: /Message received/ }));
+    await user.click(screen.getByRole('button', { name: 'Save shared events' }));
+    expect(api.mutate).toHaveBeenCalledWith({ action: 'events', events: ['plugin.msgraph:message-received'] });
+    expect(screen.queryByRole('textbox', { name: 'Payload field' })).not.toBeInTheDocument();
   });
 });

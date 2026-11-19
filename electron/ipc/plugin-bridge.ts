@@ -38,6 +38,10 @@ function approvalDetail(system: PluginBridgeSystem, change: BridgeMutation): str
       '\n\nAll connected clients share this selection. Integration credentials remain in Kai.'
     );
   }
+  if (change.action === 'events')
+    return change.events.length
+      ? `Let Claude Code and Codex sessions subscribe to these Kai automation events:\n\n${change.events.map((e) => e.replace(/:\*$/, ': all events, including future events')).join('\n')}\n\nA subscribed session receives each matching event's payload (e.g. message previews and sender names). Each session chooses its own filters.`
+      : 'Stop sharing all automation events. Agent sessions stop receiving events, including ones they already subscribed to.';
   if (change.action === 'homes')
     return `Discover user installations from:\nClaude: ${change.claude || 'default host home'}\nCodex: ${change.codex || 'default host home'}\n\nComponents will be revalidated against existing approvals.`;
   if (change.action === 'remote')
@@ -71,6 +75,19 @@ const mutationSchema = z.discriminatedUnion('action', [
     })
     .strict(),
   z.object({ action: z.literal('revoke-client'), clientId: z.string().uuid() }).strict(),
+  z
+    .object({
+      action: z.literal('events'),
+      events: z
+        .array(
+          z
+            .string()
+            .regex(/^plugin\.[\w.-]+:(\*|[\w.:-]+)$/)
+            .max(300),
+        )
+        .max(1000),
+    })
+    .strict(),
 ]);
 
 export function registerPluginBridgeHandlers(
