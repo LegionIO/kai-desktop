@@ -28,6 +28,15 @@ describe('Plugin Bridge human settings', () => {
         expiresAt: '2026-01-01T00:10:00Z',
       })),
       applyClient: vi.fn(async () => ({ configuration: 'created configuration' })),
+      previewWakeHooks: vi.fn(async (host, install) => ({
+        id: 'wake-preview',
+        host,
+        install,
+        path: '/fixture/settings.json',
+        configuration: '{"hooks":{}}',
+        expiresAt: '2026-01-01T00:10:00Z',
+      })),
+      applyWakeHooks: vi.fn(async () => structuredClone(snapshot)),
       createToken: vi.fn(async () => ({
         token: 'fixture-token',
         client: {
@@ -39,7 +48,23 @@ describe('Plugin Bridge human settings', () => {
         },
       })),
     };
-    Object.defineProperty(window, 'app', { configurable: true, value: { pluginBridge: api } });
+    Object.defineProperty(window, 'app', {
+      configurable: true,
+      value: {
+        pluginBridge: api,
+        automations: {
+          catalog: vi.fn(async () => [
+            {
+              source: 'plugin.msgraph',
+              displayName: 'MSGraph',
+              events: [{ event: 'message-received', title: 'Message received' }],
+              actions: [],
+            },
+          ]),
+          onCatalogChanged: vi.fn(() => () => {}),
+        },
+      },
+    });
   });
   afterEach(() => {
     cleanup();
@@ -164,5 +189,18 @@ describe('Plugin Bridge human settings', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
     await user.click(screen.getByRole('button', { name: 'Runtime compatibility' }));
     expect(screen.getByText(/Native Codex tools bypass/)).toBeInTheDocument();
+  });
+
+  it('installs wake hooks for Claude through a reviewed preview', async () => {
+    snapshot = bridgeSnapshotFixture({ sharingEnabled: true });
+    const user = userEvent.setup();
+    render(<PluginBridgeSettings focusTab="sharing" />);
+    await user.click(await screen.findByRole('button', { name: 'Install hooks in Claude Code' }));
+    expect(api.previewWakeHooks).toHaveBeenCalledWith('claude', true);
+    expect(await screen.findByText(/Hook preview · \/fixture\/settings.json/)).toBeInTheDocument();
+    snapshot.wakeHooks = { claude: true, codex: false };
+    await user.click(screen.getByRole('button', { name: 'Install hooks' }));
+    expect(api.applyWakeHooks).toHaveBeenCalledWith('wake-preview');
+    expect(await screen.findByRole('button', { name: 'Remove hooks from Claude Code' })).toBeInTheDocument();
   });
 });

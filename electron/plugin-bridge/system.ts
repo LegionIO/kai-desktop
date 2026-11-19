@@ -11,6 +11,7 @@ import type { NativeBridgeSource } from './types.js';
 import { SharingCredentials, remoteProblems } from '../mcp-sharing/credentials.js';
 import { KaiMcpService } from '../mcp-sharing/service.js';
 import { McpClientSetup } from '../mcp-sharing/setup.js';
+import { WakeHookSetup } from '../mcp-sharing/wake-hooks.js';
 import { RemoteMcpEndpoint } from '../mcp-sharing/remote.js';
 import { setMcpHttpHandler } from '../mcp-sharing/http-hook.js';
 import { setLocalMcpHandler } from '../mcp-sharing/local-hook.js';
@@ -23,6 +24,7 @@ export class PluginBridgeSystem {
   readonly credentials: SharingCredentials;
   readonly sharing: KaiMcpService;
   readonly setup: McpClientSetup;
+  readonly wakeHooks: WakeHookSetup;
   readonly remote: RemoteMcpEndpoint;
   private timer?: ReturnType<typeof setInterval>;
   private refreshing = false;
@@ -79,6 +81,7 @@ export class PluginBridgeSystem {
       void this.hooks.end(id);
     };
     this.setup = new McpClientSetup(this.credentials, () => this.imports.homes(), options.launcher);
+    this.wakeHooks = new WakeHookSetup(() => this.imports.homes(), options.launcher);
     this.credentials.onRevoked = () => {
       this.sharing.changed();
       this.remote.sweep();
@@ -174,6 +177,7 @@ export class PluginBridgeSystem {
       activity: this.store.recent(),
       remoteProblems: remoteProblems(config),
       credentialStorage: this.credentials.storage,
+      wakeHooks: { claude: this.wakeHooks.installed('claude'), codex: this.wakeHooks.installed('codex') },
     };
   }
   async discover(): Promise<BridgeSnapshot> {

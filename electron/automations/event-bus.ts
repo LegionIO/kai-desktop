@@ -10,10 +10,19 @@ type Listener = (event: AutomationEvent) => void;
 
 type CompiledValidator = { zod: z.ZodTypeAny; declaredKeys: string[] };
 
+/** Wire shape of a plugin event on `plugin:event` (and in the replay buffer). */
+export type PluginEventRecord = { pluginName: string; eventName: string; data?: unknown; ts: number };
+
+/** Replay window for `kai events --rewake`: covers the gap between one wake
+ *  watcher exiting and the next one attaching. Small on purpose (heap). */
+const RECENT_MAX = 100;
+const RECENT_MAX_AGE_MS = 15 * 60_000;
+
 export class AutomationEventBus {
   private catalog = new Map<string, SourceCatalogEntry>();
   private listeners = new Set<Listener>();
   private validators = new Map<string, CompiledValidator>();
+  private recent: PluginEventRecord[] = [];
 
   registerSource(entry: SourceCatalogEntry): void {
     this.catalog.set(entry.source, entry);
@@ -44,6 +53,11 @@ export class AutomationEventBus {
   /** True when at least one subscriber is attached (lets callers skip payload prep). */
   hasListeners(): boolean {
     return this.listeners.size > 0;
+  }
+
+  /** Plugin events newer than `sinceTs`, oldest first. */
+  recentPluginEvents(sinceTs: number): PluginEventRecord[] {
+    return this.recent.filter((e) => e.ts > sinceTs);
   }
 
   emit(source: string, event: string, payload?: unknown, depth = 0): void {
@@ -80,13 +94,18 @@ export class AutomationEventBus {
     //
     // Automation rules do NOT come through here — they consume the in-process
     // `listeners` set above, so gating this fan-out cannot affect them.
-    if (source.startsWith('plugin.') && hasAnyConsumer(PLUGIN_EVENT_CHANNEL)) {
-      broadcastToAllWindows(PLUGIN_EVENT_CHANNEL, {
-        pluginName: source.slice('plugin.'.length),
-        eventName: event,
-        data: payload,
-      });
-    }
+    if (!source.startsWith('plugin.')) return;
+    const record: PluginEventRecord = {
+      pluginName: source.slice('plugin.'.length),
+      eventName: event,
+      data: payload,
+      // Strictly increasing so a replay cursor (`ts > cursor`) never skips a same-ms sibling.
+      ts: Math.max(evt.ts, (this.recent.at(-1)?.ts ?? 0) + 1),
+    };
+    this.recent.push(record);
+    const cutoff = record.ts - RECENT_MAX_AGE_MS;
+    while (this.recent.length > RECENT_MAX || (this.recent[0] && this.recent[0].ts < cutoff)) this.recent.shift();
+    if (hasAnyConsumer(PLUGIN_EVENT_CHANNEL)) broadcastToAllWindows(PLUGIN_EVENT_CHANNEL, record);
   }
 
   private compileValidator(source: string, event: string): CompiledValidator | null {

@@ -93,6 +93,7 @@ describe('emit', () => {
       pluginName: 'my-plugin',
       eventName: 'did-thing',
       data: { v: 1 },
+      ts: expect.any(Number),
     });
   });
 
@@ -141,7 +142,19 @@ describe('plugin:event consumer gating', () => {
       pluginName: 'msgraph',
       eventName: 'message-received',
       data: { id: 'm1' },
+      ts: expect.any(Number),
     });
+  });
+
+  it('keeps a bounded replay buffer of plugin events with strictly increasing ts', () => {
+    hasAnyConsumer.mockReturnValue(false); // buffered even with no live consumer
+    bus.emit('sys', 'started', {});
+    for (let i = 0; i < 105; i++) bus.emit('plugin.msgraph', 'message-received', { i });
+    const all = bus.recentPluginEvents(0);
+    expect(all).toHaveLength(100);
+    expect(all[0].data).toEqual({ i: 5 });
+    expect(all.every((e, k) => k === 0 || e.ts > all[k - 1].ts)).toBe(true);
+    expect(bus.recentPluginEvents(all[98].ts).map((e) => e.data)).toEqual([{ i: 104 }]);
   });
 
   it('SKIPS the broadcast entirely when nothing consumes the channel', () => {

@@ -369,6 +369,9 @@ const appAPI = {
     previewClient: (host: PluginHost) => ipcRenderer.invoke('plugin-bridge:preview-client', host),
     applyClient: (id: string, write: boolean) => ipcRenderer.invoke('plugin-bridge:apply-client', id, write),
     createToken: (name: string, days: number) => ipcRenderer.invoke('plugin-bridge:create-token', name, days),
+    previewWakeHooks: (host: PluginHost, install: boolean) =>
+      ipcRenderer.invoke('plugin-bridge:preview-wake-hooks', host, install),
+    applyWakeHooks: (id: string) => ipcRenderer.invoke('plugin-bridge:apply-wake-hooks', id),
   } satisfies PluginBridgeApi,
 
   mcp: {

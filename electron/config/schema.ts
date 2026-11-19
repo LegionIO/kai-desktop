@@ -958,6 +958,21 @@ const automationsConfigSchema = z.object({
    *  - block: always denied for the agent.
    */
   approvalMode: z.enum(['auto-allow', 'prompt-user', 'block']).default('prompt-user'),
+  /** Plugin triggers shared with external agents (`kai events --shared`, e.g. the
+   *  Claude Code wake hook installed from Settings → Plugin Bridge). */
+  agentWake: z
+    .object({
+      triggers: z
+        .array(
+          z.object({
+            source: z.string(),
+            event: z.string().default(''),
+            where: z.array(z.object({ path: z.string(), value: z.string() })).default([]),
+          }),
+        )
+        .default([]),
+    })
+    .default({ triggers: [] }),
   /**
    * How a new question/approval Alert (raised by a headless automation run
    * needing the user) is surfaced beyond the OS notification + Alerts tab badge:
@@ -1424,6 +1439,7 @@ export const appConfigSchema = z.object({
     rules: [],
     log: { maxEntries: 200 },
     approvalMode: 'prompt-user',
+    agentWake: { triggers: [] },
     alertSurface: 'off',
     surfaceAlertsAsModal: false,
     surfaceAlertsAsWindow: false,

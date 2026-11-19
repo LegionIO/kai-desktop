@@ -5,6 +5,8 @@ import * as Switch from '@radix-ui/react-switch';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { CheckIcon, ChevronDownIcon, CopyIcon, Loader2Icon, RefreshCwIcon } from 'lucide-react';
 import { BRIDGE_APPROVAL_CANCELLED } from '../../../shared/bridge-approval';
+import { useConfig } from '@/providers/ConfigProvider';
+import { app, type AutomationSourceCatalogEntry } from '@/lib/ipc-client';
 import type {
   BridgeClientPreview,
   BridgeMutation,
@@ -13,6 +15,7 @@ import type {
   McpExportSource,
   PluginBridgeApi,
   PluginHost,
+  WakeHookPreview,
 } from '../../../shared/plugin-bridge';
 
 const buttonClass =
@@ -298,6 +301,7 @@ export function PluginBridgeSettings({ focusTab, focusNonce }: { focusTab?: stri
             {snapshot.sharingEnabled && (
               <>
                 <ClientConnection api={api} busy={busy} run={run} refresh={load} />
+                <AgentWake api={api} busy={busy} run={run} snapshot={snapshot} setSnapshot={setSnapshot} />
                 <RemoteSettings
                   snapshot={snapshot}
                   busy={busy}
@@ -784,6 +788,186 @@ function ClientConnection({
               Close preview
             </button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+type WakeTrigger = { source: string; event: string; where: Array<{ path: string; value: string }> };
+function AgentWake({
+  api,
+  busy,
+  run,
+  snapshot,
+  setSnapshot,
+}: {
+  api: PluginBridgeApi;
+  busy: boolean;
+  run: Run;
+  snapshot: BridgeSnapshot;
+  setSnapshot: (snapshot: BridgeSnapshot) => void;
+}) {
+  const { config, updateConfig } = useConfig();
+  const triggers: WakeTrigger[] =
+    (config as { automations?: { agentWake?: { triggers?: WakeTrigger[] } } } | null)?.automations?.agentWake
+      ?.triggers ?? [];
+  const [catalog, setCatalog] = useState<AutomationSourceCatalogEntry[]>([]);
+  const [preview, setPreview] = useState<WakeHookPreview | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => void app.automations.catalog().then((c) => alive && setCatalog(c));
+    load();
+    const off = app.automations.onCatalogChanged(load);
+    return () => {
+      alive = false;
+      off();
+    };
+  }, []);
+  const plugins = catalog.filter((c) => c.source.startsWith('plugin.'));
+  const save = (next: WakeTrigger[]) => updateConfig('automations.agentWake.triggers', next);
+  const patch = (i: number, change: Partial<WakeTrigger>) =>
+    save(triggers.map((t, j) => (j === i ? { ...t, ...change } : t)));
+  return (
+    <div className="space-y-3 border-t border-border pt-5" data-setting-id="automations.agentWake">
+      <h4 className="text-xs font-semibold">Wake agents on automation triggers</h4>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        When one of these plugin triggers fires, Kai wakes each running Claude Code session (including mid-turn) and
+        hands the event to Codex at its next turn. Filters match part of a payload field, ignoring case, e.g.{' '}
+        <code className="font-mono">from.displayName</code> = <code className="font-mono">Jane</code>. Kai must be
+        running.
+      </p>
+      {triggers.map((trigger, i) => {
+        const events = plugins.find((c) => c.source === trigger.source)?.events ?? [];
+        return (
+          <div key={i} className="space-y-2 rounded-lg border border-border p-3">
+            <div className="flex flex-wrap gap-2">
+              <select
+                aria-label="Trigger source"
+                className={inputClass + ' w-auto'}
+                value={trigger.source}
+                disabled={busy}
+                onChange={(e) => patch(i, { source: e.target.value, event: '' })}
+              >
+                <option value="">— plugin —</option>
+                {plugins.map((c) => (
+                  <option key={c.source} value={c.source}>
+                    {c.displayName}
+                  </option>
+                ))}
+              </select>
+              <select
+                aria-label="Trigger event"
+                className={inputClass + ' w-auto'}
+                value={trigger.event}
+                disabled={busy || !trigger.source}
+                onChange={(e) => patch(i, { event: e.target.value })}
+              >
+                <option value="">Any event</option>
+                {events.map((e) => (
+                  <option key={e.event} value={e.event}>
+                    {e.title}
+                  </option>
+                ))}
+              </select>
+              <button
+                className={buttonClass}
+                disabled={busy}
+                onClick={() => void save(triggers.filter((_, j) => j !== i))}
+              >
+                Remove trigger
+              </button>
+            </div>
+            {trigger.where.map((w, k) => (
+              <div key={k} className="flex flex-wrap items-center gap-2">
+                <input
+                  aria-label="Payload field"
+                  className={inputClass + ' w-48'}
+                  placeholder="from.displayName"
+                  value={w.path}
+                  disabled={busy}
+                  onChange={(e) =>
+                    patch(i, { where: trigger.where.map((x, m) => (m === k ? { ...x, path: e.target.value } : x)) })
+                  }
+                />
+                <span className="text-xs text-muted-foreground">contains</span>
+                <input
+                  aria-label="Payload value"
+                  className={inputClass + ' w-48'}
+                  placeholder="Jane"
+                  value={w.value}
+                  disabled={busy}
+                  onChange={(e) =>
+                    patch(i, { where: trigger.where.map((x, m) => (m === k ? { ...x, value: e.target.value } : x)) })
+                  }
+                />
+                <button
+                  className={buttonClass}
+                  disabled={busy}
+                  onClick={() => void patch(i, { where: trigger.where.filter((_, m) => m !== k) })}
+                >
+                  Remove filter
+                </button>
+              </div>
+            ))}
+            <button
+              className={buttonClass}
+              disabled={busy}
+              onClick={() => void patch(i, { where: [...trigger.where, { path: '', value: '' }] })}
+            >
+              Add filter
+            </button>
+          </div>
+        );
+      })}
+      <button
+        className={buttonClass}
+        disabled={busy}
+        onClick={() => void save([...triggers, { source: '', event: '', where: [] }])}
+      >
+        Add trigger
+      </button>
+      <div className="flex flex-wrap gap-2">
+        {(['claude', 'codex'] as const).map((host) => {
+          const installed = snapshot.wakeHooks?.[host];
+          const name = host === 'claude' ? 'Claude Code' : 'Codex';
+          return (
+            <button
+              key={host}
+              className={buttonClass}
+              disabled={busy}
+              onClick={() => void run(async () => setPreview(await api.previewWakeHooks(host, !installed)))}
+            >
+              {installed ? `Remove hooks from ${name}` : `Install hooks in ${name}`}
+            </button>
+          );
+        })}
+      </div>
+      {preview && (
+        <div className="space-y-3 rounded-lg border border-border p-3">
+          <p className="break-all text-xs font-medium">Hook preview · {preview.path}</p>
+          <pre className="max-h-56 overflow-auto rounded-md bg-muted p-3 text-xs">{preview.configuration}</pre>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className={buttonClass}
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  setSnapshot(await api.applyWakeHooks(preview.id));
+                  setPreview(null);
+                })
+              }
+            >
+              {preview.install ? 'Install hooks' : 'Remove hooks'}
+            </button>
+            <button className={buttonClass} onClick={() => setPreview(null)}>
+              Close preview
+            </button>
+          </div>
+          {preview.host === 'codex' && preview.install && (
+            <p className="text-xs text-muted-foreground">
+              Codex runs hooks only at turn boundaries and asks you to trust new hooks the first time.
+            </p>
+          )}
         </div>
       )}
     </div>

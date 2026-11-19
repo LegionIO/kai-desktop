@@ -88,6 +88,16 @@ export type BridgeSnapshot = {
   activity: BridgeActivity[];
   remoteProblems: string[];
   credentialStorage: 'encrypted' | 'session';
+  /** Whether Kai's agent-wake hooks are present in each host's hook file. */
+  wakeHooks: Record<PluginHost, boolean>;
+};
+export type WakeHookPreview = {
+  id: string;
+  host: PluginHost;
+  path: string;
+  install: boolean;
+  configuration: string;
+  expiresAt: string;
 };
 export type BridgeMutation =
   | { action: 'imports'; enabled: boolean }
@@ -118,4 +128,6 @@ export interface PluginBridgeApi {
   previewClient(host: PluginHost): Promise<BridgeClientPreview>;
   applyClient(previewId: string, writeConfiguration: boolean): Promise<{ configuration: string }>;
   createToken(name: string, expiresInDays: number): Promise<{ token: string; client: McpSharingClient }>;
+  previewWakeHooks(host: PluginHost, install: boolean): Promise<WakeHookPreview>;
+  applyWakeHooks(previewId: string): Promise<BridgeSnapshot>;
 }

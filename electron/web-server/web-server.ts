@@ -500,7 +500,9 @@ export function getBridgeScript(): string {
       mutate: function(change) { return invoke('plugin-bridge:mutate', change); },
       previewClient: function(host) { return invoke('plugin-bridge:preview-client', host); },
       applyClient: function(id, write) { return invoke('plugin-bridge:apply-client', id, write); },
-      createToken: function(name, days) { return invoke('plugin-bridge:create-token', name, days); }
+      createToken: function(name, days) { return invoke('plugin-bridge:create-token', name, days); },
+      previewWakeHooks: function(host, install) { return invoke('plugin-bridge:preview-wake-hooks', host, install); },
+      applyWakeHooks: function(id) { return invoke('plugin-bridge:apply-wake-hooks', id); }
     },
     mcp: {
       testConnection: function(server) { return invoke('mcp:test-connection', server); },

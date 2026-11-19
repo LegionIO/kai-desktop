@@ -17,6 +17,10 @@ export function registerAutomationsHandlers(ipcMain: IpcMain, engine: Automation
     bus.emit(source, event, payload);
   });
 
+  ipcMain.handle('automations:recent-events', (_event, sinceTs: unknown) =>
+    bus.recentPluginEvents(typeof sinceTs === 'number' ? sinceTs : Date.now()),
+  );
+
   ipcMain.handle('automations:in-flight', (_event, conversationId: string): boolean =>
     isAutomationRunInFlight(conversationId),
   );

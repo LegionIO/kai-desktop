@@ -13,6 +13,7 @@ import {
   BOOT_TIMEOUT_MS,
 } from './spawn-backend.js';
 import { confirmFolderTrust } from './folder-trust.js';
+import { parseEventsArgs, runEvents } from './events.js';
 
 /**
  * Run the `kai` CLI client from inside the packaged Electron main process
@@ -46,12 +47,13 @@ export async function runCliClient(): Promise<void> {
   }
 
   const mcpCommand = parseMcpCommand(process.argv.slice(2));
+  const eventsFilter = parseEventsArgs(process.argv.slice(2));
   const socketPath = getSocketPath();
   const token = getBridgeToken();
   // In the interactive Ink REPL the banner UI draws immediately, so transient
   // "attached"/"ready" status lines only orphan above it. Keep them for
   // headless/scripting (stderr) where there's no UI to replace them.
-  const interactive = !print && process.stdin.isTTY && process.stdout.isTTY;
+  const interactive = !print && !eventsFilter && process.stdin.isTTY && process.stdout.isTTY;
 
   // Workspace trust: in the interactive REPL the agent can run tools scoped to
   // this directory, so gate an unfamiliar folder behind an explicit "do you
@@ -66,9 +68,13 @@ export async function runCliClient(): Promise<void> {
     }
   }
 
+  const hookMode = !!(eventsFilter?.rewake || eventsFilter?.drain);
+  const quiet = interactive || hookMode;
   let client = await tryConnect(socketPath, token);
+  // Agent wake hooks fire on every session/turn: never boot a backend for them.
+  if (!client && hookMode) process.exit(0);
   if (!client) {
-    if (!interactive) cliLog('no running Kai backend found — starting a headless one…');
+    if (!quiet) cliLog('no running Kai backend found — starting a headless one…');
     if (!(await spawnHeadlessBackend(true))) {
       process.exit(1);
     }
@@ -77,9 +83,9 @@ export async function runCliClient(): Promise<void> {
       cliLog('timed out waiting for the headless backend to come up');
       process.exit(1);
     }
-    if (!interactive) cliLog('headless backend ready');
+    if (!quiet) cliLog('headless backend ready');
   } else {
-    if (!interactive) cliLog('attached to running Kai backend');
+    if (!quiet) cliLog('attached to running Kai backend');
   }
 
   // On any exit, close the socket so the backend can reap itself promptly.
@@ -89,7 +95,7 @@ export async function runCliClient(): Promise<void> {
   // Surface a CLI↔backend version mismatch (a stale backend still running after
   // an app update is the usual cause of "the fixes aren't in my build").
   const mismatch = checkVersionMismatch(activeClient);
-  if (mismatch) cliLog(mismatch);
+  if (mismatch && !hookMode) cliLog(mismatch);
 
   // `--list-models|--list-profiles|--list-runtimes`: print the list then exit
   // (no turn, no REPL). Requires a connected backend (done above).
@@ -100,6 +106,13 @@ export async function runCliClient(): Promise<void> {
       activeClient.close();
     }
     process.exit(0);
+  }
+
+  if (eventsFilter) {
+    const code = await runEvents(activeClient, eventsFilter, () => recoverBackend(activeClient, true));
+    await activeClient.requestShutdown().catch(() => {});
+    activeClient.close();
+    process.exit(code);
   }
 
   if (list) {

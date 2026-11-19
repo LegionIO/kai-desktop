@@ -109,6 +109,22 @@ export function registerPluginBridgeHandlers(
     );
     return system.setup.apply(preview.id, writeConfiguration);
   });
+  ipc.handle('plugin-bridge:preview-wake-hooks', (_event, host: unknown, install: unknown) =>
+    system.wakeHooks.preview(z.enum(['claude', 'codex']).parse(host), z.boolean().parse(install)),
+  );
+  ipc.handle('plugin-bridge:apply-wake-hooks', async (event, id: unknown) => {
+    const preview = system.wakeHooks.reviewed(z.string().uuid().parse(id));
+    const name = preview.host === 'claude' ? 'Claude Code' : 'Codex';
+    await authorize(
+      event,
+      preview.install ? `Let Kai wake ${name}?` : `Remove Kai wake hooks from ${name}?`,
+      preview.install
+        ? `Add these hooks to ${preview.path}:\n\n${preview.configuration}\n\nWhen a shared automation trigger fires, every running ${name} session receives the event payload (message previews, sender names). Existing hooks are kept.`
+        : `Remove only Kai's wake hooks from ${preview.path}. Other hooks are kept.`,
+    );
+    system.wakeHooks.apply(preview.id);
+    return system.snapshot();
+  });
   ipc.handle('plugin-bridge:create-token', async (event, name: unknown, days: unknown) => {
     const validName = z.string().min(1).max(100).parse(name);
     const validDays = z.number().int().min(1).max(365).parse(days);

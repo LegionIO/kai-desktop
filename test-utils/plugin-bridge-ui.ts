@@ -13,6 +13,7 @@ export function bridgeSnapshotFixture(overrides: Partial<BridgeSnapshot> = {}): 
     activity: [],
     remoteProblems: [],
     credentialStorage: 'encrypted',
+    wakeHooks: { claude: false, codex: false },
     compatibility: [
       {
         runtime: 'Codex SDK',
