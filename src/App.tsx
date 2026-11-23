@@ -73,6 +73,7 @@ import { SidebarDock, type DockItem } from '@/components/sidebar/SidebarDock';
 import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
 import { ContentPanel } from '@/components/sidebar/ContentPanel';
 import type { SidebarTab, Workspace } from '../electron/config/schema';
+import { resolveLaunchView } from '@/lib/launch-view';
 import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
 import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
@@ -928,6 +929,26 @@ function AppShell() {
       lastChatsViewRef.current = activeView;
     }
   }, [activeView, activeConversationId]);
+
+  // ui.launchView: open the configured screen once on launch. A plugin target waits until
+  // that plugin is active with a panel; any user navigation before then cancels it.
+  const launchViewGenerationRef = useRef<number | 'done' | null>(null);
+  useEffect(() => {
+    if (!config || launchViewGenerationRef.current === 'done') return;
+    launchViewGenerationRef.current ??= navigationIntentGenerationRef.current;
+    if (navigationIntentGenerationRef.current !== launchViewGenerationRef.current) {
+      launchViewGenerationRef.current = 'done';
+      return;
+    }
+    const target = (config.ui as { launchView?: string } | undefined)?.launchView ?? 'chats';
+    const decision = resolveLaunchView(target, pluginUIState?.pluginStatuses, pluginUIState?.panels);
+    if (decision.kind === 'wait') return;
+    launchViewGenerationRef.current = 'done';
+    if (decision.kind === 'go') {
+      setSidebarSection(decision.section);
+      setActiveView(decision.view);
+    }
+  }, [config, pluginUIState, setActiveView]);
 
   // Restore the last active conversation when switching workspaces
   const prevWorkspaceIdRef = useRef<string | null | undefined>(undefined);

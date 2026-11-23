@@ -192,6 +192,7 @@ function getDefaultConfig() {
       pluginBubbleExpanded: true,
       dockBadgeStyle: 'dot' as const,
       splashBackground: 'random' as const,
+      launchView: 'chats',
       workspaces: [] as Array<{
         id: string;
         name: string;

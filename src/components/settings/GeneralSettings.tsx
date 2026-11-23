@@ -1,6 +1,7 @@
 import { type FC, useState, useEffect, useCallback } from 'react';
 import { Trash2Icon, LoaderIcon, CheckCircle2Icon, AlertTriangleIcon, HardDriveIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { usePlugins } from '@/providers/PluginProvider';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
 /** Mirror of electron/agent/kai-presence.ts normalizeApprovalWindowMode — kept
@@ -17,6 +18,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
     sidebarWidth: number;
     fullWidthContent?: boolean;
     splashBackground?: string;
+    launchView?: string;
     composer?: { showModelProfileSelector?: boolean; midTurnSend?: 'splice' | 'queue-editable' };
     approvals?: { dedicatedWindow?: boolean | 'auto' | 'always' | 'never' };
   };
@@ -27,6 +29,14 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
         }
       | undefined) ?? {};
   const titleGenEnabled = titleGen.enabled ?? true;
+
+  // Plugins with a visible content panel can be the launch screen.
+  const { uiState: pluginUIState } = usePlugins();
+  const launchView = ui.launchView ?? 'chats';
+  const panelPlugins = [...new Set((pluginUIState?.panels ?? []).filter((p) => p.visible).map((p) => p.pluginName))];
+  const pluginLabel = (name: string) =>
+    pluginUIState?.navigationItems?.find((n) => n.pluginName === name)?.label || name;
+  const launchPlugin = launchView.startsWith('plugin:') ? launchView.slice('plugin:'.length) : null;
 
   // "Install `kai` command in PATH" — VS Code `code`-style toggle backed by the
   // cli:install IPC (symlinks/copies the shipped launcher onto a per-user PATH dir).
@@ -81,6 +91,35 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
           checked={!!config.launchAtLogin}
           onChange={(v) => updateConfig('launchAtLogin', v)}
         />
+        <div data-setting-id="ui.launchView">
+          <label htmlFor="ui.launchView" className="text-[10px] text-muted-foreground block mb-0.5">
+            Open on launch
+          </label>
+          <select
+            id="ui.launchView"
+            className={settingsSelectClass}
+            value={launchView}
+            onChange={(e) => updateConfig('ui.launchView', e.target.value)}
+          >
+            <option value="chats">Chats</option>
+            <option value="tasks">Tasks</option>
+            <option value="agents">Agents</option>
+            <option value="alerts">Alerts</option>
+            <option value="plugins">Plugins</option>
+            {panelPlugins.map((name) => (
+              <option key={name} value={`plugin:${name}`}>
+                Plugin: {pluginLabel(name)}
+              </option>
+            ))}
+            {launchPlugin && !panelPlugins.includes(launchPlugin) && (
+              <option value={launchView}>Plugin: {launchPlugin} (not loaded)</option>
+            )}
+          </select>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            The screen Kai shows when it starts. A plugin opens as soon as it has finished loading; if it fails to
+            load, Kai stays on Chats.
+          </p>
+        </div>
       </fieldset>
 
       <fieldset data-setting-id="cli.install" className="rounded-lg border p-3 space-y-3">

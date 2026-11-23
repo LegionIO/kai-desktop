@@ -441,6 +441,13 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     keywords: ['startup', 'autostart'],
   },
   {
+    id: 'ui.launchView',
+    label: 'Open on launch',
+    section: 'general',
+    tab: 'general',
+    keywords: ['home page', 'homepage', 'startup', 'launch page', 'default view', 'plugin'],
+  },
+  {
     id: 'ui.theme',
     label: 'Color scheme',
     section: 'general',

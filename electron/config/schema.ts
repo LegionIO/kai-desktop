@@ -1115,6 +1115,9 @@ export const appConfigSchema = z.object({
      */
     dockBadgeStyle: z.enum(['dot', 'truncate', 'full']).default('dot'),
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
+    /** Screen shown on launch: 'chats' | 'tasks' | 'agents' | 'alerts' | 'plugins' | 'plugin:<name>'
+     *  (a plugin target opens once that plugin is active and has registered a panel). */
+    launchView: z.string().default('chats'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
     composer: z
