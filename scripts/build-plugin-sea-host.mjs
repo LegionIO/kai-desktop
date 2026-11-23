@@ -165,12 +165,10 @@ async function resolveNodeBinary(target) {
     mkdirSync(extractDir, { recursive: true });
     if (descriptor.name.endsWith('.zip')) {
       if (process.platform !== 'win32') throw new Error(`Extracting ${descriptor.name} requires a Windows builder`);
-      execFileSync('powershell.exe', [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${extractDir.replaceAll("'", "''")}' -Force`,
-      ]);
+      // Windows' bundled bsdtar reads zips. Not Expand-Archive: powershell.exe 5.1 on GitHub runners
+      // loads PS7's incompatible Archive module via PSModulePath ("ExtractToDirectory" overload error).
+      const systemTar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
+      execFileSync(systemTar, ['-xf', archivePath, '-C', extractDir]);
     } else {
       execFileSync('tar', ['-xf', archivePath, '-C', extractDir]);
     }
